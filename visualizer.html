@@ -1,0 +1,1129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Coordination Service — Live Monitor</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500;600&display=swap');
+        
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        :root {
+            --bg-primary: #0a0a0b;
+            --bg-secondary: #111113;
+            --bg-tertiary: #18181b;
+            --border: #27272a;
+            --text-primary: #fafafa;
+            --text-secondary: #a1a1aa;
+            --text-muted: #52525b;
+            --accent: #22c55e;
+            --accent-dim: rgba(34, 197, 94, 0.1);
+            --warning: #f59e0b;
+            --danger: #ef4444;
+            --info: #3b82f6;
+            --ephemeral: #a855f7;
+        }
+        
+        body {
+            font-family: 'Inter', -apple-system, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+            overflow-x: hidden;
+        }
+        
+        /* Header */
+        .header {
+            padding: 20px 32px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: var(--bg-secondary);
+        }
+        
+        .header-left {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+        
+        .logo {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        
+        .logo-icon {
+            width: 32px;
+            height: 32px;
+            background: var(--accent);
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        .logo-icon svg {
+            width: 18px;
+            height: 18px;
+            color: var(--bg-primary);
+        }
+        
+        .logo-text {
+            font-weight: 600;
+            font-size: 16px;
+            letter-spacing: -0.02em;
+        }
+        
+        .status-badge {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 12px;
+            background: var(--accent-dim);
+            border: 1px solid rgba(34, 197, 94, 0.2);
+            border-radius: 20px;
+            font-size: 13px;
+            color: var(--accent);
+        }
+        
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            background: var(--accent);
+            border-radius: 50%;
+            animation: pulse 2s infinite;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        
+        .header-right {
+            display: flex;
+            gap: 12px;
+        }
+        
+        .btn {
+            font-family: inherit;
+            padding: 8px 16px;
+            border-radius: 6px;
+            font-size: 13px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.15s ease;
+            border: 1px solid var(--border);
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+        }
+        
+        .btn:hover {
+            background: var(--border);
+        }
+        
+        .btn-primary {
+            background: var(--accent);
+            border-color: var(--accent);
+            color: var(--bg-primary);
+        }
+        
+        .btn-primary:hover {
+            background: #16a34a;
+        }
+        
+        .btn-danger {
+            background: transparent;
+            border-color: var(--danger);
+            color: var(--danger);
+        }
+        
+        .btn-danger:hover {
+            background: var(--danger);
+            color: white;
+        }
+        
+        /* Main Layout */
+        .main {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1px;
+            background: var(--border);
+            height: calc(100vh - 73px);
+        }
+        
+        .panel {
+            background: var(--bg-primary);
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .panel-header {
+            padding: 16px 20px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: var(--bg-secondary);
+        }
+        
+        .panel-title {
+            font-size: 12px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-secondary);
+        }
+        
+        .panel-count {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 12px;
+            color: var(--text-muted);
+            background: var(--bg-tertiary);
+            padding: 4px 8px;
+            border-radius: 4px;
+        }
+        
+        .panel-content {
+            flex: 1;
+            overflow-y: auto;
+            padding: 16px 20px;
+        }
+        
+        /* Node Tree */
+        .tree {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 13px;
+            line-height: 1.8;
+        }
+        
+        .tree-node {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 4px 8px;
+            border-radius: 4px;
+            transition: background 0.1s ease;
+        }
+        
+        .tree-node:hover {
+            background: var(--bg-tertiary);
+        }
+        
+        .tree-node.new {
+            animation: highlight 1s ease;
+        }
+        
+        @keyframes highlight {
+            0% { background: var(--accent-dim); }
+            100% { background: transparent; }
+        }
+        
+        .tree-indent {
+            color: var(--text-muted);
+            user-select: none;
+        }
+        
+        .tree-path {
+            color: var(--text-primary);
+        }
+        
+        .tree-badge {
+            font-size: 10px;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-weight: 500;
+            text-transform: uppercase;
+        }
+        
+        .tree-badge.ephemeral {
+            background: rgba(168, 85, 247, 0.15);
+            color: var(--ephemeral);
+        }
+        
+        .tree-badge.persistent {
+            background: rgba(59, 130, 246, 0.15);
+            color: var(--info);
+        }
+        
+        .tree-badge.leader {
+            background: rgba(245, 158, 11, 0.15);
+            color: var(--warning);
+        }
+        
+        .tree-version {
+            color: var(--text-muted);
+            font-size: 11px;
+        }
+        
+        /* Events Log */
+        .event {
+            display: flex;
+            gap: 12px;
+            padding: 10px 12px;
+            border-radius: 6px;
+            margin-bottom: 8px;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            font-size: 13px;
+            animation: slideIn 0.2s ease;
+        }
+        
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateY(-8px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+        
+        .event-time {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 11px;
+            color: var(--text-muted);
+            white-space: nowrap;
+        }
+        
+        .event-content {
+            flex: 1;
+        }
+        
+        .event-type {
+            font-weight: 500;
+            margin-bottom: 2px;
+        }
+        
+        .event-type.create { color: var(--accent); }
+        .event-type.delete { color: var(--danger); }
+        .event-type.update { color: var(--info); }
+        .event-type.session { color: var(--warning); }
+        
+        .event-detail {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 12px;
+            color: var(--text-secondary);
+        }
+        
+        /* Bottom Panel - Sessions */
+        .sessions-panel {
+            border-top: 1px solid var(--border);
+            grid-column: 1 / -1;
+            background: var(--bg-secondary);
+        }
+        
+        .sessions-grid {
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+        
+        .session-card {
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 14px 16px;
+            min-width: 280px;
+            flex: 1;
+            max-width: 400px;
+        }
+        
+        .session-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 12px;
+        }
+        
+        .session-id {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 12px;
+            color: var(--text-primary);
+        }
+        
+        .session-status {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 11px;
+            color: var(--accent);
+        }
+        
+        .session-status-dot {
+            width: 6px;
+            height: 6px;
+            background: var(--accent);
+            border-radius: 50%;
+        }
+        
+        .session-progress {
+            height: 4px;
+            background: var(--border);
+            border-radius: 2px;
+            overflow: hidden;
+            margin-bottom: 12px;
+        }
+        
+        .session-progress-bar {
+            height: 100%;
+            background: var(--accent);
+            transition: width 1s linear;
+        }
+        
+        .session-progress-bar.warning {
+            background: var(--warning);
+        }
+        
+        .session-progress-bar.danger {
+            background: var(--danger);
+        }
+        
+        .session-footer {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .session-time {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 12px;
+            color: var(--text-secondary);
+        }
+        
+        .session-nodes {
+            font-size: 11px;
+            color: var(--text-muted);
+        }
+        
+        .btn-kill {
+            padding: 4px 10px;
+            font-size: 11px;
+        }
+        
+        /* Stats Bar */
+        .stats-bar {
+            display: flex;
+            gap: 24px;
+            padding: 12px 20px;
+            background: var(--bg-tertiary);
+            border-top: 1px solid var(--border);
+        }
+        
+        .stat {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .stat-label {
+            font-size: 11px;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.03em;
+        }
+        
+        .stat-value {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 14px;
+            font-weight: 500;
+            color: var(--text-primary);
+        }
+        
+        /* Empty State */
+        .empty-state {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 200px;
+            color: var(--text-muted);
+            font-size: 13px;
+        }
+        
+        .empty-state svg {
+            width: 40px;
+            height: 40px;
+            margin-bottom: 12px;
+            opacity: 0.3;
+        }
+        
+        /* Modal */
+        .modal-overlay {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.7);
+            z-index: 100;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        .modal-overlay.active {
+            display: flex;
+        }
+        
+        .modal {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 24px;
+            width: 400px;
+            max-width: 90vw;
+        }
+        
+        .modal-title {
+            font-size: 16px;
+            font-weight: 600;
+            margin-bottom: 16px;
+        }
+        
+        .form-group {
+            margin-bottom: 16px;
+        }
+        
+        .form-label {
+            display: block;
+            font-size: 12px;
+            font-weight: 500;
+            color: var(--text-secondary);
+            margin-bottom: 6px;
+        }
+        
+        .form-input {
+            width: 100%;
+            padding: 10px 12px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 13px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--text-primary);
+            outline: none;
+        }
+        
+        .form-input:focus {
+            border-color: var(--accent);
+        }
+        
+        .form-row {
+            display: flex;
+            gap: 12px;
+        }
+        
+        .form-row .form-group {
+            flex: 1;
+        }
+        
+        .form-checkbox {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 13px;
+            color: var(--text-secondary);
+        }
+        
+        .modal-actions {
+            display: flex;
+            justify-content: flex-end;
+            gap: 12px;
+            margin-top: 20px;
+        }
+        
+        /* Responsive */
+        @media (max-width: 900px) {
+            .main {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <header class="header">
+        <div class="header-left">
+            <div class="logo">
+                <div class="logo-icon">
+                    <svg fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M12 3c.53 0 1.04.21 1.41.59l7 7c.78.78.78 2.05 0 2.83l-7 7c-.78.78-2.05.78-2.83 0l-7-7c-.78-.78-.78-2.05 0-2.83l7-7C10.96 3.21 11.47 3 12 3z"/>
+                    </svg>
+                </div>
+                <span class="logo-text">Coordination Service</span>
+            </div>
+            <div class="status-badge" id="connectionStatus">
+                <span class="status-dot"></span>
+                <span>Connected</span>
+            </div>
+        </div>
+        <div class="header-right">
+            <button class="btn" onclick="openModal('session')">+ Session</button>
+            <button class="btn" onclick="openModal('node')">+ Node</button>
+            <button class="btn btn-primary" onclick="runDemo()">Run Demo</button>
+        </div>
+    </header>
+    
+    <main class="main">
+        <section class="panel">
+            <div class="panel-header">
+                <span class="panel-title">Node Tree</span>
+                <span class="panel-count" id="nodeCount">0 nodes</span>
+            </div>
+            <div class="panel-content">
+                <div class="tree" id="nodeTree">
+                    <div class="empty-state">
+                        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/>
+                        </svg>
+                        <span>No nodes yet</span>
+                    </div>
+                </div>
+            </div>
+        </section>
+        
+        <section class="panel">
+            <div class="panel-header">
+                <span class="panel-title">Live Events</span>
+                <span class="panel-count" id="eventCount">0 events</span>
+            </div>
+            <div class="panel-content">
+                <div id="eventLog">
+                    <div class="empty-state">
+                        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M13 10V3L4 14h7v7l9-11h-7z"/>
+                        </svg>
+                        <span>Waiting for events...</span>
+                    </div>
+                </div>
+            </div>
+        </section>
+    </main>
+    
+    <section class="sessions-panel">
+        <div class="panel-header">
+            <span class="panel-title">Active Sessions</span>
+            <span class="panel-count" id="sessionCount">0 sessions</span>
+        </div>
+        <div class="panel-content">
+            <div class="sessions-grid" id="sessionsGrid">
+                <div class="empty-state" style="width: 100%;">
+                    <span>No active sessions</span>
+                </div>
+            </div>
+        </div>
+        <div class="stats-bar">
+            <div class="stat">
+                <span class="stat-label">Total Nodes</span>
+                <span class="stat-value" id="statNodes">0</span>
+            </div>
+            <div class="stat">
+                <span class="stat-label">Sessions</span>
+                <span class="stat-value" id="statSessions">0</span>
+            </div>
+            <div class="stat">
+                <span class="stat-label">Watches</span>
+                <span class="stat-value" id="statWatches">0</span>
+            </div>
+            <div class="stat">
+                <span class="stat-label">Operations</span>
+                <span class="stat-value" id="statOps">0</span>
+            </div>
+        </div>
+    </section>
+    
+    <!-- Create Session Modal -->
+    <div class="modal-overlay" id="sessionModal">
+        <div class="modal">
+            <h2 class="modal-title">Create Session</h2>
+            <div class="form-group">
+                <label class="form-label">Timeout (seconds)</label>
+                <input type="number" class="form-input" id="sessionTimeout" value="30" min="5" max="300">
+            </div>
+            <div class="modal-actions">
+                <button class="btn" onclick="closeModal('session')">Cancel</button>
+                <button class="btn btn-primary" onclick="createSession()">Create</button>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Create Node Modal -->
+    <div class="modal-overlay" id="nodeModal">
+        <div class="modal">
+            <h2 class="modal-title">Create Node</h2>
+            <div class="form-group">
+                <label class="form-label">Path</label>
+                <input type="text" class="form-input" id="nodePath" placeholder="/services/my-service">
+            </div>
+            <div class="form-group">
+                <label class="form-label">Data</label>
+                <input type="text" class="form-input" id="nodeData" placeholder="optional data">
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label class="form-label">Session</label>
+                    <select class="form-input" id="nodeSession"></select>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Type</label>
+                    <select class="form-input" id="nodeType">
+                        <option value="persistent">Persistent</option>
+                        <option value="ephemeral">Ephemeral</option>
+                    </select>
+                </div>
+            </div>
+            <div class="modal-actions">
+                <button class="btn" onclick="closeModal('node')">Cancel</button>
+                <button class="btn btn-primary" onclick="createNode()">Create</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = 'http://localhost:8000/api';
+        
+        // State
+        let sessions = {};
+        let nodes = {};
+        let events = [];
+        let eventCounter = 0;
+        
+        // Polling interval
+        let pollInterval;
+        
+        // Initialize
+        async function init() {
+            await refresh();
+            pollInterval = setInterval(refresh, 1000);
+        }
+        
+        // Refresh all data
+        async function refresh() {
+            try {
+                const [health, stats] = await Promise.all([
+                    fetch(`${API_BASE}/health`).then(r => r.json()),
+                    fetch(`${API_BASE}/stats`).then(r => r.json())
+                ]);
+                
+                document.getElementById('statNodes').textContent = stats.nodes;
+                document.getElementById('statSessions').textContent = stats.sessions_alive;
+                document.getElementById('statWatches').textContent = stats.watches;
+                document.getElementById('statOps').textContent = stats.operations;
+                
+                await refreshTree();
+                updateSessionTimers();
+                updateConnectionStatus(true);
+            } catch (e) {
+                updateConnectionStatus(false);
+            }
+        }
+        
+        // Update connection status
+        function updateConnectionStatus(connected) {
+            const status = document.getElementById('connectionStatus');
+            if (connected) {
+                status.innerHTML = '<span class="status-dot"></span><span>Connected</span>';
+                status.style.color = 'var(--accent)';
+                status.style.borderColor = 'rgba(34, 197, 94, 0.2)';
+                status.style.background = 'var(--accent-dim)';
+            } else {
+                status.innerHTML = '<span class="status-dot" style="background: var(--danger); animation: none;"></span><span>Disconnected</span>';
+                status.style.color = 'var(--danger)';
+                status.style.borderColor = 'rgba(239, 68, 68, 0.2)';
+                status.style.background = 'rgba(239, 68, 68, 0.1)';
+            }
+        }
+        
+        // Refresh node tree
+        async function refreshTree() {
+            try {
+                const rootChildren = await listChildren('/');
+                const tree = await buildTree('/', rootChildren);
+                renderTree(tree);
+            } catch (e) {
+                console.error('Failed to refresh tree:', e);
+            }
+        }
+        
+        // List children of a path
+        async function listChildren(path) {
+            try {
+                const response = await fetch(`${API_BASE}/node/list_children?path=${encodeURIComponent(path)}`);
+                if (!response.ok) return [];
+                const data = await response.json();
+                return data.children || [];
+            } catch (e) {
+                return [];
+            }
+        }
+        
+        // Get node info
+        async function getNode(path) {
+            try {
+                const response = await fetch(`${API_BASE}/node/get?path=${encodeURIComponent(path)}`);
+                if (!response.ok) return null;
+                return await response.json();
+            } catch (e) {
+                return null;
+            }
+        }
+        
+        // Build tree recursively
+        async function buildTree(path, children) {
+            const nodeInfo = await getNode(path);
+            const node = {
+                path,
+                name: path === '/' ? '/' : path.split('/').pop(),
+                info: nodeInfo,
+                children: []
+            };
+            
+            for (const childName of children) {
+                const childPath = path === '/' ? `/${childName}` : `${path}/${childName}`;
+                const grandChildren = await listChildren(childPath);
+                const childNode = await buildTree(childPath, grandChildren);
+                node.children.push(childNode);
+            }
+            
+            return node;
+        }
+        
+        // Render tree
+        function renderTree(tree) {
+            const container = document.getElementById('nodeTree');
+            let count = 0;
+            
+            function renderNode(node, depth = 0) {
+                count++;
+                const indent = depth === 0 ? '' : '│  '.repeat(depth - 1) + '├─ ';
+                const nodeType = node.info?.node_type || 'PERSISTENT';
+                const isEphemeral = nodeType === 'EPHEMERAL';
+                const version = node.info?.version || 0;
+                
+                let badges = '';
+                if (isEphemeral) {
+                    badges += '<span class="tree-badge ephemeral">ephemeral</span>';
+                }
+                if (node.path.includes('leader') || node.path.includes('lock')) {
+                    badges += '<span class="tree-badge leader">★</span>';
+                }
+                
+                let html = `
+                    <div class="tree-node" data-path="${node.path}">
+                        <span class="tree-indent">${indent}</span>
+                        <span class="tree-path">${node.name}</span>
+                        ${badges}
+                        <span class="tree-version">v${version}</span>
+                    </div>
+                `;
+                
+                for (const child of node.children) {
+                    html += renderNode(child, depth + 1);
+                }
+                
+                return html;
+            }
+            
+            const html = renderNode(tree);
+            container.innerHTML = html;
+            document.getElementById('nodeCount').textContent = `${count} nodes`;
+        }
+        
+        // Add event to log
+        function addEvent(type, path, detail = '') {
+            const now = new Date();
+            const time = now.toTimeString().split(' ')[0];
+            eventCounter++;
+            
+            const event = { type, path, detail, time, id: eventCounter };
+            events.unshift(event);
+            if (events.length > 50) events.pop();
+            
+            renderEvents();
+        }
+        
+        // Render events
+        function renderEvents() {
+            const container = document.getElementById('eventLog');
+            if (events.length === 0) {
+                container.innerHTML = `
+                    <div class="empty-state">
+                        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M13 10V3L4 14h7v7l9-11h-7z"/>
+                        </svg>
+                        <span>Waiting for events...</span>
+                    </div>
+                `;
+                return;
+            }
+            
+            container.innerHTML = events.map(e => `
+                <div class="event">
+                    <span class="event-time">${e.time}</span>
+                    <div class="event-content">
+                        <div class="event-type ${e.type.toLowerCase()}">${e.type}</div>
+                        <div class="event-detail">${e.path}${e.detail ? ' — ' + e.detail : ''}</div>
+                    </div>
+                </div>
+            `).join('');
+            
+            document.getElementById('eventCount').textContent = `${events.length} events`;
+        }
+        
+        // Session management
+        async function createSession() {
+            const timeout = parseInt(document.getElementById('sessionTimeout').value) || 30;
+            
+            try {
+                const response = await fetch(`${API_BASE}/session/open`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ timeout_seconds: timeout })
+                });
+                
+                const data = await response.json();
+                if (data.session_id) {
+                    sessions[data.session_id] = {
+                        id: data.session_id,
+                        timeout,
+                        remaining: timeout,
+                        nodes: 0,
+                        created: Date.now()
+                    };
+                    addEvent('SESSION', data.session_id.slice(0, 8) + '...', 'created');
+                    renderSessions();
+                    closeModal('session');
+                    startHeartbeat(data.session_id, timeout);
+                }
+            } catch (e) {
+                console.error('Failed to create session:', e);
+            }
+        }
+        
+        // Start heartbeat for session
+        function startHeartbeat(sessionId, timeout) {
+            const interval = Math.max(1000, (timeout * 1000) / 3);
+            sessions[sessionId].heartbeatInterval = setInterval(async () => {
+                try {
+                    await fetch(`${API_BASE}/session/heartbeat`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ session_id: sessionId })
+                    });
+                    sessions[sessionId].remaining = sessions[sessionId].timeout;
+                } catch (e) {
+                    // Session might be dead
+                }
+            }, interval);
+        }
+        
+        // Kill session
+        async function killSession(sessionId) {
+            try {
+                if (sessions[sessionId]?.heartbeatInterval) {
+                    clearInterval(sessions[sessionId].heartbeatInterval);
+                }
+                
+                await fetch(`${API_BASE}/session/close`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ session_id: sessionId })
+                });
+                
+                addEvent('SESSION', sessionId.slice(0, 8) + '...', 'terminated');
+                delete sessions[sessionId];
+                renderSessions();
+                setTimeout(refreshTree, 500);
+            } catch (e) {
+                console.error('Failed to kill session:', e);
+            }
+        }
+        
+        // Update session timers
+        function updateSessionTimers() {
+            for (const id in sessions) {
+                sessions[id].remaining = Math.max(0, sessions[id].remaining - 1);
+            }
+            renderSessions();
+        }
+        
+        // Render sessions
+        function renderSessions() {
+            const container = document.getElementById('sessionsGrid');
+            const sessionList = Object.values(sessions);
+            
+            if (sessionList.length === 0) {
+                container.innerHTML = `
+                    <div class="empty-state" style="width: 100%;">
+                        <span>No active sessions</span>
+                    </div>
+                `;
+                document.getElementById('sessionCount').textContent = '0 sessions';
+                return;
+            }
+            
+            container.innerHTML = sessionList.map(s => {
+                const percent = (s.remaining / s.timeout) * 100;
+                const barClass = percent < 20 ? 'danger' : percent < 50 ? 'warning' : '';
+                
+                return `
+                    <div class="session-card">
+                        <div class="session-header">
+                            <span class="session-id">${s.id.slice(0, 8)}...</span>
+                            <span class="session-status">
+                                <span class="session-status-dot"></span>
+                                Active
+                            </span>
+                        </div>
+                        <div class="session-progress">
+                            <div class="session-progress-bar ${barClass}" style="width: ${percent}%"></div>
+                        </div>
+                        <div class="session-footer">
+                            <span class="session-time">${s.remaining}s / ${s.timeout}s</span>
+                            <button class="btn btn-danger btn-kill" onclick="killSession('${s.id}')">Kill</button>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+            
+            document.getElementById('sessionCount').textContent = `${sessionList.length} sessions`;
+            
+            // Update node modal session dropdown
+            const select = document.getElementById('nodeSession');
+            select.innerHTML = sessionList.map(s => 
+                `<option value="${s.id}">${s.id.slice(0, 8)}...</option>`
+            ).join('');
+        }
+        
+        // Create node
+        async function createNode() {
+            const path = document.getElementById('nodePath').value;
+            const data = document.getElementById('nodeData').value;
+            const sessionId = document.getElementById('nodeSession').value;
+            const persistent = document.getElementById('nodeType').value === 'persistent';
+            
+            if (!path) return;
+            
+            try {
+                const response = await fetch(`${API_BASE}/node/create`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        path,
+                        data,
+                        persistent,
+                        session_id: sessionId || null
+                    })
+                });
+                
+                if (response.ok) {
+                    addEvent('CREATE', path, persistent ? 'persistent' : 'ephemeral');
+                    closeModal('node');
+                    await refreshTree();
+                }
+            } catch (e) {
+                console.error('Failed to create node:', e);
+            }
+        }
+        
+        // Modal functions
+        function openModal(type) {
+            document.getElementById(`${type}Modal`).classList.add('active');
+        }
+        
+        function closeModal(type) {
+            document.getElementById(`${type}Modal`).classList.remove('active');
+        }
+        
+        // Demo: Leader Election
+        async function runDemo() {
+            addEvent('SESSION', 'Demo', 'Starting leader election demo...');
+            
+            // Create election namespace
+            const adminSession = await createDemoSession(60);
+            await createDemoNode('/election', '', true, adminSession);
+            
+            // Create 3 candidates
+            const candidates = ['alice', 'bob', 'charlie'];
+            const candidateSessions = [];
+            
+            for (const name of candidates) {
+                await sleep(500);
+                const sessionId = await createDemoSession(15);
+                candidateSessions.push({ name, sessionId });
+                await createDemoNode(`/election/${name}`, `candidate: ${name}`, false, sessionId);
+            }
+            
+            addEvent('SESSION', 'Demo', `Leader is: ${candidates[0]}`);
+            
+            // After 3 seconds, kill the leader
+            await sleep(3000);
+            addEvent('SESSION', 'Demo', 'Killing leader (alice)...');
+            await killSession(candidateSessions[0].sessionId);
+            
+            await sleep(1000);
+            addEvent('SESSION', 'Demo', `New leader is: ${candidates[1]}`);
+        }
+        
+        async function createDemoSession(timeout) {
+            const response = await fetch(`${API_BASE}/session/open`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ timeout_seconds: timeout })
+            });
+            const data = await response.json();
+            
+            sessions[data.session_id] = {
+                id: data.session_id,
+                timeout,
+                remaining: timeout,
+                nodes: 0,
+                created: Date.now()
+            };
+            
+            addEvent('SESSION', data.session_id.slice(0, 8) + '...', 'created');
+            renderSessions();
+            startHeartbeat(data.session_id, timeout);
+            
+            return data.session_id;
+        }
+        
+        async function createDemoNode(path, data, persistent, sessionId) {
+            try {
+                const response = await fetch(`${API_BASE}/node/create`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ path, data, persistent, session_id: sessionId })
+                });
+                
+                if (response.ok) {
+                    addEvent('CREATE', path, persistent ? 'persistent' : 'ephemeral');
+                    await refreshTree();
+                }
+            } catch (e) {
+                console.error('Failed to create demo node:', e);
+            }
+        }
+        
+        function sleep(ms) {
+            return new Promise(resolve => setTimeout(resolve, ms));
+        }
+        
+        // Click outside modal to close
+        document.querySelectorAll('.modal-overlay').forEach(modal => {
+            modal.addEventListener('click', (e) => {
+                if (e.target === modal) {
+                    modal.classList.remove('active');
+                }
+            });
+        });
+        
+        // Initialize on load
+        init();
+    </script>
+</body>
+</html>
