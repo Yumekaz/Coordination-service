@@ -51,6 +51,7 @@ class Coordinator:
         self._lock = threading.RLock()
         self._started = False
         self._start_time = datetime.now().timestamp()
+        self._last_recovery_stats: Dict[str, Any] = {}
         
         # Initialize components
         self._persistence = Persistence(db_path)
@@ -88,6 +89,7 @@ class Coordinator:
             
             # Perform crash recovery
             recovery_stats = self._recovery_manager.recover()
+            self._last_recovery_stats = dict(recovery_stats)
             
             # Start session timeout checker
             self._session_manager.start()
@@ -135,6 +137,7 @@ class Coordinator:
                 self._session_manager.remove_session(session.session_id)
                 self._operation_log.discard_last_operation(operation.sequence_number)
                 raise
+            self._operation_log.commit(operation)
             
             logger.info(f"Session opened: {session.session_id}")
             
@@ -171,6 +174,7 @@ class Coordinator:
                 self._session_manager.replace_session(snapshot)
                 self._operation_log.discard_last_operation(operation.sequence_number)
                 raise
+            self._operation_log.commit(operation)
             
             return session
     
@@ -218,6 +222,7 @@ class Coordinator:
 
                 self._metadata_tree.apply_delete_paths(deleted_paths)
                 session.ephemeral_nodes.clear()
+                self._operation_log.commit(operation)
 
                 for path in deleted_paths:
                     self._watch_manager.trigger(
@@ -325,6 +330,7 @@ class Coordinator:
         committed_node = self._metadata_tree.commit_create(node)
         if node_type == NodeType.EPHEMERAL:
             self._session_manager.add_ephemeral_node(session_id, committed_node.path)
+        self._operation_log.commit(operation)
         
         # Trigger watches
         self._watch_manager.trigger(
@@ -654,6 +660,7 @@ class Coordinator:
                 raise
 
             committed_node = self._metadata_tree.commit_set(node)
+            self._operation_log.commit(operation)
             
             # Trigger watches
             self._watch_manager.trigger(
@@ -711,6 +718,7 @@ class Coordinator:
             for _, (live_session, snapshot) in session_updates.items():
                 live_session.ephemeral_nodes.clear()
                 live_session.ephemeral_nodes.update(snapshot.ephemeral_nodes)
+            self._operation_log.commit(operation)
             
             # Trigger watches for each deleted node
             for deleted_path in deleted_paths:
@@ -744,6 +752,99 @@ class Coordinator:
         """
         with self._lock:
             return self._metadata_tree.list_children(path)
+
+    def get_operations(
+        self,
+        since_sequence: int = 0,
+        limit: int = 100,
+        operation_types: Optional[Set[OperationType]] = None,
+        path_prefix: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> List[Operation]:
+        """Return committed operations with optional filtering."""
+        with self._lock:
+            operations = self._operation_log.get_operations_since(since_sequence)
+
+        operations = self._filter_operations(
+            operations,
+            operation_types=operation_types,
+            path_prefix=path_prefix,
+            session_id=session_id,
+        )
+
+        if limit <= 0:
+            return []
+        return operations[:limit]
+
+    def get_operation(self, sequence_number: int) -> Optional[Operation]:
+        """Return a committed operation by sequence number."""
+        with self._lock:
+            return self._operation_log.get_operation(sequence_number)
+
+    def _filter_operations(
+        self,
+        operations: List[Operation],
+        operation_types: Optional[Set[OperationType]] = None,
+        path_prefix: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> List[Operation]:
+        """Apply read-side operation filters."""
+        filtered = operations
+        if operation_types:
+            filtered = [op for op in filtered if op.operation_type in operation_types]
+        if path_prefix:
+            filtered = [op for op in filtered if op.path.startswith(path_prefix)]
+        if session_id:
+            filtered = [op for op in filtered if op.session_id == session_id]
+        return filtered
+
+    def wait_for_operations(
+        self,
+        since_sequence: int = 0,
+        timeout_seconds: float = 30.0,
+        limit: int = 100,
+        operation_types: Optional[Set[OperationType]] = None,
+        path_prefix: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> List[Operation]:
+        """Wait for committed operations that match the provided filters."""
+        if timeout_seconds < 0:
+            raise ValueError("timeout_seconds must be non-negative")
+
+        deadline = time.monotonic() + timeout_seconds
+        current_since = since_sequence
+
+        while True:
+            with self._lock:
+                raw_operations = self._operation_log.get_operations_since(current_since)
+            operations = self._filter_operations(
+                raw_operations,
+                operation_types=operation_types,
+                path_prefix=path_prefix,
+                session_id=session_id,
+            )
+            if operations:
+                return operations[:limit]
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return []
+
+            raw_operations = self._operation_log.wait_for_operations_since(
+                current_since,
+                remaining,
+            )
+            if not raw_operations:
+                return []
+            operations = self._filter_operations(
+                raw_operations,
+                operation_types=operation_types,
+                path_prefix=path_prefix,
+                session_id=session_id,
+            )
+            if operations:
+                return operations[:limit]
+            current_since = raw_operations[-1].sequence_number
     
     # ========== Watch Operations ==========
     
@@ -844,3 +945,8 @@ class Coordinator:
     def verify_consistency(self) -> Tuple[bool, List[str]]:
         """Verify system consistency."""
         return self._recovery_manager.verify_consistency()
+
+    def get_last_recovery_stats(self) -> Dict[str, Any]:
+        """Return the most recent startup recovery report."""
+        with self._lock:
+            return dict(self._last_recovery_stats)

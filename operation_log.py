@@ -9,6 +9,7 @@ This guarantees that all clients see operations in the same order.
 """
 
 import threading
+import time
 from typing import List, Optional, Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -32,7 +33,8 @@ class OperationLog:
     
     def __init__(self):
         """Initialize the operation log."""
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._condition = threading.Condition(self._lock)
         self._sequence_number = 0
         self._operations: List[Operation] = []
         self._commit_callbacks: List[Callable[[Operation], None]] = []
@@ -90,13 +92,6 @@ class OperationLog:
             self._operations.append(operation)
             logger.debug(f"Appended operation: seq={operation.sequence_number}, type={operation_type.value}, path={path}")
             
-            # Notify commit callbacks
-            for callback in self._commit_callbacks:
-                try:
-                    callback(operation)
-                except Exception as e:
-                    logger.error(f"Commit callback error: {e}")
-            
             return operation
 
     def discard_last_operation(self, sequence_number: int) -> bool:
@@ -142,6 +137,46 @@ class OperationLog:
         """Get all operations in order."""
         with self._lock:
             return list(self._operations)
+
+    def commit(self, operation: Operation) -> None:
+        """
+        Mark an operation as committed and notify listeners.
+
+        Operations are appended provisionally before durable persistence.
+        This method is the point where downstream observers are told that
+        an operation is now safe to observe as committed.
+        """
+        with self._condition:
+            callbacks = list(self._commit_callbacks)
+            self._condition.notify_all()
+
+        for callback in callbacks:
+            try:
+                callback(operation)
+            except Exception as e:
+                logger.error(f"Commit callback error: {e}")
+
+    def wait_for_operations_since(
+        self,
+        sequence_number: int,
+        timeout_seconds: float,
+    ) -> List[Operation]:
+        """Wait until at least one committed operation exists after a sequence."""
+        deadline = time.monotonic() + timeout_seconds
+        with self._condition:
+            while True:
+                operations = [
+                    op for op in self._operations
+                    if op.sequence_number > sequence_number
+                ]
+                if operations:
+                    return list(operations)
+
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return []
+
+                self._condition.wait(timeout=remaining)
     
     def add_commit_callback(self, callback: Callable[[Operation], None]) -> None:
         """

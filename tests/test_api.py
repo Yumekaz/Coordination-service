@@ -13,6 +13,8 @@ import tempfile
 import os
 import sys
 import inspect
+import threading
+import time
 from fastapi.testclient import TestClient
 
 # Setup test database path before importing main
@@ -558,6 +560,108 @@ class TestHealthEndpoint:
         assert response.status_code == 200
         data = response.json()
         assert "consistent" in data
+
+
+class TestOperationTimelineEndpoints:
+    """Tests for committed operation timeline APIs."""
+
+    def test_list_operations_supports_filters(self, client):
+        """The operations endpoint should filter by type and path."""
+        session_id = client.post("/api/session/open", json={}).json()["session_id"]
+
+        client.post("/api/node/create", json={
+            "path": "/ops-filter",
+            "data": "v1",
+            "persistent": True,
+            "session_id": session_id,
+        })
+        client.post("/api/node/set", json={
+            "path": "/ops-filter",
+            "data": "v2",
+        })
+
+        response = client.get("/api/operations", params=[
+            ("path_prefix", "/ops-filter"),
+            ("operation_types", "CREATE"),
+        ])
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["count"] == 1
+        assert data["operations"][0]["operation_type"] == "CREATE"
+        assert data["operations"][0]["path"] == "/ops-filter"
+        assert data["operations"][0]["summary"].startswith("CREATE")
+        assert data["next_since"] == data["last_sequence"]
+
+    def test_tail_operations_waits_for_next_commit(self, client):
+        """The tail endpoint should block until a matching commit appears."""
+        session_id = client.post("/api/session/open", json={}).json()["session_id"]
+        baseline = client.get("/api/stats").json()["last_sequence"]
+
+        def writer():
+            time.sleep(0.2)
+            main.coordinator.create(
+                "/ops-tail",
+                b"payload",
+                persistent=True,
+                session_id=session_id,
+            )
+
+        thread = threading.Thread(target=writer)
+        thread.start()
+        try:
+            response = client.get("/api/operations/tail", params={
+                "since_sequence": baseline,
+                "timeout_seconds": 2,
+                "path_prefix": "/ops-tail",
+            })
+        finally:
+            thread.join()
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "ok"
+        assert data["count"] >= 1
+        assert data["operations"][0]["path"] == "/ops-tail"
+        assert data["operations"][0]["summary"].startswith("CREATE")
+
+    def test_tail_operations_times_out_cleanly(self, client):
+        """The tail endpoint should report timeouts without inventing data."""
+        baseline = client.get("/api/stats").json()["last_sequence"]
+
+        response = client.get("/api/operations/tail", params={
+            "since_sequence": baseline,
+            "timeout_seconds": 0.1,
+            "path_prefix": "/ops-never",
+        })
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "timeout"
+        assert data["count"] == 0
+        assert data["operations"] == []
+
+    def test_operation_detail_and_recovery_endpoints(self, client):
+        """Detail and recovery endpoints should expose committed state."""
+        session_id = client.post("/api/session/open", json={}).json()["session_id"]
+        client.post("/api/node/create", json={
+            "path": "/ops-detail",
+            "data": "payload",
+            "persistent": True,
+            "session_id": session_id,
+        })
+
+        operations = client.get("/api/operations", params={"path_prefix": "/ops-detail"}).json()
+        sequence_number = operations["operations"][0]["sequence_number"]
+
+        detail = client.get(f"/api/operations/{sequence_number}")
+        assert detail.status_code == 200
+        assert detail.json()["path"] == "/ops-detail"
+        assert detail.json()["data_preview"] == "payload"
+
+        recovery = client.get("/api/recovery/last")
+        assert recovery.status_code == 200
+        assert "wal_entries_read" in recovery.json()
 
 
 class TestEphemeralNodeCleanup:

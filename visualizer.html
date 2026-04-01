@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Coordination Service — Live Monitor</title>
+    <title>Coordination Service — Control Plane</title>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500;600&display=swap');
         
@@ -303,14 +303,38 @@
         }
         
         .event-type.create { color: var(--accent); }
+        .event-type.set { color: var(--info); }
         .event-type.delete { color: var(--danger); }
-        .event-type.update { color: var(--info); }
-        .event-type.session { color: var(--warning); }
+        .event-type.session_open { color: var(--warning); }
+        .event-type.session_heartbeat { color: #fbbf24; }
+        .event-type.session_close { color: #fb7185; }
         
         .event-detail {
             font-family: 'JetBrains Mono', monospace;
             font-size: 12px;
             color: var(--text-secondary);
+        }
+
+        .event-meta {
+            margin-top: 6px;
+            font-size: 11px;
+            color: var(--text-muted);
+        }
+
+        .recovery-summary {
+            margin-bottom: 12px;
+            padding: 10px 12px;
+            border-radius: 6px;
+            border: 1px solid var(--border);
+            background: var(--bg-secondary);
+            font-size: 12px;
+            color: var(--text-secondary);
+            line-height: 1.5;
+        }
+
+        .recovery-summary strong {
+            color: var(--text-primary);
+            margin-right: 8px;
         }
         
         /* Bottom Panel - Sessions */
@@ -588,16 +612,17 @@
         
         <section class="panel">
             <div class="panel-header">
-                <span class="panel-title">Live Events</span>
-                <span class="panel-count" id="eventCount">0 events</span>
+                <span class="panel-title">Committed Timeline</span>
+                <span class="panel-count" id="eventCount">0 ops</span>
             </div>
             <div class="panel-content">
+                <div id="recoverySummary" class="recovery-summary">Waiting for startup recovery report...</div>
                 <div id="eventLog">
                     <div class="empty-state">
                         <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M13 10V3L4 14h7v7l9-11h-7z"/>
                         </svg>
-                        <span>Waiting for events...</span>
+                        <span>Waiting for committed operations...</span>
                     </div>
                 </div>
             </div>
@@ -689,8 +714,12 @@
         // State
         let sessions = {};
         let nodes = {};
-        let events = [];
-        let eventCounter = 0;
+        let operations = [];
+        let lastOperationSequence = 0;
+        let timelineInitialized = false;
+        let recoverySummaryLoaded = false;
+        const TIMELINE_LIMIT = 50;
+        const HIDDEN_TIMELINE_TYPES = new Set(['SESSION_HEARTBEAT']);
         
         // Polling interval
         let pollInterval;
@@ -713,8 +742,17 @@
                 document.getElementById('statSessions').textContent = stats.sessions_alive;
                 document.getElementById('statWatches').textContent = stats.watches;
                 document.getElementById('statOps').textContent = stats.operations;
-                
-                await refreshTree();
+
+                if (!timelineInitialized) {
+                    lastOperationSequence = Math.max(0, stats.operations - TIMELINE_LIMIT);
+                    timelineInitialized = true;
+                }
+
+                await Promise.all([
+                    refreshTree(),
+                    refreshTimeline(),
+                    refreshRecoverySummary()
+                ]);
                 updateSessionTimers();
                 updateConnectionStatus(true);
             } catch (e) {
@@ -833,45 +871,147 @@
             document.getElementById('nodeCount').textContent = `${count} nodes`;
         }
         
-        // Add event to log
-        function addEvent(type, path, detail = '') {
-            const now = new Date();
-            const time = now.toTimeString().split(' ')[0];
-            eventCounter++;
-            
-            const event = { type, path, detail, time, id: eventCounter };
-            events.unshift(event);
-            if (events.length > 50) events.pop();
-            
-            renderEvents();
+        function escapeHtml(value) {
+            return String(value ?? '')
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
+        function formatTime(timestamp) {
+            if (!timestamp) return 'unknown time';
+            return new Date(timestamp * 1000).toLocaleTimeString();
+        }
+
+        function formatOperationLabel(operationType) {
+            return operationType.replace(/_/g, ' ');
+        }
+
+        function formatOperationDetail(operation) {
+            if (operation.operation_type === 'DELETE' && operation.delete_paths && operation.delete_paths.length > 0) {
+                const preview = operation.delete_paths.slice(0, 3).join(', ');
+                const suffix = operation.delete_paths.length > 3 ? ` +${operation.delete_paths.length - 3} more` : '';
+                return escapeHtml(`${preview}${suffix}`);
+            }
+
+            if (operation.path) {
+                return escapeHtml(operation.path);
+            }
+
+            if (operation.session_id) {
+                return escapeHtml(operation.session_id);
+            }
+
+            return '(system)';
+        }
+
+        function formatOperationMeta(operation) {
+            const parts = [formatTime(operation.timestamp)];
+
+            if (operation.session_id) {
+                parts.push(`session ${operation.session_id.slice(0, 8)}...`);
+            }
+
+            if (operation.node_type) {
+                parts.push(operation.node_type.toLowerCase());
+            }
+
+            if (operation.operation_type === 'DELETE' && operation.delete_paths && operation.delete_paths.length > 0) {
+                parts.push(`${operation.delete_paths.length} path(s)`);
+            } else if (operation.data_preview) {
+                parts.push(`data ${operation.data_preview}`);
+            }
+
+            return escapeHtml(parts.join(' · '));
+        }
+
+        async function refreshRecoverySummary() {
+            if (recoverySummaryLoaded) {
+                return;
+            }
+            try {
+                const response = await fetch(`${API_BASE}/recovery/last`);
+                if (!response.ok) return;
+
+                const stats = await response.json();
+                const container = document.getElementById('recoverySummary');
+
+                if (!stats || Object.keys(stats).length === 0) {
+                    container.textContent = 'Recovery report unavailable for this process.';
+                    return;
+                }
+
+                const mode = stats.snapshot_loaded ? 'SQLite snapshot loaded' : 'fresh start';
+                container.innerHTML = `
+                    <strong>Startup recovery</strong>
+                    ${escapeHtml(mode)} · WAL ${stats.wal_entries_read} · replayed ${stats.operations_replayed} · expired ${stats.sessions_expired} · cleaned ${stats.ephemeral_nodes_deleted} · ${stats.recovery_time_ms} ms
+                `;
+                recoverySummaryLoaded = true;
+            } catch (e) {
+                console.error('Failed to load recovery summary:', e);
+            }
+        }
+
+        async function refreshTimeline() {
+            try {
+                const response = await fetch(
+                    `${API_BASE}/operations?since_sequence=${lastOperationSequence}&limit=100`
+                );
+                if (!response.ok) return;
+
+                const data = await response.json();
+                const newOperations = data.operations || [];
+                const visibleOperations = newOperations.filter(
+                    operation => !HIDDEN_TIMELINE_TYPES.has(operation.operation_type)
+                );
+
+                if (newOperations.length > 0) {
+                    for (const operation of visibleOperations) {
+                        operations.unshift(operation);
+                    }
+                    operations = operations
+                        .filter((operation, index, items) =>
+                            items.findIndex(item => item.sequence_number === operation.sequence_number) === index
+                        )
+                        .slice(0, TIMELINE_LIMIT);
+                    lastOperationSequence = data.next_since || newOperations[newOperations.length - 1].sequence_number;
+                }
+
+                renderEvents();
+            } catch (e) {
+                console.error('Failed to refresh operations timeline:', e);
+            }
         }
         
-        // Render events
+        // Render committed operations timeline
         function renderEvents() {
             const container = document.getElementById('eventLog');
-            if (events.length === 0) {
+            if (operations.length === 0) {
                 container.innerHTML = `
                     <div class="empty-state">
                         <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M13 10V3L4 14h7v7l9-11h-7z"/>
                         </svg>
-                        <span>Waiting for events...</span>
+                        <span>Waiting for committed operations...</span>
                     </div>
                 `;
                 return;
             }
             
-            container.innerHTML = events.map(e => `
+            container.innerHTML = operations.map(operation => `
                 <div class="event">
-                    <span class="event-time">${e.time}</span>
+                    <span class="event-time">#${operation.sequence_number}</span>
                     <div class="event-content">
-                        <div class="event-type ${e.type.toLowerCase()}">${e.type}</div>
-                        <div class="event-detail">${e.path}${e.detail ? ' — ' + e.detail : ''}</div>
+                        <div class="event-type ${operation.operation_type.toLowerCase()}">${formatOperationLabel(operation.operation_type)}</div>
+                        <div class="event-detail">${formatOperationDetail(operation)}</div>
+                        <div class="event-meta">${formatOperationMeta(operation)}</div>
                     </div>
                 </div>
             `).join('');
             
-            document.getElementById('eventCount').textContent = `${events.length} events`;
+            document.getElementById('eventCount').textContent = `${operations.length} ops`;
         }
         
         // Session management
@@ -894,8 +1034,8 @@
                         nodes: 0,
                         created: Date.now()
                     };
-                    addEvent('SESSION', data.session_id.slice(0, 8) + '...', 'created');
                     renderSessions();
+                    await refreshTimeline();
                     closeModal('session');
                     startHeartbeat(data.session_id, timeout);
                 }
@@ -933,11 +1073,13 @@
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ session_id: sessionId })
                 });
-                
-                addEvent('SESSION', sessionId.slice(0, 8) + '...', 'terminated');
+
                 delete sessions[sessionId];
                 renderSessions();
-                setTimeout(refreshTree, 500);
+                setTimeout(() => {
+                    refreshTree();
+                    refreshTimeline();
+                }, 500);
             } catch (e) {
                 console.error('Failed to kill session:', e);
             }
@@ -1021,9 +1163,8 @@
                 });
                 
                 if (response.ok) {
-                    addEvent('CREATE', path, persistent ? 'persistent' : 'ephemeral');
                     closeModal('node');
-                    await refreshTree();
+                    await Promise.all([refreshTree(), refreshTimeline()]);
                 }
             } catch (e) {
                 console.error('Failed to create node:', e);
@@ -1041,8 +1182,6 @@
         
         // Demo: Leader Election
         async function runDemo() {
-            addEvent('SESSION', 'Demo', 'Starting leader election demo...');
-            
             // Create election namespace
             const adminSession = await createDemoSession(60);
             await createDemoNode('/election', '', true, adminSession);
@@ -1058,15 +1197,10 @@
                 await createDemoNode(`/election/${name}`, `candidate: ${name}`, false, sessionId);
             }
             
-            addEvent('SESSION', 'Demo', `Leader is: ${candidates[0]}`);
-            
             // After 3 seconds, kill the leader
             await sleep(3000);
-            addEvent('SESSION', 'Demo', 'Killing leader (alice)...');
             await killSession(candidateSessions[0].sessionId);
-            
             await sleep(1000);
-            addEvent('SESSION', 'Demo', `New leader is: ${candidates[1]}`);
         }
         
         async function createDemoSession(timeout) {
@@ -1084,10 +1218,9 @@
                 nodes: 0,
                 created: Date.now()
             };
-            
-            addEvent('SESSION', data.session_id.slice(0, 8) + '...', 'created');
             renderSessions();
             startHeartbeat(data.session_id, timeout);
+            await refreshTimeline();
             
             return data.session_id;
         }
@@ -1101,8 +1234,7 @@
                 });
                 
                 if (response.ok) {
-                    addEvent('CREATE', path, persistent ? 'persistent' : 'ephemeral');
-                    await refreshTree();
+                    await Promise.all([refreshTree(), refreshTimeline()]);
                 }
             } catch (e) {
                 console.error('Failed to create demo node:', e);

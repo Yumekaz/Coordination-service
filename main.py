@@ -19,9 +19,10 @@ from typing import Any, Dict, List, Optional
 from contextlib import asynccontextmanager
 import uvicorn
 import os
+import json
 
 from coordinator import Coordinator
-from models import EventType, NodeType
+from models import EventType, NodeType, Operation, OperationType
 from logger import get_logger
 from config import HOST, PORT, DEFAULT_SESSION_TIMEOUT, WATCH_WAIT_TIMEOUT
 from errors import ConflictError, ForbiddenError
@@ -57,7 +58,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Coordination Service",
-    description="ZooKeeper-class metadata and coordination service",
+    description="Crash-aware coordination engine with leases, watches, and committed operation history",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -190,9 +191,70 @@ class HealthResponse(BaseModel):
     uptime_seconds: int
 
 
+class OperationResponse(BaseModel):
+    sequence_number: int
+    operation_type: str
+    path: str
+    data: str
+    data_size: int
+    data_preview: str
+    delete_paths: List[str] = Field(default_factory=list)
+    summary: str
+    session_id: Optional[str] = None
+    timestamp: float
+    node_type: Optional[str] = None
+
+
+class OperationsResponse(BaseModel):
+    operations: List[OperationResponse]
+    count: int
+    last_sequence: int
+    next_since: int
+    status: str = "ok"
+
+
 class ErrorResponse(BaseModel):
     error: str
     detail: str
+
+
+def _serialize_operation(operation: Operation) -> OperationResponse:
+    """Convert an internal operation into an API response model."""
+    payload = operation.to_dict()
+    delete_paths: List[str] = []
+    if operation.operation_type == OperationType.DELETE and operation.data:
+        try:
+            decoded = json.loads(operation.data.decode("utf-8"))
+            if isinstance(decoded, list):
+                delete_paths = [str(path) for path in decoded]
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            delete_paths = []
+
+    data_preview = payload["data"]
+    if len(data_preview) > 120:
+        data_preview = data_preview[:117] + "..."
+
+    summary = f"{payload['operation_type']} {payload['path'] or '(session)'}"
+    if operation.operation_type == OperationType.DELETE and delete_paths:
+        summary = f"DELETE {len(delete_paths)} path(s)"
+    elif operation.operation_type in (OperationType.CREATE, OperationType.SET) and payload["path"]:
+        summary = f"{payload['operation_type']} {payload['path']}"
+    elif operation.session_id:
+        summary = f"{payload['operation_type']} {operation.session_id[:8]}"
+
+    return OperationResponse(
+        sequence_number=payload["sequence_number"],
+        operation_type=payload["operation_type"],
+        path=payload["path"],
+        data=payload["data"],
+        data_size=len(operation.data or b""),
+        data_preview=data_preview,
+        delete_paths=delete_paths,
+        summary=summary,
+        session_id=payload["session_id"],
+        timestamp=payload["timestamp"],
+        node_type=payload["node_type"],
+    )
 
 
 # ========== Exception Handlers ==========
@@ -444,6 +506,77 @@ async def verify() -> dict:
         "consistent": is_consistent,
         "issues": issues,
     }
+
+
+@app.get("/api/operations", response_model=OperationsResponse)
+async def list_operations(
+    since_sequence: int = Query(default=0, ge=0),
+    limit: int = Query(default=100, ge=1, le=1000),
+    operation_types: Optional[List[OperationType]] = Query(default=None),
+    path_prefix: Optional[str] = Query(default=None),
+    session_id: Optional[str] = Query(default=None),
+) -> OperationsResponse:
+    """List committed operations in sequence order."""
+    operations = coordinator.get_operations(
+        since_sequence=since_sequence,
+        limit=limit,
+        operation_types=set(operation_types) if operation_types else None,
+        path_prefix=path_prefix,
+        session_id=session_id,
+    )
+    serialized = [_serialize_operation(op) for op in operations]
+    last_sequence = serialized[-1].sequence_number if serialized else since_sequence
+    return OperationsResponse(
+        operations=serialized,
+        count=len(serialized),
+        last_sequence=last_sequence,
+        next_since=last_sequence,
+    )
+
+
+@app.get("/api/operations/tail", response_model=OperationsResponse)
+async def tail_operations(
+    since_sequence: int = Query(default=0, ge=0),
+    timeout_seconds: float = Query(default=WATCH_WAIT_TIMEOUT, ge=0, le=300),
+    limit: int = Query(default=100, ge=1, le=1000),
+    operation_types: Optional[List[OperationType]] = Query(default=None),
+    path_prefix: Optional[str] = Query(default=None),
+    session_id: Optional[str] = Query(default=None),
+) -> OperationsResponse:
+    """Wait for the next committed operations after a sequence number."""
+    operations = coordinator.wait_for_operations(
+        since_sequence=since_sequence,
+        timeout_seconds=timeout_seconds,
+        limit=limit,
+        operation_types=set(operation_types) if operation_types else None,
+        path_prefix=path_prefix,
+        session_id=session_id,
+    )
+    serialized = [_serialize_operation(op) for op in operations]
+    last_sequence = serialized[-1].sequence_number if serialized else since_sequence
+    status = "ok" if serialized else "timeout"
+    return OperationsResponse(
+        operations=serialized,
+        count=len(serialized),
+        last_sequence=last_sequence,
+        next_since=last_sequence,
+        status=status,
+    )
+
+
+@app.get("/api/operations/{sequence_number}", response_model=OperationResponse)
+async def get_operation(sequence_number: int) -> OperationResponse:
+    """Fetch one committed operation by sequence number."""
+    operation = coordinator.get_operation(sequence_number)
+    if operation is None:
+        raise HTTPException(status_code=404, detail=f"Operation not found: {sequence_number}")
+    return _serialize_operation(operation)
+
+
+@app.get("/api/recovery/last")
+async def last_recovery() -> dict:
+    """Return the most recent startup recovery report."""
+    return coordinator.get_last_recovery_stats()
 
 
 # ========== Visualizer ==========

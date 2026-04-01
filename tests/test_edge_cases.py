@@ -212,6 +212,7 @@ class TestOperationLogEdgeCases:
             operation_type=OperationType.CREATE,
             path="/test"
         )
+        log.commit(op)
         
         assert len(callback_called) == 1
         assert callback_called[0].path == "/test"
