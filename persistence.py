@@ -713,6 +713,19 @@ class Persistence:
                 count = cursor.rowcount
                 logger.info(f"Truncated {count} operations before seq={sequence_number}")
                 return count
+
+    def _append_wal_after_commit(self, operation: Operation) -> None:
+        """
+        Best-effort custom WAL append after the SQLite commit succeeds.
+
+        SQLite plus the operations table are the canonical committed state.
+        The custom WAL is supplemental recovery evidence and must never cause
+        an uncommitted operation to reappear after restart.
+        """
+        try:
+            self._wal_writer.append(operation)
+        except Exception as e:
+            logger.error(f"Custom WAL append failed after commit for seq={operation.sequence_number}: {e}")
     
     # ========== Atomic Multi-Operation ==========
     
@@ -729,9 +742,6 @@ class Persistence:
         Writes to both SQLite and custom WAL file (Section 10).
         """
         with self._lock:
-            # Write to custom WAL file first (Section 10 format)
-            self._wal_writer.append(operation)
-            
             with self._transaction() as conn:
                 # Log operation to SQLite
                 conn.execute("""
@@ -766,14 +776,21 @@ class Persistence:
                 # Update session if ephemeral
                 if session:
                     conn.execute("""
-                        UPDATE sessions SET ephemeral_nodes = ?
+                        UPDATE sessions
+                        SET created_at = ?, last_heartbeat = ?, timeout_seconds = ?, ephemeral_nodes = ?, is_alive = ?
                         WHERE session_id = ?
                     """, (
+                        session.created_at,
+                        session.last_heartbeat,
+                        session.timeout_seconds,
                         json.dumps(list(session.ephemeral_nodes)),
+                        1 if session.is_alive else 0,
                         session.session_id,
                     ))
                 
                 logger.debug(f"Atomic create: {node.path}")
+
+            self._append_wal_after_commit(operation)
     
     def atomic_update_node(
         self,
@@ -782,9 +799,6 @@ class Persistence:
     ) -> None:
         """Atomically update a node and log the operation."""
         with self._lock:
-            # Write to custom WAL file first (Section 10 format)
-            self._wal_writer.append(operation)
-            
             with self._transaction() as conn:
                 # Log operation to SQLite
                 conn.execute("""
@@ -813,19 +827,18 @@ class Persistence:
                 ))
                 
                 logger.debug(f"Atomic update: {node.path}")
+
+            self._append_wal_after_commit(operation)
     
     def atomic_delete_node(
         self,
         paths: List[str],
         operation: Operation,
-        session: Optional[Session] = None,
+        sessions: Optional[List[Session]] = None,
     ) -> None:
         """Atomically delete nodes and log the operation."""
         with self._lock:
             operation.data = json.dumps(paths).encode()
-
-            # Write to custom WAL file first (Section 10 format)
-            self._wal_writer.append(operation)
             
             with self._transaction() as conn:
                 # Log operation to SQLite
@@ -851,17 +864,24 @@ class Persistence:
                         paths
                     )
                 
-                # Update session if provided
-                if session:
+                # Update any affected session records.
+                for session in sessions or []:
                     conn.execute("""
-                        UPDATE sessions SET ephemeral_nodes = ?
+                        UPDATE sessions
+                        SET created_at = ?, last_heartbeat = ?, timeout_seconds = ?, ephemeral_nodes = ?, is_alive = ?
                         WHERE session_id = ?
                     """, (
+                        session.created_at,
+                        session.last_heartbeat,
+                        session.timeout_seconds,
                         json.dumps(list(session.ephemeral_nodes)),
+                        1 if session.is_alive else 0,
                         session.session_id,
                     ))
                 
                 logger.debug(f"Atomic delete: {paths}")
+
+            self._append_wal_after_commit(operation)
     
     # ========== Utility ==========
     

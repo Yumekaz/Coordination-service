@@ -18,7 +18,7 @@ from typing import List
 
 from coordinator import Coordinator
 from persistence import Persistence
-from models import NodeType, Node
+from models import EventType, NodeType, Node
 
 
 class TestCreateAtomicity:
@@ -262,6 +262,138 @@ class TestTransactionRollback:
         after = coordinator.get("/rollback_test")
         assert after.data == before.data
         assert after.version == before.version
+
+
+class TestDurabilityRollback:
+    """Tests that persistence failures do not leak partial in-memory state."""
+
+    def test_create_failure_does_not_mutate_metadata(self, coordinator: Coordinator):
+        """Failed create should leave the tree unchanged."""
+        session = coordinator.open_session()
+
+        def fail_atomic_create(*args, **kwargs):
+            raise RuntimeError("forced create persistence failure")
+
+        before_count = coordinator.get_health()["nodes_count"]
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr(coordinator._persistence, "atomic_create_node", fail_atomic_create)
+        try:
+            with pytest.raises(RuntimeError, match="forced create persistence failure"):
+                coordinator.create(
+                    "/durability-create",
+                    b"payload",
+                    persistent=True,
+                    session_id=session.session_id,
+                )
+        finally:
+            monkeypatch.undo()
+
+        assert coordinator.get("/durability-create") is None
+        assert coordinator.get_health()["nodes_count"] == before_count
+
+    def test_update_failure_does_not_mutate_metadata(self, coordinator: Coordinator):
+        """Failed update should leave data and version unchanged."""
+        session = coordinator.open_session()
+        coordinator.create("/durability-update", b"initial", persistent=True, session_id=session.session_id)
+
+        before = coordinator.get("/durability-update")
+        before_data = before.data
+        before_version = before.version
+        before_modified = before.modified_at
+
+        def fail_atomic_update(*args, **kwargs):
+            raise RuntimeError("forced update persistence failure")
+
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr(coordinator._persistence, "atomic_update_node", fail_atomic_update)
+        try:
+            with pytest.raises(RuntimeError, match="forced update persistence failure"):
+                coordinator.set("/durability-update", b"updated")
+        finally:
+            monkeypatch.undo()
+
+        after = coordinator.get("/durability-update")
+        assert after.data == before_data
+        assert after.version == before_version
+        assert after.modified_at == before_modified
+
+    def test_delete_failure_does_not_mutate_metadata(self, coordinator: Coordinator):
+        """Failed delete should leave the tree intact."""
+        session = coordinator.open_session()
+        coordinator.create("/durability-delete", b"payload", persistent=True, session_id=session.session_id)
+
+        before = coordinator.get("/durability-delete")
+        before_data = before.data
+        before_version = before.version
+        before_modified = before.modified_at
+
+        def fail_atomic_delete(*args, **kwargs):
+            raise RuntimeError("forced delete persistence failure")
+
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr(coordinator._persistence, "atomic_delete_node", fail_atomic_delete)
+        try:
+            with pytest.raises(RuntimeError, match="forced delete persistence failure"):
+                coordinator.delete("/durability-delete")
+        finally:
+            monkeypatch.undo()
+
+        after = coordinator.get("/durability-delete")
+        assert after is not None
+        assert after.data == before_data
+        assert after.version == before_version
+        assert after.modified_at == before_modified
+
+    def test_session_expiry_cleanup_failure_does_not_drop_ephemeral_state(self, coordinator: Coordinator):
+        """Failed expiry cleanup should not orphan or remove the ephemeral node."""
+        session = coordinator.open_session()
+        coordinator.create("/durability-expiry", b"", persistent=True, session_id=session.session_id)
+        coordinator.create(
+            "/durability-expiry/lease",
+            b"lease-holder",
+            persistent=False,
+            session_id=session.session_id,
+        )
+
+        def fail_atomic_delete(*args, **kwargs):
+            raise RuntimeError("forced expiry persistence failure")
+
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr(coordinator._persistence, "atomic_delete_node", fail_atomic_delete)
+        try:
+            with pytest.raises(RuntimeError, match="forced expiry persistence failure"):
+                coordinator._on_session_expired(session)
+        finally:
+            monkeypatch.undo()
+
+        assert coordinator.exists("/durability-expiry/lease") is True
+        assert "/durability-expiry/lease" in session.ephemeral_nodes
+
+    def test_stale_cas_does_not_commit_or_fire_watch(self, coordinator: Coordinator):
+        """Rejected CAS updates must not append commits or fire watches."""
+        session = coordinator.open_session()
+        coordinator.create("/cas_watch", b"v1", persistent=True, session_id=session.session_id)
+
+        watch = coordinator.register_watch(
+            "/cas_watch",
+            session.session_id,
+            event_types={EventType.UPDATE},
+        )
+
+        operations_before = len(coordinator._operation_log.get_all_operations())
+        before = coordinator.get("/cas_watch")
+        before_data = before.data
+        before_version = before.version
+
+        with pytest.raises(ValueError):
+            coordinator.set("/cas_watch", b"stale", expected_version=99)
+
+        assert len(coordinator._operation_log.get_all_operations()) == operations_before
+        assert coordinator.wait_watch(watch.watch_id, timeout_seconds=0.1) is None
+
+        after = coordinator.get("/cas_watch")
+        assert after.data == before_data
+        assert after.version == before_version
 
 
 class TestPersistenceAtomicity:

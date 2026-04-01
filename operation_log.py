@@ -98,6 +98,28 @@ class OperationLog:
                     logger.error(f"Commit callback error: {e}")
             
             return operation
+
+    def discard_last_operation(self, sequence_number: int) -> bool:
+        """
+        Remove the most recent in-memory operation if it was not committed.
+
+        This is used by the coordinator to roll back provisional log entries
+        when persistence fails before an operation becomes durable.
+        """
+        with self._lock:
+            if self._operations and self._operations[-1].sequence_number == sequence_number:
+                self._operations.pop()
+                if self._sequence_number == sequence_number:
+                    self._sequence_number -= 1
+                logger.debug(f"Discarded provisional operation: seq={sequence_number}")
+                return True
+
+            if self._sequence_number == sequence_number:
+                self._sequence_number -= 1
+                logger.debug(f"Released provisional sequence without committed op: seq={sequence_number}")
+                return True
+
+            return False
     
     def get_operations_since(self, sequence_number: int) -> List[Operation]:
         """

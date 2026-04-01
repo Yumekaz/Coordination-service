@@ -201,33 +201,44 @@ class Coordinator:
         """
         with self._lock:
             logger.info(f"Handling session expiry: {session.session_id}")
-            
-            # Delete ephemeral nodes
-            deleted_paths = self._metadata_tree.delete_session_nodes(session.session_id)
-            session.ephemeral_nodes.clear()
-            
-            # Persist deletions
+
+            deleted_paths = self._metadata_tree.plan_delete_session_nodes(session.session_id)
+            persisted_session = self._clone_session(session)
+            persisted_session.ephemeral_nodes.difference_update(deleted_paths)
+
             if deleted_paths:
                 operation = self._operation_log.append(
                     operation_type=OperationType.DELETE,
                     path=",".join(deleted_paths),
                     session_id=session.session_id,
                 )
-                self._persistence.delete_nodes(deleted_paths)
-                
-                # Trigger watches for each deleted node
+                try:
+                    self._persistence.atomic_delete_node(
+                        deleted_paths,
+                        operation,
+                        sessions=[persisted_session],
+                    )
+                except Exception:
+                    self._operation_log.discard_last_operation(operation.sequence_number)
+                    raise
+
+                self._metadata_tree.apply_delete_paths(deleted_paths)
+                session.ephemeral_nodes.clear()
+
                 for path in deleted_paths:
                     self._watch_manager.trigger(
                         path=path,
                         event_type=EventType.DELETE,
                         sequence_number=operation.sequence_number,
                     )
-            
-            # Clear session's watches
+            else:
+                self._persistence.save_session(persisted_session)
+
             self._watch_manager.clear_session_watches(session.session_id)
-            
-            # Persist session state
-            self._persistence.save_session(session)
+
+            if not deleted_paths:
+                session.ephemeral_nodes.clear()
+                session.ephemeral_nodes.update(persisted_session.ephemeral_nodes)
             
             logger.info(f"Session cleanup complete: deleted {len(deleted_paths)} ephemeral nodes")
     
@@ -287,43 +298,51 @@ class Coordinator:
         if isinstance(data, str):
             data = data.encode("utf-8")
         
-        # Create node in tree
-        node = self._metadata_tree.create(
+        node = self._metadata_tree.prepare_create(
             path=path,
             data=data,
             node_type=node_type,
             session_id=session_id,
         )
         
-        # Track ephemeral node in session
-        session = None
+        persisted_session = None
         if node_type == NodeType.EPHEMERAL:
-            self._session_manager.add_ephemeral_node(session_id, path)
-            session = self._session_manager.get_session(session_id)
+            live_session = self._session_manager.get_session(session_id)
+            if live_session is None:
+                raise KeyError(f"Session does not exist: {session_id}")
+            persisted_session = self._clone_session(live_session)
+            persisted_session.ephemeral_nodes.add(node.path)
         
         # Log operation
         operation = self._operation_log.append(
             operation_type=OperationType.CREATE,
-            path=path,
+            path=node.path,
             data=data,
             session_id=session_id,
             node_type=node_type,
         )
         
-        # Persist atomically
-        self._persistence.atomic_create_node(node, operation, session)
+        try:
+            self._persistence.atomic_create_node(node, operation, persisted_session)
+        except Exception:
+            self._operation_log.discard_last_operation(operation.sequence_number)
+            raise
+
+        committed_node = self._metadata_tree.commit_create(node)
+        if node_type == NodeType.EPHEMERAL:
+            self._session_manager.add_ephemeral_node(session_id, committed_node.path)
         
         # Trigger watches
         self._watch_manager.trigger(
-            path=path,
+            path=committed_node.path,
             event_type=EventType.CREATE,
             data=data,
             sequence_number=operation.sequence_number,
         )
         
-        logger.info(f"Created node: {path} (type={node_type.value})")
+        logger.info(f"Created node: {committed_node.path} (type={node_type.value})")
         
-        return node, operation
+        return committed_node, operation
 
     def _normalize_path(self, path: str) -> str:
         """Normalize a path into canonical form."""
@@ -336,6 +355,35 @@ class Coordinator:
         while "//" in path:
             path = path.replace("//", "/")
         return path
+
+    def _clone_session(self, session: Session) -> Session:
+        """Create a detached copy of a session for staged persistence."""
+        return Session.from_dict(session.to_dict())
+
+    def _build_session_updates_for_deleted_paths(
+        self,
+        deleted_paths: List[str],
+    ) -> Dict[str, Tuple[Session, Session]]:
+        """Build staged session updates for any ephemeral nodes being deleted."""
+        session_updates: Dict[str, Tuple[Session, Session]] = {}
+        for deleted_path in deleted_paths:
+            deleted_node = self._metadata_tree.get(deleted_path)
+            if deleted_node is None or not deleted_node.session_id:
+                continue
+
+            live_session = self._session_manager.get_session(deleted_node.session_id)
+            if live_session is None:
+                continue
+
+            if deleted_node.session_id not in session_updates:
+                session_updates[deleted_node.session_id] = (
+                    live_session,
+                    self._clone_session(live_session),
+                )
+
+            session_updates[deleted_node.session_id][1].ephemeral_nodes.discard(deleted_path)
+
+        return session_updates
 
     def _ensure_parent_paths(self, path: str) -> List[str]:
         """Create missing persistent parents for a target path."""
@@ -592,8 +640,11 @@ class Coordinator:
             if isinstance(data, str):
                 data = data.encode("utf-8")
             
-            # Update node
-            node = self._metadata_tree.set(path, data, expected_version=expected_version)
+            node = self._metadata_tree.prepare_set(
+                path,
+                data,
+                expected_version=expected_version,
+            )
             
             # Log operation
             operation = self._operation_log.append(
@@ -602,8 +653,13 @@ class Coordinator:
                 data=data,
             )
             
-            # Persist atomically
-            self._persistence.atomic_update_node(node, operation)
+            try:
+                self._persistence.atomic_update_node(node, operation)
+            except Exception:
+                self._operation_log.discard_last_operation(operation.sequence_number)
+                raise
+
+            committed_node = self._metadata_tree.commit_set(node)
             
             # Trigger watches
             self._watch_manager.trigger(
@@ -613,9 +669,9 @@ class Coordinator:
                 sequence_number=operation.sequence_number,
             )
             
-            logger.info(f"Updated node: {path} (version={node.version})")
+            logger.info(f"Updated node: {path} (version={committed_node.version})")
             
-            return node
+            return committed_node
     
     def delete(self, path: str) -> List[str]:
         """
@@ -636,15 +692,9 @@ class Coordinator:
             node = self._metadata_tree.get(path)
             if node is None:
                 raise KeyError(f"Node does not exist: {path}")
-            
-            # Delete from tree
-            deleted_paths = self._metadata_tree.delete(path, recursive=True)
-            
-            # Update session tracking for ephemeral nodes
-            session = None
-            if node.session_id:
-                self._session_manager.remove_ephemeral_node(node.session_id, path)
-                session = self._session_manager.get_session(node.session_id)
+
+            deleted_paths = self._metadata_tree.plan_delete(path, recursive=True)
+            session_updates = self._build_session_updates_for_deleted_paths(deleted_paths)
             
             # Log operation
             operation = self._operation_log.append(
@@ -653,8 +703,20 @@ class Coordinator:
                 session_id=node.session_id,
             )
             
-            # Persist atomically
-            self._persistence.atomic_delete_node(deleted_paths, operation, session)
+            try:
+                self._persistence.atomic_delete_node(
+                    deleted_paths,
+                    operation,
+                    sessions=[snapshot for _, snapshot in session_updates.values()],
+                )
+            except Exception:
+                self._operation_log.discard_last_operation(operation.sequence_number)
+                raise
+
+            self._metadata_tree.apply_delete_paths(deleted_paths)
+            for _, (live_session, snapshot) in session_updates.items():
+                live_session.ephemeral_nodes.clear()
+                live_session.ephemeral_nodes.update(snapshot.ephemeral_nodes)
             
             # Trigger watches for each deleted node
             for deleted_path in deleted_paths:

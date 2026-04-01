@@ -49,6 +49,10 @@ class MetadataTree:
             node_type=NodeType.PERSISTENT,
         )
         logger.info("MetadataTree initialized with root node")
+
+    def _clone_node(self, node: Node) -> Node:
+        """Create a detached copy of a node."""
+        return Node.from_dict(node.to_dict())
     
     def _normalize_path(self, path: str) -> str:
         """
@@ -129,6 +133,17 @@ class MetadataTree:
             ValueError: If path is invalid or parent doesn't exist
             KeyError: If node already exists
         """
+        node = self.prepare_create(path, data, node_type, session_id=session_id)
+        return self.commit_create(node)
+
+    def prepare_create(
+        self,
+        path: str,
+        data: bytes,
+        node_type: NodeType,
+        session_id: Optional[str] = None,
+    ) -> Node:
+        """Validate a create and return the node that would be inserted."""
         with self._lock:
             path = self._normalize_path(path)
             self._validate_path(path)
@@ -159,11 +174,25 @@ class MetadataTree:
                 created_at=now,
                 modified_at=now,
             )
-            
-            self._nodes[path] = node
-            logger.debug(f"Created node: {path} (type={node_type.value})")
-            
-            return node
+            return self._clone_node(node)
+
+    def commit_create(self, node: Node) -> Node:
+        """Insert a previously prepared node into the live tree."""
+        with self._lock:
+            path = self._normalize_path(node.path)
+            if path in self._nodes:
+                raise KeyError(f"Node already exists: {path}")
+
+            parent_path = self._get_parent_path(path)
+            if parent_path and parent_path not in self._nodes:
+                raise ValueError(f"Parent node does not exist: {parent_path}")
+            if parent_path and self._nodes[parent_path].node_type == NodeType.EPHEMERAL:
+                raise ValueError(f"Cannot create child under ephemeral node: {parent_path}")
+
+            committed = self._clone_node(node)
+            self._nodes[path] = committed
+            logger.debug(f"Created node: {path} (type={committed.node_type.value})")
+            return committed
     
     def get(self, path: str) -> Optional[Node]:
         """
@@ -199,6 +228,16 @@ class MetadataTree:
         Raises:
             KeyError: If node doesn't exist
         """
+        node = self.prepare_set(path, data, expected_version=expected_version)
+        return self.commit_set(node)
+
+    def prepare_set(
+        self,
+        path: str,
+        data: bytes,
+        expected_version: Optional[int] = None,
+    ) -> Node:
+        """Validate an update and return the new node state without applying it."""
         with self._lock:
             path = self._normalize_path(path)
             
@@ -208,16 +247,29 @@ class MetadataTree:
             if path == "/":
                 raise ValueError("Cannot modify root node")
 
-            node = self._nodes[path]
-            if expected_version is not None and node.version != expected_version:
-                raise VersionConflictError(path, expected_version, node.version)
-            node.data = data if isinstance(data, bytes) else data.encode("utf-8")
-            node.version += 1
-            node.modified_at = datetime.now().timestamp()
-            
-            logger.debug(f"Updated node: {path} (version={node.version})")
-            
-            return node
+            current = self._nodes[path]
+            if expected_version is not None and current.version != expected_version:
+                raise VersionConflictError(path, expected_version, current.version)
+
+            updated = self._clone_node(current)
+            updated.data = data if isinstance(data, bytes) else data.encode("utf-8")
+            updated.version += 1
+            updated.modified_at = datetime.now().timestamp()
+            return updated
+
+    def commit_set(self, node: Node) -> Node:
+        """Apply a previously prepared node update to the live tree."""
+        with self._lock:
+            path = self._normalize_path(node.path)
+            if path not in self._nodes:
+                raise KeyError(f"Node does not exist: {path}")
+            if path == "/":
+                raise ValueError("Cannot modify root node")
+
+            committed = self._clone_node(node)
+            self._nodes[path] = committed
+            logger.debug(f"Updated node: {path} (version={committed.version})")
+            return committed
     
     def delete(self, path: str, recursive: bool = True) -> List[str]:
         """
@@ -234,30 +286,36 @@ class MetadataTree:
             KeyError: If node doesn't exist
             ValueError: If trying to delete root or non-empty node without recursive
         """
+        deleted_paths = self.plan_delete(path, recursive=recursive)
+        return self.apply_delete_paths(deleted_paths)
+
+    def plan_delete(self, path: str, recursive: bool = True) -> List[str]:
+        """Plan a delete without applying it to the live tree."""
         with self._lock:
             path = self._normalize_path(path)
-            
+
             if path == "/":
                 raise ValueError("Cannot delete root node")
-            
+
             if path not in self._nodes:
                 raise KeyError(f"Node does not exist: {path}")
-            
-            # Find all children
+
             children = self._get_all_children(path)
-            
+
             if children and not recursive:
                 raise ValueError(f"Node has children: {path}")
-            
-            # Delete in reverse order (children first)
+
+            return sorted(children + [path], reverse=True)
+
+    def apply_delete_paths(self, paths: List[str]) -> List[str]:
+        """Delete a known set of paths from the live tree."""
+        with self._lock:
             deleted_paths = []
-            all_paths = sorted(children + [path], reverse=True)
-            
-            for p in all_paths:
-                del self._nodes[p]
-                deleted_paths.append(p)
-                logger.debug(f"Deleted node: {p}")
-            
+            for path in paths:
+                if path in self._nodes:
+                    del self._nodes[path]
+                    deleted_paths.append(path)
+                    logger.debug(f"Deleted node: {path}")
             return deleted_paths
     
     def exists(self, path: str) -> bool:
@@ -326,25 +384,28 @@ class MetadataTree:
         Called when a session expires or disconnects.
         Returns the list of deleted paths for watch notifications.
         """
+        deleted_paths = self.plan_delete_session_nodes(session_id)
+        return self.apply_delete_paths(deleted_paths)
+
+    def plan_delete_session_nodes(self, session_id: str) -> List[str]:
+        """Plan all ephemeral node deletions for an expired session."""
         with self._lock:
             paths_to_delete = [
                 node.path for node in self._nodes.values()
                 if node.session_id == session_id and node.node_type == NodeType.EPHEMERAL
             ]
-            
+
             deleted_paths = []
             seen_paths = set()
-            # Sort by depth (deepest first) to delete children before parents
             paths_to_delete.sort(key=lambda p: p.count("/"), reverse=True)
-            
+
             for path in paths_to_delete:
                 if path in self._nodes:
-                    for deleted_path in self.delete(path, recursive=True):
+                    for deleted_path in self.plan_delete(path, recursive=True):
                         if deleted_path not in seen_paths:
                             seen_paths.add(deleted_path)
                             deleted_paths.append(deleted_path)
-                    logger.debug(f"Deleted ephemeral subtree: {path} (session expired)")
-            
+
             return deleted_paths
     
     def get_all_nodes(self) -> List[Node]:
