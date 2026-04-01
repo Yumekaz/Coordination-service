@@ -124,17 +124,17 @@ class Coordinator:
             The created Session
         """
         with self._lock:
-            # Create session
             session = self._session_manager.open_session(timeout_seconds)
-            
-            # Log operation
-            self._operation_log.append(
+            operation = self._operation_log.append(
                 operation_type=OperationType.SESSION_OPEN,
                 session_id=session.session_id,
             )
-            
-            # Persist
-            self._persistence.save_session(session)
+            try:
+                self._persistence.atomic_save_session(session, operation)
+            except Exception:
+                self._session_manager.remove_session(session.session_id)
+                self._operation_log.discard_last_operation(operation.sequence_number)
+                raise
             
             logger.info(f"Session opened: {session.session_id}")
             
@@ -155,16 +155,22 @@ class Coordinator:
             ValueError: If session is dead
         """
         with self._lock:
+            existing = self._session_manager.get_session(session_id)
+            if existing is None:
+                raise KeyError(f"Session does not exist: {session_id}")
+            snapshot = self._clone_session(existing)
             session = self._session_manager.heartbeat(session_id)
             
-            # Log operation
-            self._operation_log.append(
+            operation = self._operation_log.append(
                 operation_type=OperationType.SESSION_HEARTBEAT,
                 session_id=session_id,
             )
-            
-            # Persist updated heartbeat time
-            self._persistence.save_session(session)
+            try:
+                self._persistence.atomic_save_session(session, operation)
+            except Exception:
+                self._session_manager.replace_session(snapshot)
+                self._operation_log.discard_last_operation(operation.sequence_number)
+                raise
             
             return session
     
@@ -178,19 +184,7 @@ class Coordinator:
             The closed Session, or None if not found
         """
         with self._lock:
-            session = self._session_manager.close_session(session_id)
-            
-            if session:
-                # Log operation
-                self._operation_log.append(
-                    operation_type=OperationType.SESSION_CLOSE,
-                    session_id=session_id,
-                )
-                
-                # Persist
-                self._persistence.save_session(session)
-            
-            return session
+            return self._session_manager.close_session(session_id)
     
     def _on_session_expired(self, session: Session) -> None:
         """

@@ -267,6 +267,73 @@ class TestTransactionRollback:
 class TestDurabilityRollback:
     """Tests that persistence failures do not leak partial in-memory state."""
 
+    def test_open_session_failure_does_not_leave_session_alive(self, coordinator: Coordinator):
+        """Failed session open should not leave a live session behind."""
+        monkeypatch = pytest.MonkeyPatch()
+
+        def fail_atomic_save_session(*args, **kwargs):
+            raise RuntimeError("forced open session persistence failure")
+
+        monkeypatch.setattr(coordinator._persistence, "atomic_save_session", fail_atomic_save_session)
+        try:
+            with pytest.raises(RuntimeError, match="forced open session persistence failure"):
+                coordinator.open_session()
+        finally:
+            monkeypatch.undo()
+
+        assert coordinator.get_health()["sessions_count"] == 0
+
+    def test_heartbeat_failure_does_not_mutate_session(self, coordinator: Coordinator):
+        """Failed heartbeat persistence should restore the prior session state."""
+        session = coordinator.open_session()
+        before = coordinator._clone_session(session)
+
+        monkeypatch = pytest.MonkeyPatch()
+
+        def fail_atomic_save_session(*args, **kwargs):
+            raise RuntimeError("forced heartbeat persistence failure")
+
+        monkeypatch.setattr(coordinator._persistence, "atomic_save_session", fail_atomic_save_session)
+        try:
+            with pytest.raises(RuntimeError, match="forced heartbeat persistence failure"):
+                coordinator.heartbeat(session.session_id)
+        finally:
+            monkeypatch.undo()
+
+        after = coordinator._session_manager.get_session(session.session_id)
+        assert after is not None
+        assert after.last_heartbeat == before.last_heartbeat
+        assert after.is_alive == before.is_alive
+
+    def test_close_session_failure_restores_alive_state(self, coordinator: Coordinator):
+        """Failed close cleanup should leave the session alive and its ephemeral node present."""
+        session = coordinator.open_session()
+        coordinator.create("/session-close", b"", persistent=True, session_id=session.session_id)
+        coordinator.create(
+            "/session-close/lease",
+            b"holder",
+            persistent=False,
+            session_id=session.session_id,
+        )
+
+        monkeypatch = pytest.MonkeyPatch()
+
+        def fail_atomic_delete(*args, **kwargs):
+            raise RuntimeError("forced close persistence failure")
+
+        monkeypatch.setattr(coordinator._persistence, "atomic_delete_node", fail_atomic_delete)
+        try:
+            with pytest.raises(RuntimeError, match="forced close persistence failure"):
+                coordinator.close_session(session.session_id)
+        finally:
+            monkeypatch.undo()
+
+        restored = coordinator._session_manager.get_session(session.session_id)
+        assert restored is not None
+        assert restored.is_alive is True
+        assert coordinator.exists("/session-close/lease") is True
+        assert "/session-close/lease" in restored.ephemeral_nodes
+
     def test_create_failure_does_not_mutate_metadata(self, coordinator: Coordinator):
         """Failed create should leave the tree unchanged."""
         session = coordinator.open_session()

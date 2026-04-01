@@ -98,6 +98,10 @@ class SessionManager:
         # Expire sessions outside the lock to prevent deadlock
         for session in expired_sessions:
             self.expire_session(session.session_id)
+
+    def _clone_session(self, session: Session) -> Session:
+        """Create a detached copy of a session."""
+        return Session.from_dict(session.to_dict())
     
     def open_session(
         self,
@@ -142,6 +146,17 @@ class SessionManager:
             logger.info(f"Session opened: {session_id} (timeout={timeout_seconds}s)")
             
             return session
+
+    def remove_session(self, session_id: str) -> Optional[Session]:
+        """Remove a session from the manager."""
+        with self._lock:
+            return self._sessions.pop(session_id, None)
+
+    def replace_session(self, session: Session) -> Session:
+        """Replace the stored state for a session."""
+        with self._lock:
+            self._sessions[session.session_id] = self._clone_session(session)
+            return self._sessions[session.session_id]
     
     def heartbeat(self, session_id: str) -> Session:
         """
@@ -203,7 +218,7 @@ class SessionManager:
             
             if not session.is_alive:
                 return session  # Already expired
-            
+            snapshot = self._clone_session(session)
             session.is_alive = False
             logger.info(f"Session expired: {session_id}")
         
@@ -212,7 +227,10 @@ class SessionManager:
             try:
                 callback(session)
             except Exception as e:
+                with self._lock:
+                    self._sessions[session_id] = snapshot
                 logger.error(f"Expiry callback error: {e}")
+                raise
         
         return session
     
@@ -230,7 +248,7 @@ class SessionManager:
             
             if not session.is_alive:
                 return session
-            
+            snapshot = self._clone_session(session)
             session.is_alive = False
             logger.info(f"Session closed: {session_id}")
         
@@ -239,7 +257,10 @@ class SessionManager:
             try:
                 callback(session)
             except Exception as e:
+                with self._lock:
+                    self._sessions[session_id] = snapshot
                 logger.error(f"Expiry callback error: {e}")
+                raise
         
         return session
     

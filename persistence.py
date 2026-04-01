@@ -569,6 +569,43 @@ class Persistence:
                     1 if session.is_alive else 0,
                 ))
                 logger.debug(f"Saved session: {session.session_id}")
+
+    def atomic_save_session(
+        self,
+        session: Session,
+        operation: Optional[Operation] = None,
+    ) -> None:
+        """Atomically persist a session update and an optional operation log entry."""
+        with self._lock:
+            with self._transaction() as conn:
+                if operation is not None:
+                    conn.execute("""
+                        INSERT INTO operations
+                        (sequence_number, operation_type, path, data, session_id, timestamp, node_type)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        operation.sequence_number,
+                        operation.operation_type.value,
+                        operation.path,
+                        operation.data,
+                        operation.session_id,
+                        operation.timestamp,
+                        operation.node_type.value if operation.node_type else None,
+                    ))
+
+                conn.execute("""
+                    INSERT OR REPLACE INTO sessions
+                    (session_id, created_at, last_heartbeat, timeout_seconds, ephemeral_nodes, is_alive)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (
+                    session.session_id,
+                    session.created_at,
+                    session.last_heartbeat,
+                    session.timeout_seconds,
+                    json.dumps(list(session.ephemeral_nodes)),
+                    1 if session.is_alive else 0,
+                ))
+                logger.debug(f"Atomically saved session: {session.session_id}")
     
     def delete_session(self, session_id: str) -> bool:
         """Delete a session atomically."""
