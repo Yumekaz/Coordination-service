@@ -22,8 +22,9 @@ Invariants (Section 13):
 - Durability Invariant: Acknowledged operations survive crashes
 """
 
+import json
 import os
-from typing import List, Tuple, Optional, Dict
+from typing import Dict, List, Optional, Tuple
 from datetime import datetime
 
 from models import Node, Session, Operation, NodeType, EventType, OperationType
@@ -157,11 +158,11 @@ class RecoveryManager:
         self._watch_manager.clear()
         logger.info("Cleared all watches")
         
-        # Step 7: Restore operation log sequence number
-        last_seq = self._persistence.get_last_sequence_number()
-        self._operation_log.restore_sequence(last_seq)
-        logger.info(f"Restored operation sequence to {last_seq}")
-        
+        # Step 7: Restore the in-memory operation log from the committed log.
+        operations = self._persistence.load_all_operations()
+        self._operation_log.restore_operations(operations)
+        logger.info(f"Restored {len(operations)} operations into in-memory log")
+
         # Truncate WAL after successful recovery (checkpoint)
         self._persistence.truncate_wal()
         logger.info("WAL truncated after successful recovery")
@@ -224,31 +225,27 @@ class RecoveryManager:
         replayed = 0
         
         for op in sorted_ops:
-            try:
-                # Check if operation is already in database
-                # (idempotent - skip if already applied)
-                existing = self._persistence.get_operation(op.sequence_number)
-                if existing:
-                    logger.debug(f"Skipping already applied operation: seq={op.sequence_number}")
-                    continue
-                
-                # Apply operation based on type
-                if op.operation_type == OperationType.CREATE:
-                    self._replay_create(op)
-                elif op.operation_type == OperationType.UPDATE:
-                    self._replay_update(op)
-                elif op.operation_type == OperationType.DELETE:
-                    self._replay_delete(op)
-                
-                # Log the operation to database
-                self._persistence.save_operation(op)
-                
-                replayed += 1
-                logger.debug(f"Replayed operation: seq={op.sequence_number}, type={op.operation_type.value}")
-                
-            except Exception as e:
-                logger.error(f"Error replaying operation seq={op.sequence_number}: {e}")
-                # Continue with next operation - partial replay is better than none
+            # Check if operation is already in database
+            # (idempotent - skip if already applied)
+            existing = self._persistence.get_operation(op.sequence_number)
+            if existing:
+                logger.debug(f"Skipping already applied operation: seq={op.sequence_number}")
+                continue
+
+            if op.operation_type == OperationType.CREATE:
+                self._replay_create(op)
+            elif op.operation_type == OperationType.SET:
+                self._replay_set(op)
+            elif op.operation_type == OperationType.DELETE:
+                self._replay_delete(op)
+            else:
+                raise ValueError(f"Unsupported operation type during recovery: {op.operation_type}")
+
+            # Log the operation to database
+            self._persistence.save_operation(op)
+
+            replayed += 1
+            logger.debug(f"Replayed operation: seq={op.sequence_number}, type={op.operation_type.value}")
         
         return replayed
     
@@ -275,13 +272,12 @@ class RecoveryManager:
         )
         self._persistence.save_node(node)
     
-    def _replay_update(self, op: Operation) -> None:
-        """Replay an UPDATE operation."""
+    def _replay_set(self, op: Operation) -> None:
+        """Replay a SET operation."""
         # Load existing node
         node = self._persistence.load_node(op.path)
         if not node:
-            logger.warning(f"Node not found during replay update: {op.path}")
-            return
+            raise KeyError(f"Node not found during replay set: {op.path}")
         
         # Update node
         node.data = op.data
@@ -291,16 +287,31 @@ class RecoveryManager:
     
     def _replay_delete(self, op: Operation) -> None:
         """Replay a DELETE operation."""
-        # Handle multiple paths (comma-separated for ephemeral cleanup)
-        paths = op.path.split(",") if "," in op.path else [op.path]
-        
+        paths = self._extract_delete_paths(op)
         for path in paths:
-            path = path.strip()
-            if path:
-                try:
-                    self._persistence.delete_node(path)
-                except Exception as e:
-                    logger.debug(f"Node already deleted during replay: {path}")
+            deleted = self._persistence.delete_node(path)
+            if not deleted:
+                logger.debug(f"Node already deleted during replay: {path}")
+
+    def _extract_delete_paths(self, op: Operation) -> List[str]:
+        """Decode all paths affected by a delete operation."""
+        if op.data:
+            try:
+                payload = json.loads(op.data.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                raise ValueError(f"Invalid delete payload for seq={op.sequence_number}") from e
+
+            if not isinstance(payload, list):
+                raise ValueError(f"Delete payload must be a list for seq={op.sequence_number}")
+
+            paths = [str(path).strip() for path in payload if str(path).strip()]
+            if paths:
+                return paths
+
+        if op.path:
+            return [path.strip() for path in op.path.split(",") if path.strip()]
+
+        raise ValueError(f"Delete operation missing target paths for seq={op.sequence_number}")
     
     def verify_consistency(self) -> Tuple[bool, List[str]]:
         """

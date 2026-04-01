@@ -22,7 +22,7 @@ import threading
 import json
 import os
 import struct
-from typing import List, Optional, Tuple, Generator
+from typing import Dict, Generator, List, Optional, Tuple
 from datetime import datetime
 from contextlib import contextmanager
 
@@ -37,8 +37,9 @@ class WALWriter:
     """
     Custom Write-Ahead Log file writer.
     
-    Implements the exact WAL format from Spec Section 10:
-    [timestamp][operation_type][path][data][session_id][sequence_number]
+    Implements the WAL format used for crash recovery.
+    The on-disk payload preserves the original operation semantics,
+    including node type for CREATE operations.
     
     Each entry is written as:
     - 8 bytes: timestamp (double)
@@ -70,7 +71,8 @@ class WALWriter:
         """
         Append an operation to the WAL file.
         
-        Format: [timestamp][operation_type][path][data][session_id][sequence_number]
+        Format:
+        [timestamp][operation_type][path][data][session_id][sequence_number][node_type?]
         """
         import zlib
         
@@ -79,44 +81,52 @@ class WALWriter:
             entry_parts = []
             
             # timestamp (8 bytes double)
-            entry_parts.append(struct.pack('d', operation.timestamp))
+            entry_parts.append(struct.pack('<d', operation.timestamp))
             
             # operation_type (length-prefixed string)
             op_type_bytes = operation.operation_type.value.encode('utf-8')
-            entry_parts.append(struct.pack('I', len(op_type_bytes)))
+            entry_parts.append(struct.pack('<I', len(op_type_bytes)))
             entry_parts.append(op_type_bytes)
             
             # path (length-prefixed string)
             path_bytes = operation.path.encode('utf-8')
-            entry_parts.append(struct.pack('I', len(path_bytes)))
+            entry_parts.append(struct.pack('<I', len(path_bytes)))
             entry_parts.append(path_bytes)
             
             # data (length-prefixed bytes)
             data_bytes = operation.data if operation.data else b''
-            entry_parts.append(struct.pack('I', len(data_bytes)))
+            entry_parts.append(struct.pack('<I', len(data_bytes)))
             entry_parts.append(data_bytes)
             
             # session_id (length-prefixed string, 0 length if None)
             if operation.session_id:
                 session_bytes = operation.session_id.encode('utf-8')
-                entry_parts.append(struct.pack('I', len(session_bytes)))
+                entry_parts.append(struct.pack('<I', len(session_bytes)))
                 entry_parts.append(session_bytes)
             else:
-                entry_parts.append(struct.pack('I', 0))
-            
+                entry_parts.append(struct.pack('<I', 0))
+
             # sequence_number (8 bytes long)
-            entry_parts.append(struct.pack('q', operation.sequence_number))
+            entry_parts.append(struct.pack('<q', operation.sequence_number))
+
+            # node_type (length-prefixed string, 0 length if None)
+            if operation.node_type:
+                node_type_bytes = operation.node_type.value.encode('utf-8')
+                entry_parts.append(struct.pack('<I', len(node_type_bytes)))
+                entry_parts.append(node_type_bytes)
+            else:
+                entry_parts.append(struct.pack('<I', 0))
             
             # Combine all parts
             entry_data = b''.join(entry_parts)
             
             # Add checksum (CRC32)
             checksum = zlib.crc32(entry_data) & 0xffffffff
-            entry_parts.append(struct.pack('I', checksum))
+            entry_parts.append(struct.pack('<I', checksum))
             
             # Write complete entry with length prefix
             full_entry = b''.join(entry_parts)
-            entry_with_length = struct.pack('I', len(full_entry)) + full_entry
+            entry_with_length = struct.pack('<I', len(full_entry)) + full_entry
             
             # Write and fsync
             self._file.write(entry_with_length)
@@ -143,7 +153,7 @@ class WALWriter:
                     if not length_bytes or len(length_bytes) < 4:
                         break
                     
-                    entry_length = struct.unpack('I', length_bytes)[0]
+                    entry_length = struct.unpack('<I', length_bytes)[0]
                     entry_data = f.read(entry_length)
                     
                     if len(entry_data) < entry_length:
@@ -154,29 +164,29 @@ class WALWriter:
                     offset = 0
                     
                     # timestamp
-                    timestamp = struct.unpack('d', entry_data[offset:offset+8])[0]
+                    timestamp = struct.unpack('<d', entry_data[offset:offset+8])[0]
                     offset += 8
                     
                     # operation_type
-                    op_type_len = struct.unpack('I', entry_data[offset:offset+4])[0]
+                    op_type_len = struct.unpack('<I', entry_data[offset:offset+4])[0]
                     offset += 4
                     op_type_str = entry_data[offset:offset+op_type_len].decode('utf-8')
                     offset += op_type_len
                     
                     # path
-                    path_len = struct.unpack('I', entry_data[offset:offset+4])[0]
+                    path_len = struct.unpack('<I', entry_data[offset:offset+4])[0]
                     offset += 4
                     path = entry_data[offset:offset+path_len].decode('utf-8')
                     offset += path_len
                     
                     # data
-                    data_len = struct.unpack('I', entry_data[offset:offset+4])[0]
+                    data_len = struct.unpack('<I', entry_data[offset:offset+4])[0]
                     offset += 4
                     data = entry_data[offset:offset+data_len]
                     offset += data_len
                     
                     # session_id
-                    session_len = struct.unpack('I', entry_data[offset:offset+4])[0]
+                    session_len = struct.unpack('<I', entry_data[offset:offset+4])[0]
                     offset += 4
                     session_id = None
                     if session_len > 0:
@@ -184,11 +194,21 @@ class WALWriter:
                         offset += session_len
                     
                     # sequence_number
-                    sequence_number = struct.unpack('q', entry_data[offset:offset+8])[0]
+                    sequence_number = struct.unpack('<q', entry_data[offset:offset+8])[0]
                     offset += 8
+
+                    node_type = None
+                    remaining_bytes = len(entry_data) - offset
+                    if remaining_bytes > 4:
+                        node_type_len = struct.unpack('<I', entry_data[offset:offset+4])[0]
+                        offset += 4
+                        if node_type_len > 0:
+                            node_type_str = entry_data[offset:offset+node_type_len].decode('utf-8')
+                            offset += node_type_len
+                            node_type = NodeType(node_type_str)
                     
                     # Verify checksum
-                    stored_checksum = struct.unpack('I', entry_data[offset:offset+4])[0]
+                    stored_checksum = struct.unpack('<I', entry_data[offset:offset+4])[0]
                     computed_checksum = zlib.crc32(entry_data[:offset]) & 0xffffffff
                     
                     if stored_checksum != computed_checksum:
@@ -203,6 +223,7 @@ class WALWriter:
                         data=data,
                         session_id=session_id,
                         timestamp=timestamp,
+                        node_type=node_type,
                     )
                     operations.append(operation)
         
@@ -256,6 +277,8 @@ class Persistence:
         self._db_path = db_path
         self._lock = threading.RLock()
         self._local = threading.local()
+        self._connections: Dict[int, sqlite3.Connection] = {}
+        self._closed = False
         
         # Custom WAL file (Section 10 format)
         wal_path = db_path.replace('.db', '.wal')
@@ -266,29 +289,65 @@ class Persistence:
         # Initialize database
         self._init_database()
         logger.info(f"Persistence initialized: {db_path}")
+
+    def _create_connection(self) -> sqlite3.Connection:
+        """Create and configure a new SQLite connection."""
+        conn = sqlite3.connect(
+            self._db_path,
+            check_same_thread=False,
+            isolation_level=None,  # Auto-commit mode
+        )
+        conn.row_factory = sqlite3.Row
+
+        # Enable WAL mode for better concurrency
+        if WAL_MODE:
+            conn.execute("PRAGMA journal_mode=WAL")
+
+        # Enable foreign keys
+        conn.execute("PRAGMA foreign_keys=ON")
+
+        # Synchronous mode for durability
+        if FSYNC_ON_COMMIT:
+            conn.execute("PRAGMA synchronous=FULL")
+
+        return conn
+
+    def _register_connection(self, conn: sqlite3.Connection) -> sqlite3.Connection:
+        """Track a connection so it can be closed deterministically."""
+        thread_id = threading.get_ident()
+        self._connections[thread_id] = conn
+        self._local.connection = conn
+        return conn
+
+    def _unregister_connection(self, conn: sqlite3.Connection) -> None:
+        """Remove a connection from the tracked connection table."""
+        thread_id = threading.get_ident()
+        if self._connections.get(thread_id) is conn:
+            del self._connections[thread_id]
+        if getattr(self._local, "connection", None) is conn:
+            self._local.connection = None
+
+    def _close_connection(self, conn: sqlite3.Connection) -> None:
+        """Close a connection and ignore errors during shutdown."""
+        try:
+            conn.close()
+        except Exception as e:
+            logger.debug(f"Ignoring SQLite close error during shutdown: {e}")
     
     def _get_connection(self) -> sqlite3.Connection:
         """Get a thread-local database connection."""
-        if not hasattr(self._local, 'connection') or self._local.connection is None:
-            self._local.connection = sqlite3.connect(
-                self._db_path,
-                check_same_thread=False,
-                isolation_level=None,  # Auto-commit mode
-            )
-            self._local.connection.row_factory = sqlite3.Row
-            
-            # Enable WAL mode for better concurrency
-            if WAL_MODE:
-                self._local.connection.execute("PRAGMA journal_mode=WAL")
-            
-            # Enable foreign keys
-            self._local.connection.execute("PRAGMA foreign_keys=ON")
-            
-            # Synchronous mode for durability
-            if FSYNC_ON_COMMIT:
-                self._local.connection.execute("PRAGMA synchronous=FULL")
-        
-        return self._local.connection
+        if self._closed:
+            raise RuntimeError("Persistence layer is closed")
+
+        connection = getattr(self._local, 'connection', None)
+        if connection is None:
+            with self._lock:
+                if self._closed:
+                    raise RuntimeError("Persistence layer is closed")
+                connection = self._create_connection()
+                self._register_connection(connection)
+
+        return connection
     
     @contextmanager
     def _transaction(self) -> Generator[sqlite3.Connection, None, None]:
@@ -763,6 +822,8 @@ class Persistence:
     ) -> None:
         """Atomically delete nodes and log the operation."""
         with self._lock:
+            operation.data = json.dumps(paths).encode()
+
             # Write to custom WAL file first (Section 10 format)
             self._wal_writer.append(operation)
             
@@ -776,7 +837,7 @@ class Persistence:
                     operation.sequence_number,
                     operation.operation_type.value,
                     operation.path,
-                    json.dumps(paths).encode(),
+                    operation.data,
                     operation.session_id,
                     operation.timestamp,
                     None,
@@ -819,11 +880,22 @@ class Persistence:
         """Close the database connection and WAL file."""
         # Close WAL writer
         self._wal_writer.close()
-        
-        if hasattr(self._local, 'connection') and self._local.connection:
-            self._local.connection.close()
+
+        with self._lock:
+            if self._closed:
+                return
+
+            connections = list(self._connections.values())
+            self._connections.clear()
+            self._closed = True
+
+        for connection in connections:
+            self._close_connection(connection)
+
+        if hasattr(self._local, 'connection'):
             self._local.connection = None
-            logger.info("Database connection closed")
+
+        logger.info("Database connection closed")
     
     def read_wal(self) -> List[Operation]:
         """

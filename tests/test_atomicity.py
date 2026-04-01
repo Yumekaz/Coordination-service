@@ -270,48 +270,52 @@ class TestPersistenceAtomicity:
     def test_persistence_atomic_write(self, temp_db_path):
         """Persisted data should be complete or not exist."""
         persistence = Persistence(temp_db_path)
-        
-        from models import Node
-        import time
-        
-        node = Node(
-            path="/persist_test",
-            data=b"test data",
-            version=1,
-            node_type=NodeType.PERSISTENT,
-            session_id=None,
-            created_at=time.time(),
-            modified_at=time.time()
-        )
-        
-        # Save should be atomic
-        persistence.save_node(node)
-        
-        # Load should return complete node
-        loaded = persistence.load_node("/persist_test")
-        assert loaded is not None
-        assert loaded.data == b"test data"
-        assert loaded.version == 1
+        try:
+            from models import Node
+            import time
+            
+            node = Node(
+                path="/persist_test",
+                data=b"test data",
+                version=1,
+                node_type=NodeType.PERSISTENT,
+                session_id=None,
+                created_at=time.time(),
+                modified_at=time.time()
+            )
+            
+            # Save should be atomic
+            persistence.save_node(node)
+            
+            # Load should return complete node
+            loaded = persistence.load_node("/persist_test")
+            assert loaded is not None
+            assert loaded.data == b"test data"
+            assert loaded.version == 1
+        finally:
+            persistence.close()
     
     def test_persistence_rollback(self, temp_db_path):
         """Transaction rollback should not persist partial data."""
         persistence = Persistence(temp_db_path)
-        
-        from models import Node
-        import time
-        
-        # Create initial node
-        node = Node(
-            path="/rollback_persist",
-            data=b"initial",
-            version=1,
-            node_type=NodeType.PERSISTENT,
-            session_id=None,
-            created_at=time.time(),
-            modified_at=time.time()
-        )
-        persistence.save_node(node)
-        
-        # Load to verify
-        loaded = persistence.load_node("/rollback_persist")
-        assert loaded.data == b"initial"
+        try:
+            from models import Node
+            import time
+            
+            # Create initial node
+            node = Node(
+                path="/rollback_persist",
+                data=b"initial",
+                version=1,
+                node_type=NodeType.PERSISTENT,
+                session_id=None,
+                created_at=time.time(),
+                modified_at=time.time()
+            )
+            persistence.save_node(node)
+            
+            # Load to verify
+            loaded = persistence.load_node("/rollback_persist")
+            assert loaded.data == b"initial"
+        finally:
+            persistence.close()

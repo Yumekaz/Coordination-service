@@ -12,6 +12,7 @@ Recovery must restore consistent state:
 import pytest
 import tempfile
 import os
+import sqlite3
 import time
 
 from coordinator import Coordinator
@@ -593,3 +594,124 @@ class TestWALReplay:
             coord2.stop()
         finally:
             os.unlink(db_path)
+
+
+class TestWALDurabilityUpgrade:
+    """High-signal durability tests for WAL-only recovery paths."""
+
+    def test_wal_only_replay_restores_set_value(self):
+        """A SET present only in the WAL should still be replayed correctly."""
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            db_path = f.name
+
+        try:
+            coord1 = Coordinator(db_path=db_path)
+            coord1.start()
+
+            session = coord1.open_session()
+            coord1.create("/replayed", b"v1", persistent=True, session_id=session.session_id)
+            coord1.set("/replayed", b"v2")
+            coord1.stop()
+
+            conn = sqlite3.connect(db_path)
+            conn.execute("DELETE FROM nodes")
+            conn.execute("DELETE FROM operations")
+            conn.commit()
+            conn.close()
+
+            coord2 = Coordinator(db_path=db_path)
+            stats = coord2.start()
+
+            node = coord2.get("/replayed")
+            assert node is not None
+            assert node.data == b"v2"
+            assert node.version == 2
+            assert stats["operations_replayed"] == 2
+
+            coord2.stop()
+        finally:
+            for path in [db_path, db_path + "-wal", db_path + "-shm", db_path.replace(".db", ".wal")]:
+                if os.path.exists(path):
+                    os.unlink(path)
+
+    def test_wal_only_replay_preserves_recursive_delete_payload(self):
+        """Recursive deletes should replay the full subtree from the WAL payload."""
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            db_path = f.name
+
+        try:
+            coord1 = Coordinator(db_path=db_path)
+            coord1.start()
+
+            session = coord1.open_session()
+            coord1.create("/parent", b"p", persistent=True, session_id=session.session_id)
+            coord1.create("/parent/child", b"c", persistent=True, session_id=session.session_id)
+            coord1.delete("/parent")
+            coord1.stop()
+
+            now = time.time()
+            conn = sqlite3.connect(db_path)
+            conn.execute("DELETE FROM operations WHERE operation_type = 'DELETE'")
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO nodes
+                (path, data, version, node_type, session_id, created_at, modified_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                ("/parent", b"p", 1, "PERSISTENT", None, now, now),
+            )
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO nodes
+                (path, data, version, node_type, session_id, created_at, modified_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                ("/parent/child", b"c", 1, "PERSISTENT", None, now, now),
+            )
+            conn.commit()
+            conn.close()
+
+            coord2 = Coordinator(db_path=db_path)
+            coord2.start()
+
+            assert coord2.exists("/parent") is False
+            assert coord2.exists("/parent/child") is False
+
+            coord2.stop()
+        finally:
+            for path in [db_path, db_path + "-wal", db_path + "-shm", db_path.replace(".db", ".wal")]:
+                if os.path.exists(path):
+                    os.unlink(path)
+
+    def test_wal_only_ephemeral_create_stays_ephemeral(self):
+        """Ephemeral creates replayed from WAL should still be cleaned up on recovery."""
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            db_path = f.name
+
+        try:
+            coord1 = Coordinator(db_path=db_path)
+            coord1.start()
+
+            session = coord1.open_session()
+            coord1.create("/ephemeral", b"temp", persistent=False, session_id=session.session_id)
+            wal_ops = coord1._persistence.read_wal()
+            assert wal_ops[-1].node_type == NodeType.EPHEMERAL
+            coord1.stop()
+
+            conn = sqlite3.connect(db_path)
+            conn.execute("DELETE FROM nodes")
+            conn.execute("DELETE FROM operations")
+            conn.commit()
+            conn.close()
+
+            coord2 = Coordinator(db_path=db_path)
+            stats = coord2.start()
+
+            assert coord2.exists("/ephemeral") is False
+            assert stats["ephemeral_nodes_deleted"] == 1
+
+            coord2.stop()
+        finally:
+            for path in [db_path, db_path + "-wal", db_path + "-shm", db_path.replace(".db", ".wal")]:
+                if os.path.exists(path):
+                    os.unlink(path)
