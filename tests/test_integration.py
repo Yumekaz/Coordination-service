@@ -17,9 +17,46 @@ import threading
 import tempfile
 import os
 import json
+import inspect
 
 from coordinator import Coordinator
 from models import NodeType, EventType
+
+
+def _find_callable(obj, candidates):
+    """Return the first callable attribute present on obj."""
+    for name in candidates:
+        candidate = getattr(obj, name, None)
+        if callable(candidate):
+            return candidate
+    return None
+
+
+def _call_with_supported_kwargs(func, **kwargs):
+    """Call a function using only kwargs it explicitly accepts."""
+    signature = inspect.signature(func)
+    call_kwargs = {
+        name: value
+        for name, value in kwargs.items()
+        if name in signature.parameters
+    }
+    return func(**call_kwargs)
+
+
+def _extract_value(result, *names):
+    """Pull a value out of dict-like or object-like return values."""
+    if isinstance(result, str):
+        return result
+    if isinstance(result, dict):
+        for name in names:
+            if name in result and result[name] is not None:
+                return result[name]
+    for name in names:
+        if hasattr(result, name):
+            value = getattr(result, name)
+            if value is not None:
+                return value
+    return None
 
 
 class TestLeaderElectionScenario:
@@ -178,6 +215,161 @@ class TestDistributedLockScenario:
             
             coord.stop()
         finally:
+            os.unlink(db_path)
+
+
+class TestVersionGuardedWrites:
+    """Version-guarded write scenarios."""
+
+    def test_expected_version_write_succeeds(self):
+        """A matching expected_version should allow an update."""
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            db_path = f.name
+
+        coord = Coordinator(db_path=db_path)
+        coord.start()
+        try:
+            if "expected_version" not in inspect.signature(coord.set).parameters:
+                pytest.skip("Coordinator.set does not yet accept expected_version")
+
+            admin = coord.open_session()
+            coord.create("/cas", b"v1", persistent=True, session_id=admin.session_id)
+
+            updated = coord.set("/cas", b"v2", expected_version=1)
+            assert updated.version == 2
+            assert updated.data == b"v2"
+
+            node = coord.get("/cas")
+            assert node.version == 2
+            assert node.data == b"v2"
+        finally:
+            coord.stop()
+            os.unlink(db_path)
+
+    def test_stale_expected_version_conflicts(self):
+        """A stale expected_version should be rejected and leave the node unchanged."""
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            db_path = f.name
+
+        coord = Coordinator(db_path=db_path)
+        coord.start()
+        try:
+            if "expected_version" not in inspect.signature(coord.set).parameters:
+                pytest.skip("Coordinator.set does not yet accept expected_version")
+
+            admin = coord.open_session()
+            coord.create("/cas-stale", b"v1", persistent=True, session_id=admin.session_id)
+            coord.set("/cas-stale", b"v2", expected_version=1)
+
+            with pytest.raises((ValueError, RuntimeError, KeyError, AssertionError)):
+                coord.set("/cas-stale", b"v3", expected_version=1)
+
+            node = coord.get("/cas-stale")
+            assert node.version == 2
+            assert node.data == b"v2"
+        finally:
+            coord.stop()
+            os.unlink(db_path)
+
+
+class TestLeaseLifecycle:
+    """Lease acquire/release and session cleanup scenarios."""
+
+    def test_lease_lifecycle_owner_conflict_and_session_cleanup(self):
+        """Lease ownership should be exclusive and cleaned up with the owning session."""
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            db_path = f.name
+
+        coord = Coordinator(db_path=db_path)
+        coord.start()
+        try:
+            acquire = _find_callable(coord, ["acquire_lease", "lease_acquire", "create_lease"])
+            release = _find_callable(coord, ["release_lease", "lease_release", "delete_lease"])
+            if acquire is None or release is None:
+                pytest.skip("Lease API is not available yet")
+
+            admin = coord.open_session()
+            coord.create("/leases", b"", persistent=True, session_id=admin.session_id)
+
+            owner_one = coord.open_session()
+            owner_two = coord.open_session()
+
+            lease = _call_with_supported_kwargs(
+                acquire,
+                path="/leases/resource",
+                resource="/leases/resource",
+                lease_path="/leases/resource",
+                session_id=owner_one.session_id,
+                owner_session_id=owner_one.session_id,
+                ttl_seconds=5,
+                timeout_seconds=5,
+            )
+            assert lease is not None
+            lease_id = _extract_value(lease, "lease_id", "id", "path")
+            assert lease_id is not None
+
+            with pytest.raises((ValueError, RuntimeError, KeyError, AssertionError, PermissionError)):
+                _call_with_supported_kwargs(
+                    acquire,
+                    path="/leases/resource",
+                    resource="/leases/resource",
+                    lease_path="/leases/resource",
+                    session_id=owner_two.session_id,
+                    owner_session_id=owner_two.session_id,
+                    ttl_seconds=5,
+                    timeout_seconds=5,
+                )
+
+            with pytest.raises((ValueError, RuntimeError, KeyError, AssertionError, PermissionError)):
+                _call_with_supported_kwargs(
+                    release,
+                    lease_id=lease_id,
+                    path="/leases/resource",
+                    resource="/leases/resource",
+                    lease_path="/leases/resource",
+                    session_id=owner_two.session_id,
+                    owner_session_id=owner_two.session_id,
+                )
+
+            released = _call_with_supported_kwargs(
+                release,
+                lease_id=lease_id,
+                path="/leases/resource",
+                resource="/leases/resource",
+                lease_path="/leases/resource",
+                session_id=owner_one.session_id,
+                owner_session_id=owner_one.session_id,
+            )
+            assert released is not False
+
+            reacquired = _call_with_supported_kwargs(
+                acquire,
+                path="/leases/resource",
+                resource="/leases/resource",
+                lease_path="/leases/resource",
+                session_id=owner_two.session_id,
+                owner_session_id=owner_two.session_id,
+                ttl_seconds=5,
+                timeout_seconds=5,
+            )
+            assert reacquired is not None
+
+            coord.close_session(owner_two.session_id)
+            time.sleep(0.1)
+
+            post_cleanup = _call_with_supported_kwargs(
+                acquire,
+                path="/leases/resource",
+                resource="/leases/resource",
+                lease_path="/leases/resource",
+                session_id=owner_one.session_id,
+                owner_session_id=owner_one.session_id,
+                ttl_seconds=5,
+                timeout_seconds=5,
+            )
+            assert post_cleanup is not None
+        finally:
+            coord.stop()
             os.unlink(db_path)
 
 
@@ -446,6 +638,44 @@ class TestWatchRaces:
             
             coord.stop()
         finally:
+            os.unlink(db_path)
+
+
+class TestWatchEventFiltering:
+    """Watch filtering by event type."""
+
+    def test_watch_register_event_types_filters_events(self):
+        """A watch should only fire for the event types it registered."""
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            db_path = f.name
+
+        coord = Coordinator(db_path=db_path)
+        coord.start()
+        try:
+            admin = coord.open_session()
+            coord.create("/filtered", b"", persistent=True, session_id=admin.session_id)
+            coord.create("/filtered/data", b"initial", persistent=True, session_id=admin.session_id)
+
+            watcher = coord.open_session()
+            watch = coord.register_watch(
+                "/filtered/data",
+                watcher.session_id,
+                event_types={EventType.DELETE},
+            )
+
+            coord.set("/filtered/data", b"updated")
+
+            # DELETE-only watch must not fire on UPDATE.
+            assert coord.wait_watch(watch.watch_id, timeout_seconds=0.2) is None
+
+            coord.delete("/filtered/data")
+
+            event = coord.wait_watch(watch.watch_id, timeout_seconds=5.0)
+            assert event is not None
+            assert event.event_type == EventType.DELETE
+            assert event.path == "/filtered/data"
+        finally:
+            coord.stop()
             os.unlink(db_path)
 
 

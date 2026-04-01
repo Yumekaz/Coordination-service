@@ -12,6 +12,7 @@ import pytest
 import tempfile
 import os
 import sys
+import inspect
 from fastapi.testclient import TestClient
 
 # Setup test database path before importing main
@@ -23,6 +24,37 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from coordinator import Coordinator
 import main
+
+
+def _lease_routes_present() -> bool:
+    """Detect whether lease endpoints have landed yet."""
+    routes = {getattr(route, "path", "") for route in main.app.routes}
+    return {
+        "/api/lease/acquire",
+        "/api/lease/get",
+        "/api/lease/release",
+    }.issubset(routes)
+
+
+def _model_has_field(model_cls, field_name: str) -> bool:
+    """Compatibility helper for Pydantic v1/v2 field inspection."""
+    model_fields = getattr(model_cls, "model_fields", None)
+    if model_fields is None:
+        model_fields = getattr(model_cls, "__fields__", {})
+    return field_name in model_fields
+
+
+def _model_has_field(model, field_name: str) -> bool:
+    """Detect whether a pydantic model exposes a field."""
+    fields = getattr(model, "model_fields", None)
+    if fields is not None:
+        return field_name in fields
+
+    fields = getattr(model, "__fields__", None)
+    if fields is not None:
+        return field_name in fields
+
+    return False
 
 
 @pytest.fixture
@@ -374,6 +406,129 @@ class TestWatchEndpoints:
         
         assert response.status_code == 200
 
+    def test_register_watch_event_types_filter_updates_through_http(self, client):
+        """HTTP watch registration should honor event type filters."""
+        if not _model_has_field(main.RegisterWatchRequest, "event_types"):
+            pytest.skip("RegisterWatchRequest does not yet expose event_types")
+
+        response = client.post("/api/session/open", json={})
+        session_id = response.json()["session_id"]
+
+        client.post("/api/node/create", json={
+            "path": "/filtered-watch",
+            "data": "payload",
+            "persistent": True,
+            "session_id": session_id
+        })
+
+        update_watch = client.post("/api/watch/register", json={
+            "path": "/filtered-watch",
+            "session_id": session_id,
+            "event_types": ["UPDATE"]
+        })
+        delete_watch = client.post("/api/watch/register", json={
+            "path": "/filtered-watch",
+            "session_id": session_id,
+            "event_types": ["DELETE"]
+        })
+
+        assert update_watch.status_code == 200
+        assert delete_watch.status_code == 200
+
+        response = client.delete("/api/node/delete", params={"path": "/filtered-watch"})
+        assert response.status_code == 200
+
+        update_wait = client.get("/api/watch/wait", params={
+            "watch_id": update_watch.json()["watch_id"],
+            "timeout_seconds": 1,
+        })
+        delete_wait = client.get("/api/watch/wait", params={
+            "watch_id": delete_watch.json()["watch_id"],
+            "timeout_seconds": 1,
+        })
+
+        assert update_wait.status_code == 200
+        assert update_wait.json()["status"] == "timeout"
+        assert delete_wait.status_code == 200
+        assert delete_wait.json()["event_type"] == "DELETE"
+
+
+class TestLeaseEndpoints:
+    """Tests for lease APIs, enabled only if the routes exist."""
+
+    def test_lease_acquire_get_release_round_trip(self, client):
+        """Lease APIs should create, fetch, and release a lease."""
+        if not _lease_routes_present():
+            pytest.skip("Lease endpoints are not implemented yet")
+
+        response = client.post("/api/session/open", json={})
+        session_id = response.json()["session_id"]
+
+        acquire = client.post("/api/lease/acquire", json={
+            "path": "/leases/resource",
+            "session_id": session_id,
+            "data": "holder-a"
+        })
+        assert acquire.status_code == 200
+        lease_path = acquire.json()["path"]
+
+        current = client.get("/api/lease/get", params={"path": lease_path})
+        assert current.status_code == 200
+        assert current.json()["path"] == lease_path
+        assert current.json()["session_id"] == session_id
+
+        release = client.post("/api/lease/release", json={
+            "path": lease_path,
+            "session_id": session_id
+        })
+        assert release.status_code == 200
+
+        after_release = client.get("/api/lease/get", params={"path": lease_path})
+        assert after_release.status_code in [404, 410]
+
+    def test_lease_conflict_rejected(self, client):
+        """Competing lease claims should be rejected."""
+        if not _lease_routes_present():
+            pytest.skip("Lease endpoints are not implemented yet")
+
+        session_one = client.post("/api/session/open", json={}).json()["session_id"]
+        session_two = client.post("/api/session/open", json={}).json()["session_id"]
+
+        first = client.post("/api/lease/acquire", json={
+            "path": "/leases/conflict",
+            "session_id": session_one,
+            "data": "first"
+        })
+        assert first.status_code == 200
+
+        second = client.post("/api/lease/acquire", json={
+            "path": "/leases/conflict",
+            "session_id": session_two,
+            "data": "second"
+        })
+        assert second.status_code == 409
+
+    def test_lease_cleared_on_session_close(self, client):
+        """A lease should disappear when the owning session closes."""
+        if not _lease_routes_present():
+            pytest.skip("Lease endpoints are not implemented yet")
+
+        session_id = client.post("/api/session/open", json={}).json()["session_id"]
+
+        acquired = client.post("/api/lease/acquire", json={
+            "path": "/leases/session-cleanup",
+            "session_id": session_id,
+            "data": "cleanup"
+        })
+        assert acquired.status_code == 200
+        lease_path = acquired.json()["path"]
+
+        closed = client.post("/api/session/close", json={"session_id": session_id})
+        assert closed.status_code == 200
+
+        after_close = client.get("/api/lease/get", params={"path": lease_path})
+        assert after_close.status_code in [404, 410]
+
 
 class TestHealthEndpoint:
     """Tests for health and stats endpoints."""
@@ -547,3 +702,70 @@ class TestVersioningAPI:
             "data": "v3"
         })
         assert response.json()["version"] == 3
+
+    def test_set_with_expected_version_succeeds(self, client):
+        """A matching expected_version should allow the write."""
+        if not _model_has_field(main.SetNodeRequest, "expected_version"):
+            pytest.skip("SetNodeRequest does not yet expose expected_version")
+
+        response = client.post("/api/session/open", json={})
+        session_id = response.json()["session_id"]
+
+        client.post("/api/node/create", json={
+            "path": "/cas",
+            "data": "v1",
+            "persistent": True,
+            "session_id": session_id,
+        })
+
+        response = client.post("/api/node/set", json={
+            "path": "/cas",
+            "data": "v2",
+            "expected_version": 1,
+        })
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["version"] == 2
+
+        node_resp = client.get("/api/node/get", params={"path": "/cas"})
+        assert node_resp.status_code == 200
+        assert node_resp.json()["data"] == "v2"
+        assert node_resp.json()["version"] == 2
+
+    def test_set_with_stale_expected_version_conflicts(self, client):
+        """A stale expected_version should reject the write."""
+        if not _model_has_field(main.SetNodeRequest, "expected_version"):
+            pytest.skip("SetNodeRequest does not yet expose expected_version")
+
+        response = client.post("/api/session/open", json={})
+        session_id = response.json()["session_id"]
+
+        client.post("/api/node/create", json={
+            "path": "/cas-stale",
+            "data": "v1",
+            "persistent": True,
+            "session_id": session_id,
+        })
+
+        first_write = client.post("/api/node/set", json={
+            "path": "/cas-stale",
+            "data": "v2",
+            "expected_version": 1,
+        })
+        assert first_write.status_code == 200
+
+        stale_write = client.post("/api/node/set", json={
+            "path": "/cas-stale",
+            "data": "v3",
+            "expected_version": 1,
+        })
+
+        assert stale_write.status_code in [400, 409, 412]
+        detail = stale_write.json().get("detail", "")
+        assert any(keyword in detail.lower() for keyword in ["version", "conflict", "expected"])
+
+        node_resp = client.get("/api/node/get", params={"path": "/cas-stale"})
+        assert node_resp.status_code == 200
+        assert node_resp.json()["data"] == "v2"
+        assert node_resp.json()["version"] == 2

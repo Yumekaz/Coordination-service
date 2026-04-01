@@ -16,6 +16,7 @@ from typing import Dict, List, Optional, Set, Tuple
 from datetime import datetime
 
 from models import Node, NodeType
+from errors import VersionConflictError
 from logger import get_logger
 
 logger = get_logger("metadata_tree")
@@ -140,6 +141,8 @@ class MetadataTree:
             parent_path = self._get_parent_path(path)
             if parent_path and parent_path not in self._nodes:
                 raise ValueError(f"Parent node does not exist: {parent_path}")
+            if parent_path and self._nodes[parent_path].node_type == NodeType.EPHEMERAL:
+                raise ValueError(f"Cannot create child under ephemeral node: {parent_path}")
             
             # Validate ephemeral node requirements
             if node_type == NodeType.EPHEMERAL and session_id is None:
@@ -176,13 +179,19 @@ class MetadataTree:
             path = self._normalize_path(path)
             return self._nodes.get(path)
     
-    def set(self, path: str, data: bytes) -> Node:
+    def set(
+        self,
+        path: str,
+        data: bytes,
+        expected_version: Optional[int] = None,
+    ) -> Node:
         """
         Update a node's data.
-        
+
         Args:
             path: The path of the node to update
             data: The new data
+            expected_version: Optional compare-and-swap guard
             
         Returns:
             The updated Node
@@ -198,8 +207,10 @@ class MetadataTree:
             
             if path == "/":
                 raise ValueError("Cannot modify root node")
-            
+
             node = self._nodes[path]
+            if expected_version is not None and node.version != expected_version:
+                raise VersionConflictError(path, expected_version, node.version)
             node.data = data if isinstance(data, bytes) else data.encode("utf-8")
             node.version += 1
             node.modified_at = datetime.now().timestamp()
@@ -322,14 +333,17 @@ class MetadataTree:
             ]
             
             deleted_paths = []
+            seen_paths = set()
             # Sort by depth (deepest first) to delete children before parents
             paths_to_delete.sort(key=lambda p: p.count("/"), reverse=True)
             
             for path in paths_to_delete:
                 if path in self._nodes:
-                    del self._nodes[path]
-                    deleted_paths.append(path)
-                    logger.debug(f"Deleted ephemeral node: {path} (session expired)")
+                    for deleted_path in self.delete(path, recursive=True):
+                        if deleted_path not in seen_paths:
+                            seen_paths.add(deleted_path)
+                            deleted_paths.append(deleted_path)
+                    logger.debug(f"Deleted ephemeral subtree: {path} (session expired)")
             
             return deleted_paths
     

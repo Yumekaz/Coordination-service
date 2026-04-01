@@ -89,6 +89,22 @@ class TestMetadataTreeBasic:
         with pytest.raises(KeyError):
             metadata_tree.set("/nonexistent", b"data")
 
+    def test_set_with_expected_version_succeeds(self, metadata_tree: MetadataTree):
+        """Version-guarded writes should succeed when the version matches."""
+        metadata_tree.create("/config", b"v1", NodeType.PERSISTENT)
+
+        node = metadata_tree.set("/config", b"v2", expected_version=1)
+
+        assert node.data == b"v2"
+        assert node.version == 2
+
+    def test_set_with_expected_version_mismatch_fails(self, metadata_tree: MetadataTree):
+        """Version-guarded writes should reject stale writes."""
+        metadata_tree.create("/config", b"v1", NodeType.PERSISTENT)
+
+        with pytest.raises(ValueError, match="version"):
+            metadata_tree.set("/config", b"stale", expected_version=99)
+
 
 class TestMetadataTreeDelete:
     """Delete operation tests."""

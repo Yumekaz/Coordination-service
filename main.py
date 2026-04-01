@@ -15,15 +15,16 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from typing import Optional, List
+from typing import Any, Dict, List, Optional
 from contextlib import asynccontextmanager
 import uvicorn
 import os
 
 from coordinator import Coordinator
-from models import NodeType
+from models import EventType, NodeType
 from logger import get_logger
 from config import HOST, PORT, DEFAULT_SESSION_TIMEOUT, WATCH_WAIT_TIMEOUT
+from errors import ConflictError, ForbiddenError
 
 logger = get_logger("api")
 
@@ -115,6 +116,7 @@ class GetNodeResponse(BaseModel):
 class SetNodeRequest(BaseModel):
     path: str
     data: str
+    expected_version: Optional[int] = Field(default=None, ge=0)
 
 
 class SetNodeResponse(BaseModel):
@@ -137,6 +139,34 @@ class ListChildrenResponse(BaseModel):
 
 
 class RegisterWatchRequest(BaseModel):
+    path: str
+    session_id: str
+    event_types: Optional[List[EventType]] = None
+
+
+class AcquireLeaseRequest(BaseModel):
+    path: str
+    session_id: str
+    holder: Optional[str] = None
+    data: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    wait_timeout_seconds: float = Field(default=0.0, ge=0, le=300)
+    create_parents: bool = True
+
+
+class LeaseResponse(BaseModel):
+    path: str
+    session_id: str
+    holder: str
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    version: int
+    acquired_at: float
+    modified_at: float
+    expires_at: Optional[float] = None
+    lease_token: Optional[int] = None
+
+
+class ReleaseLeaseRequest(BaseModel):
     path: str
     session_id: str
 
@@ -180,6 +210,22 @@ async def value_error_handler(request, exc) -> JSONResponse:
     return JSONResponse(
         status_code=400,
         content={"error": "bad_request", "detail": str(exc)},
+    )
+
+
+@app.exception_handler(ConflictError)
+async def conflict_error_handler(request, exc: ConflictError) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content=exc.to_response(),
+    )
+
+
+@app.exception_handler(ForbiddenError)
+async def forbidden_error_handler(request, exc: ForbiddenError) -> JSONResponse:
+    return JSONResponse(
+        status_code=403,
+        content=exc.to_response(),
     )
 
 
@@ -257,7 +303,11 @@ async def get_node(path: str = Query(..., description="Node path")) -> GetNodeRe
 async def set_node(request: SetNodeRequest) -> SetNodeResponse:
     """Update a node's data."""
     try:
-        node = coordinator.set(request.path, request.data.encode("utf-8"))
+        node = coordinator.set(
+            request.path,
+            request.data.encode("utf-8"),
+            expected_version=request.expected_version,
+        )
         return SetNodeResponse(path=node.path, version=node.version)
     except KeyError as e:
         raise HTTPException(status_code=404, detail=f"Node not found: {request.path}")
@@ -301,6 +351,7 @@ async def register_watch(request: RegisterWatchRequest) -> RegisterWatchResponse
         watch = coordinator.register_watch(
             path=request.path,
             session_id=request.session_id,
+            event_types=set(request.event_types) if request.event_types else None,
         )
         return RegisterWatchResponse(watch_id=watch.watch_id)
     except ValueError as e:
@@ -318,12 +369,15 @@ async def wait_watch(
     if event is None:
         return {"status": "timeout", "watch_id": watch_id}
     
-    return WatchEventResponse(
+    response = WatchEventResponse(
         event_type=event.event_type.value,
         path=event.path,
         data=event.data.decode("utf-8") if isinstance(event.data, bytes) else event.data,
         sequence=event.sequence_number,
     )
+    if hasattr(response, "model_dump"):
+        return response.model_dump()
+    return response.dict()
 
 
 @app.delete("/api/watch/unregister")
@@ -333,6 +387,38 @@ async def unregister_watch(watch_id: str = Query(..., description="Watch ID")) -
     if not result:
         raise HTTPException(status_code=404, detail=f"Watch not found: {watch_id}")
     return {"status": "unregistered", "watch_id": watch_id}
+
+
+# ========== Lease Endpoints ==========
+
+@app.post("/api/lease/acquire", response_model=LeaseResponse)
+async def acquire_lease(request: AcquireLeaseRequest) -> LeaseResponse:
+    """Acquire an exclusive lease backed by an ephemeral node."""
+    lease = coordinator.acquire_lease(
+        path=request.path,
+        session_id=request.session_id,
+        holder=request.holder or request.data,
+        metadata=request.metadata,
+        wait_timeout_seconds=request.wait_timeout_seconds,
+        create_parents=request.create_parents,
+    )
+    return LeaseResponse(**lease)
+
+
+@app.get("/api/lease/get", response_model=LeaseResponse)
+async def get_lease(path: str = Query(..., description="Lease path")) -> LeaseResponse:
+    """Get the current state of a lease."""
+    lease = coordinator.get_lease(path)
+    if lease is None:
+        raise HTTPException(status_code=404, detail=f"Lease not found: {path}")
+    return LeaseResponse(**lease)
+
+
+@app.post("/api/lease/release")
+async def release_lease(request: ReleaseLeaseRequest) -> dict:
+    """Release a lease if the caller currently owns it."""
+    coordinator.release_lease(request.path, request.session_id)
+    return {"status": "released", "path": request.path}
 
 
 # ========== Health Endpoints ==========
