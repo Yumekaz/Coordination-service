@@ -223,6 +223,56 @@ class Coordinator:
                 self._session_inventory_condition.wait(timeout=remaining)
 
             return self._session_inventory_version, self._build_session_views_locked(alive_only=alive_only)
+
+    def get_session_detail(
+        self,
+        session_id: str,
+        operation_limit: int = 20,
+    ) -> Optional[Dict[str, Any]]:
+        """Return a drill-down view for one session."""
+        with self._lock:
+            session = self._session_manager.get_session(session_id)
+            if session is None:
+                return None
+
+            summary = self._build_session_views_locked(alive_only=False)
+            session_summary = next(
+                (item for item in summary if item["session_id"] == session_id),
+                None,
+            )
+            if session_summary is None:
+                return None
+
+            watches = [
+                watch.to_dict()
+                for watch in self._watch_manager.get_watches_for_session(session_id)
+            ]
+            owned_nodes = []
+            for path in sorted(session.ephemeral_nodes):
+                node = self._metadata_tree.get(path)
+                if node is None:
+                    continue
+                raw_data = node.data.decode("utf-8") if isinstance(node.data, bytes) else str(node.data)
+                owned_nodes.append({
+                    "path": node.path,
+                    "node_type": node.node_type.value,
+                    "version": node.version,
+                    "session_id": node.session_id,
+                    "data_preview": raw_data if len(raw_data) <= 120 else raw_data[:117] + "...",
+                    "created_at": node.created_at,
+                    "modified_at": node.modified_at,
+                })
+            recent_operations = self._get_recent_operations_locked(
+                limit=operation_limit,
+                session_id=session_id,
+            )
+
+            return {
+                **session_summary,
+                "owned_nodes": owned_nodes,
+                "watches": watches,
+                "recent_operations": recent_operations,
+            }
     
     def _on_session_expired(self, session: Session) -> None:
         """
@@ -440,6 +490,23 @@ class Coordinator:
         )
         return session_views
 
+    def _get_recent_operations_locked(
+        self,
+        limit: int = 20,
+        path: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> List[Operation]:
+        """Return recent committed operations in reverse chronological order."""
+        if limit <= 0:
+            return []
+
+        operations = list(reversed(self._operation_log.get_all_operations()))
+        if path is not None:
+            operations = [operation for operation in operations if operation.path == path]
+        if session_id is not None:
+            operations = [operation for operation in operations if operation.session_id == session_id]
+        return operations[:limit]
+
     def _build_session_updates_for_deleted_paths(
         self,
         deleted_paths: List[str],
@@ -503,12 +570,16 @@ class Coordinator:
         except (TypeError, ValueError) as exc:
             raise ValueError("Lease metadata must be JSON-serializable") from exc
 
-    def _decode_lease_payload(self, node: Node) -> Tuple[str, Dict[str, Any]]:
-        """Decode holder metadata from a lease node."""
-        if not node.data:
-            return node.session_id or "", {}
+    def _decode_lease_payload_data(
+        self,
+        data: bytes,
+        fallback_holder: Optional[str] = None,
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Decode holder metadata from a raw lease payload."""
+        if not data:
+            return fallback_holder or "", {}
         
-        raw = node.data.decode("utf-8") if isinstance(node.data, bytes) else str(node.data)
+        raw = data.decode("utf-8") if isinstance(data, bytes) else str(data)
         try:
             payload = json.loads(raw)
         except json.JSONDecodeError:
@@ -517,12 +588,16 @@ class Coordinator:
         if not isinstance(payload, dict):
             return raw, {}
         
-        holder = payload.get("holder") or payload.get("data") or node.session_id or ""
+        holder = payload.get("holder") or payload.get("data") or fallback_holder or ""
         metadata = payload.get("metadata")
         if not isinstance(metadata, dict):
             metadata = {}
         
         return holder, metadata
+
+    def _decode_lease_payload(self, node: Node) -> Tuple[str, Dict[str, Any]]:
+        """Decode holder metadata from a lease node."""
+        return self._decode_lease_payload_data(node.data, node.session_id)
 
     def _get_lease_token(self, path: str) -> Optional[int]:
         """Return the create sequence for the currently held lease."""
@@ -534,6 +609,30 @@ class Coordinator:
             ):
                 return operation.sequence_number
         return None
+
+    def _get_operations_for_exact_path_locked(
+        self,
+        path: str,
+        limit: int = 20,
+    ) -> List[Operation]:
+        """Return the most recent operations that touched an exact path."""
+        matched: List[Operation] = []
+        for operation in reversed(self._operation_log.get_all_operations()):
+            include = operation.path == path
+            if not include and operation.operation_type == OperationType.DELETE and operation.data:
+                try:
+                    deleted_paths = json.loads(operation.data.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    deleted_paths = []
+                if isinstance(deleted_paths, list) and path in deleted_paths:
+                    include = True
+
+            if include:
+                matched.append(operation)
+            if len(matched) >= limit:
+                break
+
+        return matched
 
     def _lease_info_from_node(
         self,
@@ -569,6 +668,65 @@ class Coordinator:
             if node is None:
                 return None
             return self._lease_info_from_node(node)
+
+    def get_lease_detail(
+        self,
+        path: str,
+        operation_limit: int = 20,
+    ) -> Optional[Dict[str, Any]]:
+        """Return a drill-down view for a lease path."""
+        normalized_path = self._normalize_path(path)
+        with self._lock:
+            node = self._metadata_tree.get(normalized_path)
+            current_lease = None
+            holder_session = None
+            if node is not None and node.node_type == NodeType.EPHEMERAL:
+                current_lease = self._lease_info_from_node(node)
+                if node.session_id:
+                    holder_session = next(
+                        (
+                            item for item in self._build_session_views_locked(alive_only=False)
+                            if item["session_id"] == node.session_id
+                        ),
+                        None,
+                    )
+            waiters = sorted({
+                watch.session_id
+                for watch in self._watch_manager.get_watches_for_path(normalized_path)
+                if EventType.DELETE in watch.event_types and (current_lease is None or watch.session_id != current_lease["session_id"])
+            })
+            recent_operations = self._get_operations_for_exact_path_locked(
+                normalized_path,
+                limit=operation_limit,
+            )
+            if current_lease is None and not recent_operations:
+                return None
+
+            holder_history = []
+            for operation in recent_operations:
+                if (
+                    operation.operation_type == OperationType.CREATE
+                    and operation.path == normalized_path
+                    and operation.node_type == NodeType.EPHEMERAL
+                ):
+                    holder, metadata = self._decode_lease_payload_data(operation.data, operation.session_id)
+                    holder_history.append({
+                        "sequence_number": operation.sequence_number,
+                        "timestamp": operation.timestamp,
+                        "session_id": operation.session_id,
+                        "holder": holder,
+                        "metadata": metadata,
+                    })
+
+            return {
+                "path": normalized_path,
+                "current_lease": current_lease,
+                "holder_session": holder_session,
+                "waiters": waiters,
+                "waiter_count": len(waiters),
+                "holder_history": holder_history,
+                "recent_operations": recent_operations,
+            }
 
     def acquire_lease(
         self,

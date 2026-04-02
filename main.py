@@ -112,6 +112,25 @@ class SessionsResponse(BaseModel):
     status: str = "ok"
 
 
+class WatchSummaryResponse(BaseModel):
+    watch_id: str
+    path: str
+    session_id: str
+    event_types: List[str]
+    is_fired: bool
+    created_at: float
+
+
+class OwnedNodeResponse(BaseModel):
+    path: str
+    node_type: str
+    version: int
+    session_id: Optional[str] = None
+    data_preview: str
+    created_at: float
+    modified_at: float
+
+
 class CreateNodeRequest(BaseModel):
     path: str
     data: str = ""
@@ -231,6 +250,30 @@ class OperationsResponse(BaseModel):
     last_sequence: int
     next_since: int
     status: str = "ok"
+
+
+class SessionDetailResponse(SessionSummaryResponse):
+    owned_nodes: List[OwnedNodeResponse] = Field(default_factory=list)
+    watches: List[WatchSummaryResponse] = Field(default_factory=list)
+    recent_operations: List[OperationResponse] = Field(default_factory=list)
+
+
+class LeaseHistoryEntryResponse(BaseModel):
+    sequence_number: int
+    timestamp: float
+    session_id: Optional[str] = None
+    holder: str
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class LeaseDetailResponse(BaseModel):
+    path: str
+    current_lease: Optional[LeaseResponse] = None
+    holder_session: Optional[SessionSummaryResponse] = None
+    waiters: List[str] = Field(default_factory=list)
+    waiter_count: int
+    holder_history: List[LeaseHistoryEntryResponse] = Field(default_factory=list)
+    recent_operations: List[OperationResponse] = Field(default_factory=list)
 
 
 class ErrorResponse(BaseModel):
@@ -383,6 +426,34 @@ async def list_sessions(
     )
 
 
+@app.get("/api/session/detail", response_model=SessionDetailResponse)
+async def session_detail(
+    session_id: str = Query(..., description="Session ID"),
+    operation_limit: int = Query(default=20, ge=1, le=100),
+) -> SessionDetailResponse:
+    """Return a drill-down view of one session."""
+    detail = coordinator.get_session_detail(session_id=session_id, operation_limit=operation_limit)
+    if detail is None:
+        raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
+
+    return SessionDetailResponse(
+        **{key: value for key, value in detail.items() if key not in {"owned_nodes", "watches", "recent_operations"}},
+        owned_nodes=[OwnedNodeResponse(**node) for node in detail.get("owned_nodes", [])],
+        watches=[
+            WatchSummaryResponse(
+                watch_id=watch["watch_id"],
+                path=watch["path"],
+                session_id=watch["session_id"],
+                event_types=[event_type.value if hasattr(event_type, "value") else str(event_type) for event_type in watch["event_types"]],
+                is_fired=watch["is_fired"],
+                created_at=watch["created_at"],
+            )
+            for watch in detail["watches"]
+        ],
+        recent_operations=[_serialize_operation(operation) for operation in detail["recent_operations"]],
+    )
+
+
 # ========== Metadata Endpoints ==========
 
 @app.post("/api/node/create", response_model=CreateNodeResponse)
@@ -532,6 +603,27 @@ async def get_lease(path: str = Query(..., description="Lease path")) -> LeaseRe
     if lease is None:
         raise HTTPException(status_code=404, detail=f"Lease not found: {path}")
     return LeaseResponse(**lease)
+
+
+@app.get("/api/lease/detail", response_model=LeaseDetailResponse)
+async def lease_detail(
+    path: str = Query(..., description="Lease path"),
+    operation_limit: int = Query(default=20, ge=1, le=100),
+) -> LeaseDetailResponse:
+    """Return a drill-down view of a lease path."""
+    detail = coordinator.get_lease_detail(path=path, operation_limit=operation_limit)
+    if detail is None:
+        raise HTTPException(status_code=404, detail=f"Lease not found: {path}")
+
+    return LeaseDetailResponse(
+        path=detail["path"],
+        current_lease=LeaseResponse(**detail["current_lease"]) if detail.get("current_lease") else None,
+        holder_session=SessionSummaryResponse(**detail["holder_session"]) if detail.get("holder_session") else None,
+        waiters=detail["waiters"],
+        waiter_count=detail["waiter_count"],
+        holder_history=[LeaseHistoryEntryResponse(**entry) for entry in detail.get("holder_history", [])],
+        recent_operations=[_serialize_operation(operation) for operation in detail["recent_operations"]],
+    )
 
 
 @app.post("/api/lease/release")

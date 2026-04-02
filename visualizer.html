@@ -152,7 +152,7 @@
         /* Main Layout */
         .main {
             display: grid;
-            grid-template-columns: 1fr 1fr;
+            grid-template-columns: minmax(320px, 1.15fr) minmax(320px, 1fr) minmax(320px, 0.95fr);
             gap: 1px;
             background: var(--border);
             height: calc(100vh - 73px);
@@ -211,9 +211,23 @@
             border-radius: 4px;
             transition: background 0.1s ease;
         }
-        
+
+        .tree-node.inspectable,
+        .event.inspectable,
+        .session-card.inspectable {
+            cursor: pointer;
+        }
+
         .tree-node:hover {
             background: var(--bg-tertiary);
+        }
+
+        .tree-node.selected,
+        .event.selected,
+        .session-card.selected {
+            border-color: rgba(59, 130, 246, 0.45);
+            box-shadow: inset 0 0 0 1px rgba(59, 130, 246, 0.4);
+            background: rgba(59, 130, 246, 0.08);
         }
         
         .tree-node.new {
@@ -335,6 +349,158 @@
         .recovery-summary strong {
             color: var(--text-primary);
             margin-right: 8px;
+        }
+
+        .inspector-panel {
+            border-left: 1px solid var(--border);
+        }
+
+        .inspector-kicker {
+            font-size: 11px;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-bottom: 8px;
+        }
+
+        .inspector-title {
+            font-size: 18px;
+            font-weight: 600;
+            margin-bottom: 6px;
+        }
+
+        .inspector-subtitle {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 12px;
+            color: var(--text-secondary);
+            margin-bottom: 16px;
+            word-break: break-all;
+        }
+
+        .inspector-section {
+            margin-bottom: 18px;
+            padding: 14px;
+            border-radius: 8px;
+            border: 1px solid var(--border);
+            background: var(--bg-secondary);
+        }
+
+        .inspector-section-title {
+            font-size: 11px;
+            font-weight: 600;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-bottom: 10px;
+        }
+
+        .inspector-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 10px 14px;
+        }
+
+        .inspector-stat-label {
+            font-size: 11px;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.03em;
+            margin-bottom: 3px;
+        }
+
+        .inspector-stat-value {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 12px;
+            color: var(--text-primary);
+            word-break: break-word;
+        }
+
+        .inspector-list {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .inspector-item {
+            padding: 10px 12px;
+            border-radius: 6px;
+            border: 1px solid var(--border);
+            background: var(--bg-tertiary);
+        }
+
+        .inspector-item.inspectable {
+            cursor: pointer;
+            transition: background 120ms ease, border-color 120ms ease;
+        }
+
+        .inspector-item.inspectable:hover {
+            background: rgba(59, 130, 246, 0.08);
+            border-color: rgba(59, 130, 246, 0.3);
+        }
+
+        .inspector-item-row {
+            display: flex;
+            justify-content: space-between;
+            gap: 10px;
+            align-items: flex-start;
+        }
+
+        .inspector-item-title {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 12px;
+            color: var(--text-primary);
+            word-break: break-all;
+        }
+
+        .inspector-item-meta {
+            margin-top: 4px;
+            font-size: 11px;
+            color: var(--text-secondary);
+            line-height: 1.5;
+            word-break: break-word;
+        }
+
+        .inspector-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 3px 7px;
+            border-radius: 999px;
+            font-size: 10px;
+            color: var(--text-secondary);
+            background: rgba(59, 130, 246, 0.12);
+            border: 1px solid rgba(59, 130, 246, 0.2);
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            white-space: nowrap;
+        }
+
+        .inspector-button {
+            appearance: none;
+            display: inline-flex;
+            width: 100%;
+            text-align: left;
+            border: 1px solid var(--border);
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+            padding: 10px 12px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-family: inherit;
+            font-size: 12px;
+        }
+
+        .inspector-button:hover {
+            background: rgba(59, 130, 246, 0.08);
+            border-color: rgba(59, 130, 246, 0.3);
+        }
+
+        .inspector-code {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 11px;
+            color: var(--text-secondary);
+            white-space: pre-wrap;
+            word-break: break-word;
         }
         
         /* Bottom Panel - Sessions */
@@ -627,6 +793,21 @@
                 </div>
             </div>
         </section>
+
+        <section class="panel inspector-panel">
+            <div class="panel-header">
+                <span class="panel-title">Inspector</span>
+                <span class="panel-count" id="inspectorCount">idle</span>
+            </div>
+            <div class="panel-content" id="inspectorPanel">
+                <div class="empty-state">
+                    <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 12h6m-6 4h6M7 4h10a2 2 0 012 2v12a2 2 0 01-2 2H7a2 2 0 01-2-2V6a2 2 0 012-2z"/>
+                    </svg>
+                    <span>Select a session card or lease path to inspect details.</span>
+                </div>
+            </div>
+        </section>
     </main>
     
     <section class="sessions-panel">
@@ -709,7 +890,7 @@
     </div>
 
     <script>
-        const API_BASE = 'http://localhost:8000/api';
+        const API_BASE = new URL('/api', window.location.href).toString().replace(/\/$/, '');
         
         // State
         let sessions = [];
@@ -723,7 +904,9 @@
         let sessionStream = null;
         let pendingTreeRefresh = null;
         let pendingStatsRefresh = null;
+        let pendingInspectorRefresh = null;
         let streamStates = { operations: false, sessions: false };
+        let selectedInspector = { kind: null, key: null, data: null, loading: false, error: null };
         const TIMELINE_LIMIT = 50;
         const HIDDEN_TIMELINE_TYPES = new Set(['SESSION_HEARTBEAT']);
         
@@ -845,6 +1028,10 @@
                 const nodeType = node.info?.node_type || 'PERSISTENT';
                 const isEphemeral = nodeType === 'EPHEMERAL';
                 const version = node.info?.version || 0;
+                const inspectTarget = isInspectableLeasePath(node.path, nodeType)
+                    ? { kind: 'lease', key: node.path }
+                    : null;
+                const classes = ['tree-node'];
                 
                 let badges = '';
                 if (isEphemeral) {
@@ -853,11 +1040,18 @@
                 if (node.path.includes('leader') || node.path.includes('lock')) {
                     badges += '<span class="tree-badge leader">★</span>';
                 }
+
+                if (inspectTarget) {
+                    classes.push('inspectable');
+                    if (isSelectedInspector(inspectTarget.kind, inspectTarget.key)) {
+                        classes.push('selected');
+                    }
+                }
                 
                 let html = `
-                    <div class="tree-node" data-path="${node.path}">
+                    <div class="${classes.join(' ')}" data-path="${escapeHtml(node.path)}" ${buildInspectAttributes(inspectTarget)}>
                         <span class="tree-indent">${indent}</span>
-                        <span class="tree-path">${node.name}</span>
+                        <span class="tree-path">${escapeHtml(node.name)}</span>
                         ${badges}
                         <span class="tree-version">v${version}</span>
                     </div>
@@ -887,6 +1081,72 @@
         function formatTime(timestamp) {
             if (!timestamp) return 'unknown time';
             return new Date(timestamp * 1000).toLocaleTimeString();
+        }
+
+        function formatDateTime(timestamp) {
+            if (!timestamp) return 'unknown';
+            return new Date(timestamp * 1000).toLocaleString();
+        }
+
+        function formatSeconds(seconds) {
+            const safe = Math.max(0, Math.ceil(seconds || 0));
+            return `${safe}s`;
+        }
+
+        function formatMetadata(value) {
+            if (!value || (typeof value === 'object' && Object.keys(value).length === 0)) {
+                return '{}';
+            }
+            return JSON.stringify(value, null, 2);
+        }
+
+        function isSelectedInspector(kind, key) {
+            return selectedInspector.kind === kind && selectedInspector.key === key;
+        }
+
+        function isInspectableLeasePath(path, nodeType = null) {
+            if (!path || path === '/') {
+                return false;
+            }
+            if (nodeType === 'EPHEMERAL') {
+                return true;
+            }
+            return path.includes('lease') || path.includes('lock') || path.includes('leader') || path.includes('election');
+        }
+
+        function getOperationInspectTarget(operation) {
+            if (operation.session_id && operation.operation_type.startsWith('SESSION_')) {
+                return { kind: 'session', key: operation.session_id };
+            }
+            if (isInspectableLeasePath(operation.path, operation.node_type)) {
+                return { kind: 'lease', key: operation.path };
+            }
+            if (operation.delete_paths && operation.delete_paths.length === 1 && isInspectableLeasePath(operation.delete_paths[0])) {
+                return { kind: 'lease', key: operation.delete_paths[0] };
+            }
+            return null;
+        }
+
+        function buildInspectAttributes(target) {
+            if (!target) {
+                return '';
+            }
+            return `data-inspect-kind="${escapeHtml(target.kind)}" data-inspect-key="${escapeHtml(target.key)}" onclick="handleInspectorSelection(this)"`;
+        }
+
+        function handleInspectorSelection(element) {
+            const kind = element?.dataset?.inspectKind;
+            const key = element?.dataset?.inspectKey;
+            if (!kind || !key) {
+                return;
+            }
+            if (kind === 'session') {
+                inspectSession(key);
+                return;
+            }
+            if (kind === 'lease') {
+                inspectLeasePath(key);
+            }
         }
 
         function formatOperationLabel(operationType) {
@@ -958,6 +1218,267 @@
             }
         }
 
+        function setInspectorState(nextState) {
+            selectedInspector = { ...selectedInspector, ...nextState };
+            renderInspector();
+        }
+
+        function scheduleInspectorRefresh() {
+            if (!selectedInspector.kind || pendingInspectorRefresh) {
+                return;
+            }
+            pendingInspectorRefresh = setTimeout(async () => {
+                pendingInspectorRefresh = null;
+                if (selectedInspector.kind === 'session') {
+                    await inspectSession(selectedInspector.key, { silent: true });
+                } else if (selectedInspector.kind === 'lease') {
+                    await inspectLeasePath(selectedInspector.key, { silent: true });
+                }
+            }, 140);
+        }
+
+        async function inspectSession(sessionId, options = {}) {
+            const { silent = false } = options;
+            if (!silent) {
+                setInspectorState({ kind: 'session', key: sessionId, data: null, loading: true, error: null });
+            } else {
+                selectedInspector.kind = 'session';
+                selectedInspector.key = sessionId;
+            }
+
+            try {
+                const response = await fetch(`${API_BASE}/session/detail?session_id=${encodeURIComponent(sessionId)}`);
+                if (!response.ok) {
+                    throw new Error(`Session detail unavailable (${response.status})`);
+                }
+                const data = await response.json();
+                setInspectorState({ kind: 'session', key: sessionId, data, loading: false, error: null });
+            } catch (e) {
+                setInspectorState({ kind: 'session', key: sessionId, data: null, loading: false, error: e.message });
+            }
+        }
+
+        async function inspectLeasePath(path, options = {}) {
+            const { silent = false } = options;
+            if (!silent) {
+                setInspectorState({ kind: 'lease', key: path, data: null, loading: true, error: null });
+            } else {
+                selectedInspector.kind = 'lease';
+                selectedInspector.key = path;
+            }
+
+            try {
+                const response = await fetch(`${API_BASE}/lease/detail?path=${encodeURIComponent(path)}`);
+                if (!response.ok) {
+                    throw new Error(`Lease detail unavailable (${response.status})`);
+                }
+                const data = await response.json();
+                setInspectorState({ kind: 'lease', key: path, data, loading: false, error: null });
+            } catch (e) {
+                setInspectorState({ kind: 'lease', key: path, data: null, loading: false, error: e.message });
+            }
+        }
+
+        function renderInspectorStats(stats) {
+            return Object.entries(stats).map(([label, value]) => `
+                <div>
+                    <div class="inspector-stat-label">${escapeHtml(label)}</div>
+                    <div class="inspector-stat-value">${escapeHtml(String(value))}</div>
+                </div>
+            `).join('');
+        }
+
+        function renderOperationItems(items) {
+            if (!items || items.length === 0) {
+                return '<div class="inspector-code">No recent operations.</div>';
+            }
+
+            return `
+                <div class="inspector-list">
+                    ${items.map(operation => {
+                        const inspectTarget = getOperationInspectTarget(operation);
+                        const classes = ['inspector-item'];
+                        if (inspectTarget) {
+                            classes.push('inspectable');
+                        }
+                        return `
+                        <div class="${classes.join(' ')}" ${buildInspectAttributes(inspectTarget)}>
+                            <div class="inspector-item-row">
+                                <div class="inspector-item-title">${escapeHtml(operation.summary)}</div>
+                                <span class="inspector-chip">#${operation.sequence_number}</span>
+                            </div>
+                            <div class="inspector-item-meta">${escapeHtml(formatDateTime(operation.timestamp))} · ${escapeHtml(operation.operation_type)}</div>
+                        </div>
+                    `;
+                    }).join('')}
+                </div>
+            `;
+        }
+
+        function renderSessionInspector(data) {
+            return `
+                <div class="inspector-kicker">Session</div>
+                <div class="inspector-title">${escapeHtml(data.session_id.slice(0, 8))}...</div>
+                <div class="inspector-subtitle">${escapeHtml(data.session_id)}</div>
+
+                <div class="inspector-section">
+                    <div class="inspector-section-title">State</div>
+                    <div class="inspector-grid">
+                        ${renderInspectorStats({
+                            Status: data.is_alive ? 'alive' : 'dead',
+                            TTL: `${formatSeconds(data.remaining_seconds)} / ${formatSeconds(data.timeout_seconds)}`,
+                            Watches: data.watch_count,
+                            Ephemeral: data.ephemeral_node_count,
+                            Created: formatDateTime(data.created_at),
+                            Heartbeat: formatDateTime(data.last_heartbeat)
+                        })}
+                    </div>
+                </div>
+
+                <div class="inspector-section">
+                    <div class="inspector-section-title">Owned Ephemeral Nodes</div>
+                    ${data.owned_nodes && data.owned_nodes.length ? `
+                        <div class="inspector-list">
+                            ${data.owned_nodes.map(node => `
+                                <button class="inspector-button" type="button" ${buildInspectAttributes({ kind: 'lease', key: node.path })}>
+                                    ${escapeHtml(node.path)} · v${node.version}
+                                </button>
+                            `).join('')}
+                        </div>
+                    ` : '<div class="inspector-code">No owned ephemeral nodes.</div>'}
+                </div>
+
+                <div class="inspector-section">
+                    <div class="inspector-section-title">Registered Watches</div>
+                    ${data.watches && data.watches.length ? `
+                        <div class="inspector-list">
+                            ${data.watches.map(watch => `
+                                <div class="inspector-item">
+                                    <div class="inspector-item-row">
+                                        <div class="inspector-item-title">${escapeHtml(watch.path)}</div>
+                                        <span class="inspector-chip">${escapeHtml(watch.event_types.join(', '))}</span>
+                                    </div>
+                                    <div class="inspector-item-meta">${escapeHtml(formatDateTime(watch.created_at))}</div>
+                                </div>
+                            `).join('')}
+                        </div>
+                    ` : '<div class="inspector-code">No active watches.</div>'}
+                </div>
+
+                <div class="inspector-section">
+                    <div class="inspector-section-title">Recent Operations</div>
+                    ${renderOperationItems(data.recent_operations)}
+                </div>
+            `;
+        }
+
+        function renderLeaseInspector(data) {
+            const lease = data.current_lease;
+            const holderSession = data.holder_session;
+            return `
+                <div class="inspector-kicker">Lease Path</div>
+                <div class="inspector-title">${escapeHtml(data.path)}</div>
+                <div class="inspector-subtitle">${lease ? 'Current or historical lease insight' : 'Historical lease insight only'}</div>
+
+                <div class="inspector-section">
+                    <div class="inspector-section-title">Current Holder</div>
+                    ${lease ? `
+                        <div class="inspector-grid">
+                            ${renderInspectorStats({
+                                Holder: lease.holder,
+                                Session: lease.session_id || 'n/a',
+                                Token: lease.lease_token || 'n/a',
+                                Expires: lease.expires_at ? formatDateTime(lease.expires_at) : 'n/a',
+                                Version: lease.version,
+                                Modified: formatDateTime(lease.modified_at)
+                            })}
+                        </div>
+                        <div class="inspector-code" style="margin-top: 10px;">${escapeHtml(formatMetadata(lease.metadata))}</div>
+                        ${holderSession ? `
+                            <div style="margin-top: 12px;">
+                                <button class="inspector-button" type="button" ${buildInspectAttributes({ kind: 'session', key: holderSession.session_id })}>
+                                    Open holder session ${escapeHtml(holderSession.session_id.slice(0, 8))}...
+                                </button>
+                            </div>
+                        ` : ''}
+                    ` : '<div class="inspector-code">No active holder. This path currently exists only in history.</div>'}
+                </div>
+
+                <div class="inspector-section">
+                    <div class="inspector-section-title">Contention</div>
+                    ${data.waiter_count ? `
+                        <div class="inspector-list">
+                            ${data.waiters.map(waiter => `
+                                <button class="inspector-button" type="button" ${buildInspectAttributes({ kind: 'session', key: waiter })}>
+                                    ${escapeHtml(waiter)}
+                                </button>
+                            `).join('')}
+                        </div>
+                    ` : '<div class="inspector-code">No current waiting sessions.</div>'}
+                </div>
+
+                <div class="inspector-section">
+                    <div class="inspector-section-title">Holder History</div>
+                    ${data.holder_history && data.holder_history.length ? `
+                        <div class="inspector-list">
+                            ${data.holder_history.map(entry => `
+                                <div class="inspector-item">
+                                    <div class="inspector-item-row">
+                                        <div class="inspector-item-title">${escapeHtml(entry.holder)}</div>
+                                        <span class="inspector-chip">#${entry.sequence_number}</span>
+                                    </div>
+                                    <div class="inspector-item-meta">${escapeHtml(formatDateTime(entry.timestamp))} · ${escapeHtml(entry.session_id || 'no session')}</div>
+                                </div>
+                            `).join('')}
+                        </div>
+                    ` : '<div class="inspector-code">No committed holder history yet.</div>'}
+                </div>
+
+                <div class="inspector-section">
+                    <div class="inspector-section-title">Recent Operations</div>
+                    ${renderOperationItems(data.recent_operations)}
+                </div>
+            `;
+        }
+
+        function renderInspector() {
+            const container = document.getElementById('inspectorPanel');
+            const count = document.getElementById('inspectorCount');
+
+            if (!selectedInspector.kind) {
+                count.textContent = 'idle';
+                container.innerHTML = `
+                    <div class="empty-state">
+                        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 12h6m-6 4h6M7 4h10a2 2 0 012 2v12a2 2 0 01-2 2H7a2 2 0 01-2-2V6a2 2 0 012-2z"/>
+                        </svg>
+                        <span>Select a session card or lease path to inspect details.</span>
+                    </div>
+                `;
+                return;
+            }
+
+            if (selectedInspector.loading) {
+                count.textContent = 'loading';
+                container.innerHTML = '<div class="inspector-code">Loading inspector data...</div>';
+                return;
+            }
+
+            if (selectedInspector.error) {
+                count.textContent = 'error';
+                container.innerHTML = `<div class="inspector-code">${escapeHtml(selectedInspector.error)}</div>`;
+                return;
+            }
+
+            count.textContent = selectedInspector.kind;
+            if (selectedInspector.kind === 'session') {
+                container.innerHTML = renderSessionInspector(selectedInspector.data);
+                return;
+            }
+
+            container.innerHTML = renderLeaseInspector(selectedInspector.data);
+        }
+
         function setStreamStatus(kind, connected) {
             streamStates[kind] = connected;
             updateConnectionStatus(streamStates.operations || streamStates.sessions);
@@ -1008,6 +1529,7 @@
                 ...newOperations.map(operation => operation.sequence_number || 0)
             );
             renderEvents();
+            scheduleInspectorRefresh();
         }
 
         function closeStreams() {
@@ -1045,6 +1567,7 @@
                 syncHeartbeatIntervals();
                 renderSessions();
                 scheduleStatsRefresh();
+                scheduleInspectorRefresh();
             });
             sessionStream.onopen = () => setStreamStatus('sessions', true);
             sessionStream.onerror = () => setStreamStatus('sessions', false);
@@ -1076,6 +1599,7 @@
                 sessions = Array.isArray(data.sessions) ? data.sessions : [];
                 syncHeartbeatIntervals();
                 renderSessions();
+                scheduleInspectorRefresh();
             } catch (e) {
                 console.error('Failed to refresh sessions:', e);
             }
@@ -1110,8 +1634,17 @@
                 return;
             }
             
-            container.innerHTML = operations.map(operation => `
-                <div class="event">
+            container.innerHTML = operations.map(operation => {
+                const inspectTarget = getOperationInspectTarget(operation);
+                const classes = ['event'];
+                if (inspectTarget) {
+                    classes.push('inspectable');
+                    if (isSelectedInspector(inspectTarget.kind, inspectTarget.key)) {
+                        classes.push('selected');
+                    }
+                }
+                return `
+                <div class="${classes.join(' ')}" ${buildInspectAttributes(inspectTarget)}>
                     <span class="event-time">#${operation.sequence_number}</span>
                     <div class="event-content">
                         <div class="event-type ${operation.operation_type.toLowerCase()}">${formatOperationLabel(operation.operation_type)}</div>
@@ -1119,7 +1652,8 @@
                         <div class="event-meta">${formatOperationMeta(operation)}</div>
                     </div>
                 </div>
-            `).join('');
+            `;
+            }).join('');
             
             document.getElementById('eventCount').textContent = `${operations.length} ops`;
         }
@@ -1209,9 +1743,13 @@
                     : 0;
                 const barClass = percent < 20 ? 'danger' : percent < 50 ? 'warning' : '';
                 const sessionLabel = `${s.session_id.slice(0, 8)}...`;
+                const classes = ['session-card', 'inspectable'];
+                if (isSelectedInspector('session', s.session_id)) {
+                    classes.push('selected');
+                }
                 
                 return `
-                    <div class="session-card">
+                    <div class="${classes.join(' ')}" ${buildInspectAttributes({ kind: 'session', key: s.session_id })}>
                         <div class="session-header">
                             <span class="session-id">${sessionLabel}</span>
                             <span class="session-status">
@@ -1224,7 +1762,7 @@
                         </div>
                         <div class="session-footer">
                             <span class="session-time">${Math.ceil(s.remaining_seconds)}s / ${s.timeout_seconds}s</span>
-                            <button class="btn btn-danger btn-kill" onclick="killSession('${s.session_id}')">Kill</button>
+                            <button class="btn btn-danger btn-kill" onclick="event.stopPropagation(); killSession('${s.session_id}')">Kill</button>
                         </div>
                         <div class="session-nodes">ephemeral ${s.ephemeral_node_count} · watches ${s.watch_count}</div>
                     </div>

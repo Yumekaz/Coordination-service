@@ -741,6 +741,112 @@ class TestSessionInventoryEndpoints:
         assert entry["watch_count"] == 0
 
 
+class TestInspectorEndpoints:
+    """Tests for session and lease drill-down endpoints."""
+
+    def test_session_detail_includes_owned_nodes_watches_and_recent_ops(self, client):
+        """Session detail should expose the owned nodes, watches, and recent operations."""
+        session_id = client.post("/api/session/open", json={"timeout_seconds": 30}).json()["session_id"]
+        client.post("/api/watch/register", json={
+            "path": "/inspect-session",
+            "session_id": session_id,
+        })
+        client.post("/api/node/create", json={
+            "path": "/inspect-session",
+            "data": "payload",
+            "persistent": False,
+            "session_id": session_id,
+        })
+
+        response = client.get("/api/session/detail", params={"session_id": session_id})
+        assert response.status_code == 200
+
+        data = response.json()
+        assert data["session_id"] == session_id
+        assert data["watch_count"] == 1
+        assert any(node["path"] == "/inspect-session" for node in data["owned_nodes"])
+        assert any(watch["path"] == "/inspect-session" for watch in data["watches"])
+        assert any(op["operation_type"] == "SESSION_OPEN" for op in data["recent_operations"])
+        assert any(op["path"] == "/inspect-session" for op in data["recent_operations"])
+
+    def test_lease_detail_includes_waiters_and_history(self, client):
+        """Lease detail should expose current holder, live waiters, and holder history."""
+        holder_session = client.post("/api/session/open", json={"timeout_seconds": 30}).json()["session_id"]
+        waiter_session = client.post("/api/session/open", json={"timeout_seconds": 30}).json()["session_id"]
+
+        lease_response = client.post("/api/lease/acquire", json={
+            "path": "/locks/demo",
+            "session_id": holder_session,
+            "holder": "alpha",
+            "metadata": {"role": "leader"},
+        })
+        assert lease_response.status_code == 200
+
+        result = {}
+
+        def waiter():
+            try:
+                main.coordinator.acquire_lease(
+                    "/locks/demo",
+                    waiter_session,
+                    holder="beta",
+                    metadata={"role": "candidate"},
+                    wait_timeout_seconds=0.5,
+                )
+                result["status"] = "acquired"
+            except Exception as exc:
+                result["status"] = type(exc).__name__
+
+        thread = threading.Thread(target=waiter)
+        thread.start()
+        time.sleep(0.15)
+        try:
+            response = client.get("/api/lease/detail", params={"path": "/locks/demo"})
+        finally:
+            thread.join()
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["path"] == "/locks/demo"
+        assert data["current_lease"]["holder"] == "alpha"
+        assert data["current_lease"]["session_id"] == holder_session
+        assert data["holder_session"]["session_id"] == holder_session
+        assert data["waiter_count"] >= 1
+        assert waiter_session in data["waiters"]
+        assert any(entry["holder"] == "alpha" for entry in data["holder_history"])
+        assert any(op["path"] == "/locks/demo" for op in data["recent_operations"])
+        assert result["status"] in {"ConflictError", "acquired"}
+
+    def test_lease_detail_preserves_history_after_release(self, client):
+        """Lease detail should stay inspectable after the active lease is gone."""
+        session_id = client.post("/api/session/open", json={"timeout_seconds": 30}).json()["session_id"]
+
+        acquired = client.post("/api/lease/acquire", json={
+            "path": "/locks/history",
+            "session_id": session_id,
+            "holder": "historian",
+            "metadata": {"role": "primary"},
+        })
+        assert acquired.status_code == 200
+
+        released = client.post("/api/lease/release", json={
+            "path": "/locks/history",
+            "session_id": session_id,
+        })
+        assert released.status_code == 200
+
+        response = client.get("/api/lease/detail", params={"path": "/locks/history"})
+        assert response.status_code == 200
+
+        data = response.json()
+        assert data["path"] == "/locks/history"
+        assert data["current_lease"] is None
+        assert data["holder_session"] is None
+        assert any(entry["holder"] == "historian" for entry in data["holder_history"])
+        assert any(op["operation_type"] == "CREATE" for op in data["recent_operations"])
+        assert any(op["operation_type"] == "DELETE" for op in data["recent_operations"])
+
+
 class TestStreamingEndpoints:
     """Tests for SSE streaming APIs."""
 
