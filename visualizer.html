@@ -712,36 +712,31 @@
         const API_BASE = 'http://localhost:8000/api';
         
         // State
-        let sessions = {};
+        let sessions = [];
         let nodes = {};
         let operations = [];
+        let heartbeatIntervals = {};
         let lastOperationSequence = 0;
         let timelineInitialized = false;
         let recoverySummaryLoaded = false;
+        let operationStream = null;
+        let sessionStream = null;
+        let pendingTreeRefresh = null;
+        let pendingStatsRefresh = null;
+        let streamStates = { operations: false, sessions: false };
         const TIMELINE_LIMIT = 50;
         const HIDDEN_TIMELINE_TYPES = new Set(['SESSION_HEARTBEAT']);
-        
-        // Polling interval
-        let pollInterval;
         
         // Initialize
         async function init() {
             await refresh();
-            pollInterval = setInterval(refresh, 1000);
+            startStreams();
         }
         
         // Refresh all data
         async function refresh() {
             try {
-                const [health, stats] = await Promise.all([
-                    fetch(`${API_BASE}/health`).then(r => r.json()),
-                    fetch(`${API_BASE}/stats`).then(r => r.json())
-                ]);
-                
-                document.getElementById('statNodes').textContent = stats.nodes;
-                document.getElementById('statSessions').textContent = stats.sessions_alive;
-                document.getElementById('statWatches').textContent = stats.watches;
-                document.getElementById('statOps').textContent = stats.operations;
+                const stats = await refreshStats();
 
                 if (!timelineInitialized) {
                     lastOperationSequence = Math.max(0, stats.operations - TIMELINE_LIMIT);
@@ -751,13 +746,22 @@
                 await Promise.all([
                     refreshTree(),
                     refreshTimeline(),
-                    refreshRecoverySummary()
+                    refreshRecoverySummary(),
+                    refreshSessions()
                 ]);
-                updateSessionTimers();
                 updateConnectionStatus(true);
             } catch (e) {
                 updateConnectionStatus(false);
             }
+        }
+
+        async function refreshStats() {
+            const stats = await fetch(`${API_BASE}/stats`).then(r => r.json());
+            document.getElementById('statNodes').textContent = stats.nodes;
+            document.getElementById('statSessions').textContent = stats.sessions_alive;
+            document.getElementById('statWatches').textContent = stats.watches;
+            document.getElementById('statOps').textContent = stats.operations;
+            return stats;
         }
         
         // Update connection status
@@ -954,6 +958,129 @@
             }
         }
 
+        function setStreamStatus(kind, connected) {
+            streamStates[kind] = connected;
+            updateConnectionStatus(streamStates.operations || streamStates.sessions);
+        }
+
+        function scheduleTreeRefresh() {
+            if (pendingTreeRefresh) {
+                return;
+            }
+            pendingTreeRefresh = setTimeout(async () => {
+                pendingTreeRefresh = null;
+                await refreshTree();
+            }, 120);
+        }
+
+        function scheduleStatsRefresh() {
+            if (pendingStatsRefresh) {
+                return;
+            }
+            pendingStatsRefresh = setTimeout(async () => {
+                pendingStatsRefresh = null;
+                try {
+                    await refreshStats();
+                } catch (e) {
+                    console.error('Failed to refresh stats:', e);
+                }
+            }, 120);
+        }
+
+        function mergeOperations(newOperations) {
+            if (!Array.isArray(newOperations) || newOperations.length === 0) {
+                return;
+            }
+
+            const visibleOperations = newOperations.filter(
+                operation => !HIDDEN_TIMELINE_TYPES.has(operation.operation_type)
+            );
+            for (const operation of visibleOperations) {
+                operations.unshift(operation);
+            }
+            operations = operations
+                .filter((operation, index, items) =>
+                    items.findIndex(item => item.sequence_number === operation.sequence_number) === index
+                )
+                .slice(0, TIMELINE_LIMIT);
+            lastOperationSequence = Math.max(
+                lastOperationSequence,
+                ...newOperations.map(operation => operation.sequence_number || 0)
+            );
+            renderEvents();
+        }
+
+        function closeStreams() {
+            if (operationStream) {
+                operationStream.close();
+                operationStream = null;
+            }
+            if (sessionStream) {
+                sessionStream.close();
+                sessionStream = null;
+            }
+        }
+
+        function startStreams() {
+            closeStreams();
+
+            operationStream = new EventSource(`${API_BASE}/stream/operations?since_sequence=${lastOperationSequence}&limit=100`);
+            operationStream.addEventListener('operation', (event) => {
+                setStreamStatus('operations', true);
+                const operation = JSON.parse(event.data);
+                mergeOperations([operation]);
+                scheduleStatsRefresh();
+                if (['CREATE', 'SET', 'DELETE'].includes(operation.operation_type)) {
+                    scheduleTreeRefresh();
+                }
+            });
+            operationStream.onopen = () => setStreamStatus('operations', true);
+            operationStream.onerror = () => setStreamStatus('operations', false);
+
+            sessionStream = new EventSource(`${API_BASE}/stream/sessions?alive_only=true`);
+            sessionStream.addEventListener('sessions', (event) => {
+                setStreamStatus('sessions', true);
+                const payload = JSON.parse(event.data);
+                sessions = Array.isArray(payload.sessions) ? payload.sessions : [];
+                syncHeartbeatIntervals();
+                renderSessions();
+                scheduleStatsRefresh();
+            });
+            sessionStream.onopen = () => setStreamStatus('sessions', true);
+            sessionStream.onerror = () => setStreamStatus('sessions', false);
+        }
+
+        function syncHeartbeatIntervals() {
+            const liveSessionIds = new Set(
+                sessions
+                    .filter(session => session.is_alive)
+                    .map(session => session.session_id)
+            );
+
+            for (const sessionId of Object.keys(heartbeatIntervals)) {
+                if (!liveSessionIds.has(sessionId)) {
+                    clearInterval(heartbeatIntervals[sessionId]);
+                    delete heartbeatIntervals[sessionId];
+                }
+            }
+        }
+
+        async function refreshSessions() {
+            try {
+                const response = await fetch(`${API_BASE}/sessions?alive_only=true`);
+                if (!response.ok) {
+                    return;
+                }
+
+                const data = await response.json();
+                sessions = Array.isArray(data.sessions) ? data.sessions : [];
+                syncHeartbeatIntervals();
+                renderSessions();
+            } catch (e) {
+                console.error('Failed to refresh sessions:', e);
+            }
+        }
+
         async function refreshTimeline() {
             try {
                 const response = await fetch(
@@ -962,24 +1089,7 @@
                 if (!response.ok) return;
 
                 const data = await response.json();
-                const newOperations = data.operations || [];
-                const visibleOperations = newOperations.filter(
-                    operation => !HIDDEN_TIMELINE_TYPES.has(operation.operation_type)
-                );
-
-                if (newOperations.length > 0) {
-                    for (const operation of visibleOperations) {
-                        operations.unshift(operation);
-                    }
-                    operations = operations
-                        .filter((operation, index, items) =>
-                            items.findIndex(item => item.sequence_number === operation.sequence_number) === index
-                        )
-                        .slice(0, TIMELINE_LIMIT);
-                    lastOperationSequence = data.next_since || newOperations[newOperations.length - 1].sequence_number;
-                }
-
-                renderEvents();
+                mergeOperations(data.operations || []);
             } catch (e) {
                 console.error('Failed to refresh operations timeline:', e);
             }
@@ -1027,17 +1137,9 @@
                 
                 const data = await response.json();
                 if (data.session_id) {
-                    sessions[data.session_id] = {
-                        id: data.session_id,
-                        timeout,
-                        remaining: timeout,
-                        nodes: 0,
-                        created: Date.now()
-                    };
-                    renderSessions();
-                    await refreshTimeline();
                     closeModal('session');
                     startHeartbeat(data.session_id, timeout);
+                    await Promise.all([refreshSessions(), refreshTimeline()]);
                 }
             } catch (e) {
                 console.error('Failed to create session:', e);
@@ -1046,17 +1148,20 @@
         
         // Start heartbeat for session
         function startHeartbeat(sessionId, timeout) {
+            if (heartbeatIntervals[sessionId]) {
+                clearInterval(heartbeatIntervals[sessionId]);
+            }
             const interval = Math.max(1000, (timeout * 1000) / 3);
-            sessions[sessionId].heartbeatInterval = setInterval(async () => {
+            heartbeatIntervals[sessionId] = setInterval(async () => {
                 try {
                     await fetch(`${API_BASE}/session/heartbeat`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ session_id: sessionId })
                     });
-                    sessions[sessionId].remaining = sessions[sessionId].timeout;
                 } catch (e) {
-                    // Session might be dead
+                    clearInterval(heartbeatIntervals[sessionId]);
+                    delete heartbeatIntervals[sessionId];
                 }
             }, interval);
         }
@@ -1064,8 +1169,9 @@
         // Kill session
         async function killSession(sessionId) {
             try {
-                if (sessions[sessionId]?.heartbeatInterval) {
-                    clearInterval(sessions[sessionId].heartbeatInterval);
+                if (heartbeatIntervals[sessionId]) {
+                    clearInterval(heartbeatIntervals[sessionId]);
+                    delete heartbeatIntervals[sessionId];
                 }
                 
                 await fetch(`${API_BASE}/session/close`, {
@@ -1074,29 +1180,17 @@
                     body: JSON.stringify({ session_id: sessionId })
                 });
 
-                delete sessions[sessionId];
-                renderSessions();
-                setTimeout(() => {
-                    refreshTree();
-                    refreshTimeline();
-                }, 500);
+                await Promise.all([refreshSessions(), refreshTree(), refreshTimeline()]);
             } catch (e) {
                 console.error('Failed to kill session:', e);
             }
         }
         
-        // Update session timers
-        function updateSessionTimers() {
-            for (const id in sessions) {
-                sessions[id].remaining = Math.max(0, sessions[id].remaining - 1);
-            }
-            renderSessions();
-        }
-        
         // Render sessions
         function renderSessions() {
             const container = document.getElementById('sessionsGrid');
-            const sessionList = Object.values(sessions);
+            const sessionList = sessions;
+            const select = document.getElementById('nodeSession');
             
             if (sessionList.length === 0) {
                 container.innerHTML = `
@@ -1105,17 +1199,21 @@
                     </div>
                 `;
                 document.getElementById('sessionCount').textContent = '0 sessions';
+                select.innerHTML = '<option value="">No live session</option>';
                 return;
             }
             
             container.innerHTML = sessionList.map(s => {
-                const percent = (s.remaining / s.timeout) * 100;
+                const percent = s.timeout_seconds > 0
+                    ? (s.remaining_seconds / s.timeout_seconds) * 100
+                    : 0;
                 const barClass = percent < 20 ? 'danger' : percent < 50 ? 'warning' : '';
+                const sessionLabel = `${s.session_id.slice(0, 8)}...`;
                 
                 return `
                     <div class="session-card">
                         <div class="session-header">
-                            <span class="session-id">${s.id.slice(0, 8)}...</span>
+                            <span class="session-id">${sessionLabel}</span>
                             <span class="session-status">
                                 <span class="session-status-dot"></span>
                                 Active
@@ -1125,9 +1223,10 @@
                             <div class="session-progress-bar ${barClass}" style="width: ${percent}%"></div>
                         </div>
                         <div class="session-footer">
-                            <span class="session-time">${s.remaining}s / ${s.timeout}s</span>
-                            <button class="btn btn-danger btn-kill" onclick="killSession('${s.id}')">Kill</button>
+                            <span class="session-time">${Math.ceil(s.remaining_seconds)}s / ${s.timeout_seconds}s</span>
+                            <button class="btn btn-danger btn-kill" onclick="killSession('${s.session_id}')">Kill</button>
                         </div>
+                        <div class="session-nodes">ephemeral ${s.ephemeral_node_count} · watches ${s.watch_count}</div>
                     </div>
                 `;
             }).join('');
@@ -1135,10 +1234,12 @@
             document.getElementById('sessionCount').textContent = `${sessionList.length} sessions`;
             
             // Update node modal session dropdown
-            const select = document.getElementById('nodeSession');
-            select.innerHTML = sessionList.map(s => 
-                `<option value="${s.id}">${s.id.slice(0, 8)}...</option>`
-            ).join('');
+            select.innerHTML = [
+                '<option value="">No session</option>',
+                ...sessionList.map(s =>
+                    `<option value="${s.session_id}">${s.session_id.slice(0, 8)}...</option>`
+                )
+            ].join('');
         }
         
         // Create node
@@ -1149,6 +1250,7 @@
             const persistent = document.getElementById('nodeType').value === 'persistent';
             
             if (!path) return;
+            if (!persistent && !sessionId) return;
             
             try {
                 const response = await fetch(`${API_BASE}/node/create`, {
@@ -1164,7 +1266,7 @@
                 
                 if (response.ok) {
                     closeModal('node');
-                    await Promise.all([refreshTree(), refreshTimeline()]);
+                    await Promise.all([refreshTree(), refreshTimeline(), refreshSessions()]);
                 }
             } catch (e) {
                 console.error('Failed to create node:', e);
@@ -1211,16 +1313,8 @@
             });
             const data = await response.json();
             
-            sessions[data.session_id] = {
-                id: data.session_id,
-                timeout,
-                remaining: timeout,
-                nodes: 0,
-                created: Date.now()
-            };
-            renderSessions();
             startHeartbeat(data.session_id, timeout);
-            await refreshTimeline();
+            await Promise.all([refreshSessions(), refreshTimeline()]);
             
             return data.session_id;
         }
@@ -1234,7 +1328,7 @@
                 });
                 
                 if (response.ok) {
-                    await Promise.all([refreshTree(), refreshTimeline()]);
+                    await Promise.all([refreshTree(), refreshTimeline(), refreshSessions()]);
                 }
             } catch (e) {
                 console.error('Failed to create demo node:', e);
@@ -1252,6 +1346,14 @@
                     modal.classList.remove('active');
                 }
             });
+        });
+
+        window.addEventListener('beforeunload', () => {
+            closeStreams();
+            for (const sessionId of Object.keys(heartbeatIntervals)) {
+                clearInterval(heartbeatIntervals[sessionId]);
+                delete heartbeatIntervals[sessionId];
+            }
         });
         
         // Initialize on load

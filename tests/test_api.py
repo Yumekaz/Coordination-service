@@ -13,6 +13,7 @@ import tempfile
 import os
 import sys
 import inspect
+import json
 import threading
 import time
 from fastapi.testclient import TestClient
@@ -26,6 +27,27 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from coordinator import Coordinator
 import main
+
+
+def _read_sse_event(response) -> tuple[str, dict]:
+    """Read one SSE event from a streaming response."""
+    event_name = "message"
+    data_lines = []
+
+    for raw_line in response.iter_lines():
+        line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
+        if line == "":
+            if data_lines:
+                return event_name, json.loads("\n".join(data_lines))
+            continue
+        if line.startswith(":"):
+            continue
+        if line.startswith("event:"):
+            event_name = line.split(":", 1)[1].strip()
+        elif line.startswith("data:"):
+            data_lines.append(line.split(":", 1)[1].lstrip())
+
+    raise AssertionError("No SSE event received")
 
 
 def _lease_routes_present() -> bool:
@@ -662,6 +684,98 @@ class TestOperationTimelineEndpoints:
         recovery = client.get("/api/recovery/last")
         assert recovery.status_code == 200
         assert "wal_entries_read" in recovery.json()
+
+
+class TestSessionInventoryEndpoints:
+    """Tests for server-sourced session inventory."""
+
+    def test_list_sessions_exposes_live_state_counts(self, client):
+        """Session inventory should include TTL, watch count, and ephemeral nodes."""
+        session_id = client.post("/api/session/open", json={"timeout_seconds": 30}).json()["session_id"]
+
+        watch = client.post("/api/watch/register", json={
+            "path": "/inventory-watch",
+            "session_id": session_id,
+        })
+        assert watch.status_code == 200
+
+        node = client.post("/api/node/create", json={
+            "path": "/inventory-ephemeral",
+            "data": "payload",
+            "persistent": False,
+            "session_id": session_id,
+        })
+        assert node.status_code == 200
+
+        response = client.get("/api/sessions", params={"alive_only": True})
+        assert response.status_code == 200
+
+        data = response.json()
+        entry = next(item for item in data["sessions"] if item["session_id"] == session_id)
+
+        assert data["count"] >= 1
+        assert entry["is_alive"] is True
+        assert entry["watch_count"] == 1
+        assert entry["ephemeral_node_count"] == 1
+        assert "/inventory-ephemeral" in entry["ephemeral_nodes"]
+        assert entry["remaining_seconds"] > 0
+        assert entry["expires_at"] >= entry["last_heartbeat"]
+
+    def test_list_sessions_can_include_closed_sessions(self, client):
+        """Closed sessions should remain visible in the full inventory but not alive_only."""
+        session_id = client.post("/api/session/open", json={"timeout_seconds": 30}).json()["session_id"]
+
+        close_response = client.post("/api/session/close", json={"session_id": session_id})
+        assert close_response.status_code == 200
+
+        alive_response = client.get("/api/sessions", params={"alive_only": True})
+        assert alive_response.status_code == 200
+        assert session_id not in {item["session_id"] for item in alive_response.json()["sessions"]}
+
+        all_response = client.get("/api/sessions")
+        assert all_response.status_code == 200
+        entry = next(item for item in all_response.json()["sessions"] if item["session_id"] == session_id)
+
+        assert entry["is_alive"] is False
+        assert entry["remaining_seconds"] == 0
+        assert entry["watch_count"] == 0
+
+
+class TestStreamingEndpoints:
+    """Tests for SSE streaming APIs."""
+
+    def test_operation_stream_emits_committed_event(self, client):
+        """Operation SSE should emit committed operations as events."""
+        session_id = client.post("/api/session/open", json={"timeout_seconds": 30}).json()["session_id"]
+        client.post("/api/node/create", json={
+            "path": "/stream-op",
+            "data": "payload",
+            "persistent": True,
+            "session_id": session_id,
+        })
+
+        with client.stream("GET", "/api/stream/operations", params={"path_prefix": "/stream-op", "snapshot_only": True}) as response:
+            assert response.status_code == 200
+            assert response.headers["content-type"].startswith("text/event-stream")
+            event_name, payload = _read_sse_event(response)
+
+        assert event_name == "operation"
+        assert payload["path"] == "/stream-op"
+        assert payload["operation_type"] == "CREATE"
+        assert payload["summary"].startswith("CREATE")
+
+    def test_session_stream_emits_inventory_snapshot(self, client):
+        """Session SSE should emit the current inventory snapshot immediately."""
+        session_id = client.post("/api/session/open", json={"timeout_seconds": 30}).json()["session_id"]
+
+        with client.stream("GET", "/api/stream/sessions", params={"alive_only": True, "snapshot_only": True}) as response:
+            assert response.status_code == 200
+            assert response.headers["content-type"].startswith("text/event-stream")
+            event_name, payload = _read_sse_event(response)
+
+        assert event_name == "sessions"
+        assert payload["count"] >= 1
+        assert session_id in {item["session_id"] for item in payload["sessions"]}
 
 
 class TestEphemeralNodeCleanup:

@@ -2,7 +2,7 @@
 
 A single-node coordination engine for hierarchical metadata, session-backed leases, one-shot watches, committed operation history, and crash recovery.
 
-`241 tests passing` | `Python + FastAPI + SQLite`
+`245 tests passing` | `Python + FastAPI + SQLite`
 
 ## What It Does
 
@@ -29,6 +29,8 @@ A single-node coordination engine for hierarchical metadata, session-backed leas
 - `POST /api/session/open`
 - `POST /api/session/heartbeat`
 - `POST /api/session/close`
+- `GET /api/sessions`
+- `GET /api/stream/sessions`
 
 ### Watches
 - `POST /api/watch/register`
@@ -44,6 +46,7 @@ A single-node coordination engine for hierarchical metadata, session-backed leas
 - `GET /api/operations`
 - `GET /api/operations/tail`
 - `GET /api/operations/{sequence_number}`
+- `GET /api/stream/operations`
 - `GET /api/recovery/last`
 
 ### Visualizer
@@ -51,7 +54,8 @@ A single-node coordination engine for hierarchical metadata, session-backed leas
 - Live node tree
 - Committed operations timeline
 - Startup recovery summary
-- Session cards for sessions opened from the visualizer
+- Live session inventory sourced from the backend
+- SSE-driven updates for sessions and operations
 
 ## Architecture
 
@@ -68,7 +72,7 @@ HTTP API
 
 The `Coordinator` is the serialization point. Writes are staged, persisted, then applied to in-memory state so persistence failure does not leak partial state into the live tree or session manager.
 
-`OperationLog` now represents committed history, not just provisional intent. The visualizer and history endpoints read from that committed stream. `RecoveryManager` replays WAL-backed operations on startup, expires old sessions, removes dead ephemerals, clears watches, restores committed history, and only truncates the WAL after successful recovery.
+`OperationLog` now represents committed history, not just provisional intent. The visualizer and history endpoints read from that committed stream, and the control plane now consumes SSE streams instead of polling every second. `RecoveryManager` replays WAL-backed operations on startup, expires old sessions, removes dead ephemerals, clears watches, restores committed history, and only truncates the WAL after successful recovery.
 
 Leases are implemented on top of ephemeral ownership. `lease_token` is derived from committed create order, so downstream consumers can use it as a fencing token.
 
@@ -82,6 +86,8 @@ Leases are implemented on top of ephemeral ownership. `lease_token` is derived f
 - Session expiry cleanup is rollback-safe.
 - `/api/operations` returns committed operations in sequence order.
 - `/api/operations/tail` blocks until a matching committed operation arrives or times out.
+- `/api/stream/operations` streams committed operations as SSE.
+- `/api/stream/sessions` streams live session inventory as SSE.
 - `/api/recovery/last` exposes the last startup recovery report for the current process.
 
 ## Setup
@@ -111,7 +117,7 @@ The API listens on the host and port defined in `config.py`.
 .venv\Scripts\python.exe -m pytest -q
 ```
 
-Latest verified local run: `241 passed in 209.50s`.
+Latest verified local run: `245 passed in 213.36s`.
 
 ## Demos
 
@@ -130,13 +136,12 @@ The `demos/` folder still covers the core scenarios:
 
 - Recovery coverage includes WAL-only replay cases for `SET`, recursive delete, and ephemeral create behavior.
 - Atomicity coverage includes metadata writes, session lifecycle failures, and rollback behavior.
-- API coverage includes CAS, lease behavior, watch filtering, operation timeline, and recovery report endpoints.
+- API coverage includes CAS, lease behavior, watch filtering, operation timeline, recovery reporting, session inventory, and SSE stream snapshots.
 - Integration coverage includes concurrent behavior and recovery scenarios.
 
 ## Honest Limits
 
 - This is still a single-node service.
-- The visualizer session panel is not a full cluster session inventory; it shows sessions opened from that page.
 - Lease TTL is still session timeout, not an independent per-lease TTL.
 - Fair queueing for competing lease waiters is not guaranteed.
 - Recovery is stronger than before, but it is still SQLite plus a custom WAL, not distributed consensus.
@@ -146,8 +151,8 @@ The `demos/` folder still covers the core scenarios:
 
 If we keep pushing this as a product, the next high-value steps are:
 
-1. Streaming operation and watch delivery over SSE or WebSocket.
-2. A real session inventory endpoint so the UI reflects all live sessions, not just browser-created ones.
+1. Session detail and ownership drill-down, not just top-level inventory.
+2. Streaming watch delivery over SSE or WebSocket.
 3. Richer lease inspection with holder history and contention visibility.
 4. More crash-injection tooling around persistence and recovery boundaries.
 5. More end-to-end examples that show why this is a coordination engine, not a generic key-value store.

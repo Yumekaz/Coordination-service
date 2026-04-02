@@ -52,6 +52,8 @@ class Coordinator:
         self._started = False
         self._start_time = datetime.now().timestamp()
         self._last_recovery_stats: Dict[str, Any] = {}
+        self._session_inventory_version = 0
+        self._session_inventory_condition = threading.Condition(self._lock)
         
         # Initialize components
         self._persistence = Persistence(db_path)
@@ -138,6 +140,7 @@ class Coordinator:
                 self._operation_log.discard_last_operation(operation.sequence_number)
                 raise
             self._operation_log.commit(operation)
+            self._mark_session_inventory_changed()
             
             logger.info(f"Session opened: {session.session_id}")
             
@@ -175,6 +178,7 @@ class Coordinator:
                 self._operation_log.discard_last_operation(operation.sequence_number)
                 raise
             self._operation_log.commit(operation)
+            self._mark_session_inventory_changed()
             
             return session
     
@@ -189,6 +193,36 @@ class Coordinator:
         """
         with self._lock:
             return self._session_manager.close_session(session_id)
+
+    def get_sessions(self, alive_only: bool = False) -> List[Dict[str, Any]]:
+        """Return session inventory data for the API and visualizer."""
+        with self._lock:
+            return self._build_session_views_locked(alive_only=alive_only)
+
+    def get_session_stream_snapshot(self, alive_only: bool = False) -> Tuple[int, List[Dict[str, Any]]]:
+        """Return the current session inventory version plus a snapshot."""
+        with self._lock:
+            return self._session_inventory_version, self._build_session_views_locked(alive_only=alive_only)
+
+    def wait_for_sessions(
+        self,
+        version: int,
+        timeout_seconds: float = 30.0,
+        alive_only: bool = False,
+    ) -> Tuple[int, List[Dict[str, Any]]]:
+        """Wait until the session inventory changes or the timeout elapses."""
+        if timeout_seconds < 0:
+            raise ValueError("timeout_seconds must be non-negative")
+
+        deadline = time.monotonic() + timeout_seconds
+        with self._session_inventory_condition:
+            while self._session_inventory_version <= version:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return version, []
+                self._session_inventory_condition.wait(timeout=remaining)
+
+            return self._session_inventory_version, self._build_session_views_locked(alive_only=alive_only)
     
     def _on_session_expired(self, session: Session) -> None:
         """
@@ -238,6 +272,7 @@ class Coordinator:
             if not deleted_paths:
                 session.ephemeral_nodes.clear()
                 session.ephemeral_nodes.update(persisted_session.ephemeral_nodes)
+            self._mark_session_inventory_changed()
             
             logger.info(f"Session cleanup complete: deleted {len(deleted_paths)} ephemeral nodes")
     
@@ -330,6 +365,7 @@ class Coordinator:
         committed_node = self._metadata_tree.commit_create(node)
         if node_type == NodeType.EPHEMERAL:
             self._session_manager.add_ephemeral_node(session_id, committed_node.path)
+            self._mark_session_inventory_changed()
         self._operation_log.commit(operation)
         
         # Trigger watches
@@ -359,6 +395,50 @@ class Coordinator:
     def _clone_session(self, session: Session) -> Session:
         """Create a detached copy of a session for staged persistence."""
         return Session.from_dict(session.to_dict())
+
+    def _mark_session_inventory_changed(self) -> None:
+        """Advance the session inventory version and wake stream listeners."""
+        with self._session_inventory_condition:
+            self._session_inventory_version += 1
+            self._session_inventory_condition.notify_all()
+
+    def _build_session_views_locked(self, alive_only: bool = False) -> List[Dict[str, Any]]:
+        """Build detached session inventory views while holding the coordinator lock."""
+        current_time = datetime.now().timestamp()
+        sessions = (
+            self._session_manager.get_alive_sessions()
+            if alive_only
+            else self._session_manager.get_all_sessions()
+        )
+
+        session_views: List[Dict[str, Any]] = []
+        for session in sessions:
+            expires_at = session.last_heartbeat + session.timeout_seconds
+            remaining_seconds = max(0.0, expires_at - current_time) if session.is_alive else 0.0
+            ephemeral_nodes = sorted(session.ephemeral_nodes)
+            watch_count = len(self._watch_manager.get_watches_for_session(session.session_id))
+
+            session_views.append({
+                "session_id": session.session_id,
+                "created_at": session.created_at,
+                "last_heartbeat": session.last_heartbeat,
+                "timeout_seconds": session.timeout_seconds,
+                "expires_at": expires_at,
+                "remaining_seconds": remaining_seconds,
+                "is_alive": session.is_alive,
+                "ephemeral_nodes": ephemeral_nodes,
+                "ephemeral_node_count": len(ephemeral_nodes),
+                "watch_count": watch_count,
+            })
+
+        session_views.sort(
+            key=lambda item: (
+                not item["is_alive"],
+                -item["last_heartbeat"],
+                item["session_id"],
+            )
+        )
+        return session_views
 
     def _build_session_updates_for_deleted_paths(
         self,
@@ -718,6 +798,8 @@ class Coordinator:
             for _, (live_session, snapshot) in session_updates.items():
                 live_session.ephemeral_nodes.clear()
                 live_session.ephemeral_nodes.update(snapshot.ephemeral_nodes)
+            if session_updates:
+                self._mark_session_inventory_changed()
             self._operation_log.commit(operation)
             
             # Trigger watches for each deleted node
@@ -877,6 +959,7 @@ class Coordinator:
                 session_id=session_id,
                 event_types=event_types,
             )
+            self._mark_session_inventory_changed()
             
             logger.info(f"Registered watch: {watch.watch_id} on {path}")
             
@@ -910,6 +993,7 @@ class Coordinator:
         with self._lock:
             result = self._watch_manager.unregister(watch_id)
             if result:
+                self._mark_session_inventory_changed()
                 logger.info(f"Unregistered watch: {watch_id}")
             return result
     

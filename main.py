@@ -10,13 +10,14 @@ FastAPI application exposing all coordination operations:
 All operations are serialized through the Coordinator for linearizability.
 """
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from typing import Any, Dict, List, Optional
 from contextlib import asynccontextmanager
+import asyncio
 import uvicorn
 import os
 import json
@@ -89,6 +90,25 @@ class HeartbeatRequest(BaseModel):
 
 
 class HeartbeatResponse(BaseModel):
+    status: str = "ok"
+
+
+class SessionSummaryResponse(BaseModel):
+    session_id: str
+    created_at: float
+    last_heartbeat: float
+    timeout_seconds: int
+    expires_at: float
+    remaining_seconds: float
+    is_alive: bool
+    ephemeral_nodes: List[str] = Field(default_factory=list)
+    ephemeral_node_count: int
+    watch_count: int
+
+
+class SessionsResponse(BaseModel):
+    sessions: List[SessionSummaryResponse]
+    count: int
     status: str = "ok"
 
 
@@ -257,6 +277,32 @@ def _serialize_operation(operation: Operation) -> OperationResponse:
     )
 
 
+def _model_dump(model: Any) -> Dict[str, Any]:
+    """Compat helper for Pydantic v1/v2 models."""
+    if hasattr(model, "model_dump"):
+        return model.model_dump()
+    return model.dict()
+
+
+def _sse_event(
+    data: Dict[str, Any],
+    event: str,
+    event_id: Optional[int] = None,
+    retry_ms: Optional[int] = None,
+) -> str:
+    """Serialize one Server-Sent Event payload."""
+    lines: List[str] = []
+    if retry_ms is not None:
+        lines.append(f"retry: {retry_ms}")
+    if event_id is not None:
+        lines.append(f"id: {event_id}")
+    lines.append(f"event: {event}")
+    payload = json.dumps(data)
+    for line in payload.splitlines() or [""]:
+        lines.append(f"data: {line}")
+    return "\n".join(lines) + "\n\n"
+
+
 # ========== Exception Handlers ==========
 
 @app.exception_handler(KeyError)
@@ -323,6 +369,18 @@ async def close_session(request: HeartbeatRequest) -> dict:
     if session is None:
         raise HTTPException(status_code=404, detail=f"Session not found: {request.session_id}")
     return {"status": "closed", "session_id": request.session_id}
+
+
+@app.get("/api/sessions", response_model=SessionsResponse)
+async def list_sessions(
+    alive_only: bool = Query(default=False, description="Only return alive sessions"),
+) -> SessionsResponse:
+    """List current session inventory for clients and the visualizer."""
+    sessions = coordinator.get_sessions(alive_only=alive_only)
+    return SessionsResponse(
+        sessions=[SessionSummaryResponse(**session) for session in sessions],
+        count=len(sessions),
+    )
 
 
 # ========== Metadata Endpoints ==========
@@ -577,6 +635,128 @@ async def get_operation(sequence_number: int) -> OperationResponse:
 async def last_recovery() -> dict:
     """Return the most recent startup recovery report."""
     return coordinator.get_last_recovery_stats()
+
+
+@app.get("/api/stream/operations")
+async def stream_operations(
+    request: Request,
+    since_sequence: int = Query(default=0, ge=0),
+    limit: int = Query(default=100, ge=1, le=1000),
+    operation_types: Optional[List[OperationType]] = Query(default=None),
+    path_prefix: Optional[str] = Query(default=None),
+    session_id: Optional[str] = Query(default=None),
+    snapshot_only: bool = Query(default=False),
+) -> StreamingResponse:
+    """Stream committed operations as Server-Sent Events."""
+    requested_types = set(operation_types) if operation_types else None
+    last_event_id = request.headers.get("last-event-id", "").strip()
+    current_since = since_sequence
+    if last_event_id.isdigit():
+        current_since = max(current_since, int(last_event_id))
+
+    async def event_stream():
+        nonlocal current_since
+        backlog = coordinator.get_operations(
+            since_sequence=current_since,
+            limit=limit,
+            operation_types=requested_types,
+            path_prefix=path_prefix,
+            session_id=session_id,
+        )
+        for operation in backlog:
+            payload = _model_dump(_serialize_operation(operation))
+            current_since = operation.sequence_number
+            yield _sse_event(payload, event="operation", event_id=operation.sequence_number, retry_ms=2000)
+
+        if snapshot_only:
+            return
+
+        while True:
+            if await request.is_disconnected():
+                break
+
+            operations = await asyncio.to_thread(
+                coordinator.wait_for_operations,
+                current_since,
+                15.0,
+                limit,
+                requested_types,
+                path_prefix,
+                session_id,
+            )
+            if not operations:
+                yield ": keep-alive\n\n"
+                continue
+
+            for operation in operations:
+                payload = _model_dump(_serialize_operation(operation))
+                current_since = operation.sequence_number
+                yield _sse_event(payload, event="operation", event_id=operation.sequence_number)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/api/stream/sessions")
+async def stream_sessions(
+    request: Request,
+    alive_only: bool = Query(default=True),
+    snapshot_only: bool = Query(default=False),
+) -> StreamingResponse:
+    """Stream session inventory snapshots as Server-Sent Events."""
+
+    async def event_stream():
+        current_version, sessions = coordinator.get_session_stream_snapshot(alive_only=alive_only)
+        payload = _model_dump(
+            SessionsResponse(
+                sessions=[SessionSummaryResponse(**session) for session in sessions],
+                count=len(sessions),
+            )
+        )
+        yield _sse_event(payload, event="sessions", event_id=current_version, retry_ms=2000)
+
+        if snapshot_only:
+            return
+
+        while True:
+            if await request.is_disconnected():
+                break
+
+            next_version, sessions = await asyncio.to_thread(
+                coordinator.wait_for_sessions,
+                current_version,
+                15.0,
+                alive_only,
+            )
+            if next_version == current_version:
+                yield ": keep-alive\n\n"
+                continue
+
+            current_version = next_version
+            payload = _model_dump(
+                SessionsResponse(
+                    sessions=[SessionSummaryResponse(**session) for session in sessions],
+                    count=len(sessions),
+                )
+            )
+            yield _sse_event(payload, event="sessions", event_id=current_version)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 # ========== Visualizer ==========
