@@ -49,7 +49,9 @@
             border-bottom: 1px solid var(--border);
             display: flex;
             justify-content: space-between;
-            align-items: center;
+            align-items: flex-start;
+            gap: 24px;
+            flex-wrap: wrap;
             background: var(--bg-secondary);
         }
         
@@ -57,12 +59,16 @@
             display: flex;
             align-items: center;
             gap: 16px;
+            flex: 1 1 420px;
+            min-width: 0;
+            flex-wrap: wrap;
         }
 
         .status-stack {
             display: flex;
             flex-direction: column;
             gap: 4px;
+            min-width: 0;
         }
         
         .logo {
@@ -155,6 +161,10 @@
         .header-right {
             display: flex;
             gap: 12px;
+            flex: 0 1 auto;
+            min-width: 0;
+            flex-wrap: wrap;
+            justify-content: flex-end;
         }
         
         .btn {
@@ -168,6 +178,7 @@
             border: 1px solid var(--border);
             background: var(--bg-tertiary);
             color: var(--text-primary);
+            white-space: nowrap;
         }
         
         .btn:hover {
@@ -203,11 +214,13 @@
         /* Main Layout */
         .main {
             display: grid;
-            grid-template-columns: minmax(320px, 1.15fr) minmax(320px, 1fr) minmax(320px, 0.95fr);
+            grid-template-columns: minmax(280px, 0.92fr) minmax(360px, 1.08fr) minmax(300px, 0.9fr);
             gap: 1px;
             background: var(--border);
             min-height: 0;
             overflow: hidden;
+            width: 100%;
+            max-width: 100vw;
         }
         
         .panel {
@@ -215,6 +228,7 @@
             display: flex;
             flex-direction: column;
             min-height: 0;
+            min-width: 0;
         }
         
         .panel-header {
@@ -223,6 +237,7 @@
             display: flex;
             justify-content: space-between;
             align-items: center;
+            gap: 12px;
             background: var(--bg-secondary);
         }
         
@@ -246,7 +261,9 @@
         .panel-content {
             flex: 1;
             overflow-y: auto;
+            overflow-x: hidden;
             padding: 16px 20px;
+            min-width: 0;
         }
         
         /* Node Tree */
@@ -263,6 +280,7 @@
             padding: 4px 8px;
             border-radius: 4px;
             transition: background 0.1s ease;
+            min-width: 0;
         }
 
         .tree-node.inspectable,
@@ -299,6 +317,7 @@
         
         .tree-path {
             color: var(--text-primary);
+            min-width: 0;
         }
         
         .tree-badge {
@@ -362,6 +381,7 @@
         
         .event-content {
             flex: 1;
+            min-width: 0;
         }
         
         .event-type {
@@ -380,12 +400,14 @@
             font-family: 'JetBrains Mono', monospace;
             font-size: 12px;
             color: var(--text-secondary);
+            word-break: break-word;
         }
 
         .event-meta {
             margin-top: 6px;
             font-size: 11px;
             color: var(--text-muted);
+            word-break: break-word;
         }
 
         .recovery-summary {
@@ -453,6 +475,7 @@
 
         .inspector-panel {
             border-left: 1px solid var(--border);
+            min-width: 0;
         }
 
         .inspector-kicker {
@@ -467,6 +490,8 @@
             font-size: 18px;
             font-weight: 600;
             margin-bottom: 6px;
+            line-height: 1.1;
+            word-break: break-word;
         }
 
         .inspector-subtitle {
@@ -483,6 +508,7 @@
             border-radius: 8px;
             border: 1px solid var(--border);
             background: var(--bg-secondary);
+            min-width: 0;
         }
 
         .inspector-section-title {
@@ -498,6 +524,7 @@
             display: grid;
             grid-template-columns: repeat(2, minmax(0, 1fr));
             gap: 10px 14px;
+            min-width: 0;
         }
 
         .inspector-stat-label {
@@ -513,12 +540,14 @@
             font-size: 12px;
             color: var(--text-primary);
             word-break: break-word;
+            overflow-wrap: anywhere;
         }
 
         .inspector-list {
             display: flex;
             flex-direction: column;
             gap: 8px;
+            min-width: 0;
         }
 
         .inspector-item {
@@ -577,7 +606,7 @@
 
         .inspector-button {
             appearance: none;
-            display: inline-flex;
+            display: flex;
             width: 100%;
             text-align: left;
             border: 1px solid var(--border);
@@ -588,6 +617,12 @@
             cursor: pointer;
             font-family: inherit;
             font-size: 12px;
+            line-height: 1.45;
+            white-space: normal;
+            word-break: break-word;
+            overflow-wrap: anywhere;
+            min-width: 0;
+            align-items: flex-start;
         }
 
         .inspector-button:hover {
@@ -601,6 +636,72 @@
             color: var(--text-secondary);
             white-space: pre-wrap;
             word-break: break-word;
+            overflow-wrap: anywhere;
+        }
+
+        .story-card {
+            padding: 14px;
+            border-radius: 10px;
+            border: 1px solid rgba(59, 130, 246, 0.25);
+            background:
+                linear-gradient(135deg, rgba(59, 130, 246, 0.12), rgba(59, 130, 246, 0.02)),
+                var(--bg-tertiary);
+            min-width: 0;
+        }
+
+        .story-card.timeout {
+            border-color: rgba(245, 158, 11, 0.35);
+            background:
+                linear-gradient(135deg, rgba(245, 158, 11, 0.12), rgba(245, 158, 11, 0.02)),
+                var(--bg-tertiary);
+        }
+
+        .story-card.delete {
+            border-color: rgba(239, 68, 68, 0.35);
+            background:
+                linear-gradient(135deg, rgba(239, 68, 68, 0.12), rgba(239, 68, 68, 0.02)),
+                var(--bg-tertiary);
+        }
+
+        .story-title {
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text-primary);
+            margin-bottom: 6px;
+        }
+
+        .story-copy {
+            font-size: 12px;
+            color: var(--text-secondary);
+            line-height: 1.6;
+            overflow-wrap: anywhere;
+        }
+
+        .story-copy strong {
+            color: var(--text-primary);
+        }
+
+        .story-steps {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            margin-top: 12px;
+        }
+
+        .story-step {
+            padding: 10px 12px;
+            border-radius: 8px;
+            border: 1px solid var(--border);
+            background: rgba(10, 10, 11, 0.45);
+            min-width: 0;
+        }
+
+        .story-step-meta {
+            font-size: 10px;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            margin-bottom: 4px;
         }
         
         /* Bottom Panel - Sessions */
@@ -832,6 +933,12 @@
             margin-top: 20px;
         }
         
+        @media (max-width: 1280px) {
+            .main {
+                grid-template-columns: minmax(240px, 0.84fr) minmax(320px, 1fr) minmax(280px, 0.9fr);
+            }
+        }
+
         /* Responsive */
         @media (max-width: 900px) {
             body {
@@ -925,7 +1032,7 @@
                     <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 12h6m-6 4h6M7 4h10a2 2 0 012 2v12a2 2 0 01-2 2H7a2 2 0 01-2-2V6a2 2 0 012-2z"/>
                     </svg>
-                    <span>Select a session card or lease path to inspect details.</span>
+                    <span>Select a session card or path to inspect details.</span>
                 </div>
             </div>
         </section>
@@ -1249,8 +1356,8 @@
                 const nodeType = node.info?.node_type || 'PERSISTENT';
                 const isEphemeral = nodeType === 'EPHEMERAL';
                 const version = node.info?.version || 0;
-                const inspectTarget = isInspectableLeasePath(node.path, nodeType)
-                    ? { kind: 'lease', key: node.path }
+                const inspectTarget = isInspectablePath(node.path)
+                    ? { kind: 'path', key: node.path }
                     : null;
                 const classes = ['tree-node'];
                 
@@ -1325,25 +1432,19 @@
             return selectedInspector.kind === kind && selectedInspector.key === key;
         }
 
-        function isInspectableLeasePath(path, nodeType = null) {
-            if (!path || path === '/') {
-                return false;
-            }
-            if (nodeType === 'EPHEMERAL') {
-                return true;
-            }
-            return path.includes('lease') || path.includes('lock') || path.includes('leader') || path.includes('election');
+        function isInspectablePath(path) {
+            return Boolean(path && path !== '/');
         }
 
         function getOperationInspectTarget(operation) {
             if (operation.session_id && operation.operation_type.startsWith('SESSION_')) {
                 return { kind: 'session', key: operation.session_id };
             }
-            if (isInspectableLeasePath(operation.path, operation.node_type)) {
-                return { kind: 'lease', key: operation.path };
+            if (isInspectablePath(operation.path)) {
+                return { kind: 'path', key: operation.path };
             }
-            if (operation.delete_paths && operation.delete_paths.length === 1 && isInspectableLeasePath(operation.delete_paths[0])) {
-                return { kind: 'lease', key: operation.delete_paths[0] };
+            if (operation.delete_paths && operation.delete_paths.length === 1 && isInspectablePath(operation.delete_paths[0])) {
+                return { kind: 'path', key: operation.delete_paths[0] };
             }
             return null;
         }
@@ -1365,8 +1466,8 @@
                 inspectSession(key);
                 return;
             }
-            if (kind === 'lease') {
-                inspectLeasePath(key);
+            if (kind === 'path') {
+                inspectPath(key);
             }
         }
 
@@ -1452,8 +1553,8 @@
                 pendingInspectorRefresh = null;
                 if (selectedInspector.kind === 'session') {
                     await inspectSession(selectedInspector.key, { silent: true });
-                } else if (selectedInspector.kind === 'lease') {
-                    await inspectLeasePath(selectedInspector.key, { silent: true });
+                } else if (selectedInspector.kind === 'path') {
+                    await inspectPath(selectedInspector.key, { silent: true });
                 }
             }, 140);
         }
@@ -1479,24 +1580,24 @@
             }
         }
 
-        async function inspectLeasePath(path, options = {}) {
+        async function inspectPath(path, options = {}) {
             const { silent = false } = options;
             if (!silent) {
-                setInspectorState({ kind: 'lease', key: path, data: null, loading: true, error: null });
+                setInspectorState({ kind: 'path', key: path, data: null, loading: true, error: null });
             } else {
-                selectedInspector.kind = 'lease';
+                selectedInspector.kind = 'path';
                 selectedInspector.key = path;
             }
 
             try {
-                const response = await fetch(`${API_BASE}/lease/detail?path=${encodeURIComponent(path)}`);
+                const response = await fetch(`${API_BASE}/path/detail?path=${encodeURIComponent(path)}&operation_limit=12&watch_limit=12`);
                 if (!response.ok) {
-                    throw new Error(`Lease detail unavailable (${response.status})`);
+                    throw new Error(`Path detail unavailable (${response.status})`);
                 }
                 const data = await response.json();
-                setInspectorState({ kind: 'lease', key: path, data, loading: false, error: null });
+                setInspectorState({ kind: 'path', key: path, data, loading: false, error: null });
             } catch (e) {
-                setInspectorState({ kind: 'lease', key: path, data: null, loading: false, error: e.message });
+                setInspectorState({ kind: 'path', key: path, data: null, loading: false, error: e.message });
             }
         }
 
@@ -1536,6 +1637,110 @@
             `;
         }
 
+        function formatCauseKind(causeKind) {
+            const labels = {
+                delete: 'Deleted directly',
+                owner_delete: 'Removed by the owning session',
+                session_closed_cleanup: 'Removed when the owning session closed',
+                session_timeout_cleanup: 'Removed when the owning session timed out'
+            };
+            return labels[causeKind] || String(causeKind || 'deleted').replace(/_/g, ' ');
+        }
+
+        function renderWatchFireItems(items) {
+            if (!items || items.length === 0) {
+                return '<div class="inspector-code">No fired watches captured for this path yet.</div>';
+            }
+
+            return `
+                <div class="inspector-list">
+                    ${items.map(record => `
+                        <div class="inspector-item">
+                            <div class="inspector-item-row">
+                                <div class="inspector-item-title">${escapeHtml(record.watch_path)}</div>
+                                <span class="inspector-chip">#${record.cause_sequence_number}.${record.ordinal}</span>
+                            </div>
+                            <div class="inspector-item-meta">${escapeHtml(formatDateTime(record.timestamp))} · ${escapeHtml(record.event_type)} · watched by ${escapeHtml(record.watch_session_id.slice(0, 8))}...</div>
+                            <div style="margin-top: 10px;">
+                                <button class="inspector-button" type="button" ${buildInspectAttributes({ kind: 'session', key: record.watch_session_id })}>
+                                    Open watcher session ${escapeHtml(record.watch_session_id.slice(0, 8))}...
+                                </button>
+                            </div>
+                        </div>
+                    `).join('')}
+                </div>
+            `;
+        }
+
+        function renderActiveWatchItems(items) {
+            if (!items || items.length === 0) {
+                return '<div class="inspector-code">No live watches on this path right now.</div>';
+            }
+
+            return `
+                <div class="inspector-list">
+                    ${items.map(watch => `
+                        <div class="inspector-item">
+                            <div class="inspector-item-row">
+                                <div class="inspector-item-title">${escapeHtml(watch.path)}</div>
+                                <span class="inspector-chip">${escapeHtml(watch.event_types.join(', '))}</span>
+                            </div>
+                            <div class="inspector-item-meta">${escapeHtml(formatDateTime(watch.created_at))} · watcher ${escapeHtml(watch.session_id.slice(0, 8))}...</div>
+                            <div style="margin-top: 10px;">
+                                <button class="inspector-button" type="button" ${buildInspectAttributes({ kind: 'session', key: watch.session_id })}>
+                                    Open watcher session ${escapeHtml(watch.session_id.slice(0, 8))}...
+                                </button>
+                            </div>
+                        </div>
+                    `).join('')}
+                </div>
+            `;
+        }
+
+        function renderDisappearanceStory(disappearance, firedWatches) {
+            if (!disappearance) {
+                return '';
+            }
+
+            const deleteOperation = disappearance.delete_operation;
+            const causeOperation = disappearance.cause_operation;
+            const causeLabel = formatCauseKind(disappearance.cause_kind);
+            const cardClass = disappearance.cause_kind === 'session_timeout_cleanup'
+                ? 'story-card timeout'
+                : disappearance.cause_kind === 'delete'
+                    ? 'story-card delete'
+                    : 'story-card';
+            const causeCopy = disappearance.reason
+                ? `${causeLabel}. Reason recorded as ${disappearance.reason}.`
+                : `${causeLabel}.`;
+
+            return `
+                <div class="${cardClass}">
+                    <div class="story-title">What happened</div>
+                    <div class="story-copy">
+                        <strong>${escapeHtml(causeCopy)}</strong>
+                        Delete operation <strong>#${deleteOperation.sequence_number}</strong> removed this path at
+                        <strong>${escapeHtml(formatDateTime(deleteOperation.timestamp))}</strong>.
+                        ${firedWatches.length ? `<strong>${firedWatches.length}</strong> watch${firedWatches.length === 1 ? '' : 'es'} fired in response.` : 'No watch firings were recorded for that delete.'}
+                    </div>
+                    <div class="story-steps">
+                        ${causeOperation ? `
+                            <div class="story-step">
+                                <div class="story-step-meta">Cause</div>
+                                <div class="inspector-item-title">${escapeHtml(causeOperation.summary)}</div>
+                                <div class="inspector-item-meta">${escapeHtml(formatDateTime(causeOperation.timestamp))}</div>
+                            </div>
+                        ` : ''}
+                        <div class="story-step">
+                            <div class="story-step-meta">Delete</div>
+                            <div class="inspector-item-title">${escapeHtml(deleteOperation.summary)}</div>
+                            <div class="inspector-item-meta">${escapeHtml(formatDateTime(deleteOperation.timestamp))}</div>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
         function renderSessionInspector(data) {
             return `
                 <div class="inspector-kicker">Session</div>
@@ -1561,7 +1766,7 @@
                     ${data.owned_nodes && data.owned_nodes.length ? `
                         <div class="inspector-list">
                             ${data.owned_nodes.map(node => `
-                                <button class="inspector-button" type="button" ${buildInspectAttributes({ kind: 'lease', key: node.path })}>
+                                <button class="inspector-button" type="button" ${buildInspectAttributes({ kind: 'path', key: node.path })}>
                                     ${escapeHtml(node.path)} · v${node.version}
                                 </button>
                             `).join('')}
@@ -1593,25 +1798,60 @@
             `;
         }
 
-        function renderLeaseInspector(data) {
+        function renderPathInspector(data) {
+            const node = data.current_node;
             const lease = data.current_lease;
             const holderSession = data.holder_session;
+            const ownerSession = data.owner_session;
+            const lastKnownNode = data.last_known_node;
+            const disappearance = data.disappearance;
+            const nodeSource = node || lastKnownNode;
+            const stateLabel = node
+                ? (lease ? 'live lease' : 'live node')
+                : (disappearance ? 'deleted' : 'historical');
+            const hasMetadata = Boolean(nodeSource?.metadata && Object.keys(nodeSource.metadata).length);
+
             return `
-                <div class="inspector-kicker">Lease Path</div>
+                <div class="inspector-kicker">Path Trace</div>
                 <div class="inspector-title">${escapeHtml(data.path)}</div>
-                <div class="inspector-subtitle">${lease ? 'Current or historical lease insight' : 'Historical lease insight only'}</div>
+                <div class="inspector-subtitle">${node ? 'Current state plus committed causality' : 'Deleted path with retained causality'}</div>
 
                 <div class="inspector-section">
-                    <div class="inspector-section-title">Current Holder</div>
-                    ${lease ? `
+                    <div class="inspector-section-title">${node ? 'Current State' : 'Last Known State'}</div>
+                    ${nodeSource ? `
+                        <div class="inspector-grid">
+                            ${renderInspectorStats({
+                                State: stateLabel,
+                                Type: nodeSource.node_type || 'n/a',
+                                Version: nodeSource.version,
+                                Session: nodeSource.session_id || 'n/a',
+                                Modified: formatDateTime(nodeSource.modified_at)
+                            })}
+                        </div>
+                        ${ownerSession ? `
+                            <div style="margin-top: 12px;">
+                                <button class="inspector-button" type="button" ${buildInspectAttributes({ kind: 'session', key: ownerSession.session_id })}>
+                                    Open owner session ${escapeHtml(ownerSession.session_id.slice(0, 8))}...
+                                </button>
+                            </div>
+                        ` : ''}
+                        <div class="inspector-code" style="margin-top: 10px;">${escapeHtml(nodeSource.data_preview || '')}</div>
+                        ${hasMetadata ? `
+                            <div class="inspector-code" style="margin-top: 10px;">${escapeHtml(formatMetadata(nodeSource.metadata))}</div>
+                        ` : ''}
+                    ` : '<div class="inspector-code">No current node state available.</div>'}
+                </div>
+
+                ${lease ? `
+                    <div class="inspector-section">
+                        <div class="inspector-section-title">Lease Holder</div>
                         <div class="inspector-grid">
                             ${renderInspectorStats({
                                 Holder: lease.holder,
-                                Session: lease.session_id || 'n/a',
                                 Token: lease.lease_token || 'n/a',
                                 Expires: lease.expires_at ? formatDateTime(lease.expires_at) : 'n/a',
-                                Version: lease.version,
-                                Modified: formatDateTime(lease.modified_at)
+                                Acquired: formatDateTime(lease.acquired_at),
+                                Waiters: data.waiter_count
                             })}
                         </div>
                         <div class="inspector-code" style="margin-top: 10px;">${escapeHtml(formatMetadata(lease.metadata))}</div>
@@ -1622,12 +1862,31 @@
                                 </button>
                             </div>
                         ` : ''}
-                    ` : '<div class="inspector-code">No active holder. This path currently exists only in history.</div>'}
-                </div>
+                    </div>
+                ` : ''}
+
+                ${disappearance ? `
+                    <div class="inspector-section">
+                        <div class="inspector-section-title">Disappearance Story</div>
+                        ${renderDisappearanceStory(disappearance, data.fired_watches || [])}
+                        ${disappearance.cause_session_id ? `
+                            <div style="margin-top: 12px;">
+                                <button class="inspector-button" type="button" ${buildInspectAttributes({ kind: 'session', key: disappearance.cause_session_id })}>
+                                    Open cause session ${escapeHtml(disappearance.cause_session_id.slice(0, 8))}...
+                                </button>
+                            </div>
+                        ` : ''}
+                    </div>
+                ` : ''}
 
                 <div class="inspector-section">
-                    <div class="inspector-section-title">Contention</div>
-                    ${data.waiter_count ? `
+                    <div class="inspector-section-title">${disappearance ? 'Watch Firings' : 'Live Watches'}</div>
+                    ${disappearance ? renderWatchFireItems(data.fired_watches) : renderActiveWatchItems(data.active_watches)}
+                </div>
+
+                ${data.waiter_count ? `
+                    <div class="inspector-section">
+                        <div class="inspector-section-title">Contention</div>
                         <div class="inspector-list">
                             ${data.waiters.map(waiter => `
                                 <button class="inspector-button" type="button" ${buildInspectAttributes({ kind: 'session', key: waiter })}>
@@ -1635,12 +1894,12 @@
                                 </button>
                             `).join('')}
                         </div>
-                    ` : '<div class="inspector-code">No current waiting sessions.</div>'}
-                </div>
+                    </div>
+                ` : ''}
 
-                <div class="inspector-section">
-                    <div class="inspector-section-title">Holder History</div>
-                    ${data.holder_history && data.holder_history.length ? `
+                ${data.holder_history && data.holder_history.length ? `
+                    <div class="inspector-section">
+                        <div class="inspector-section-title">Holder History</div>
                         <div class="inspector-list">
                             ${data.holder_history.map(entry => `
                                 <div class="inspector-item">
@@ -1652,11 +1911,11 @@
                                 </div>
                             `).join('')}
                         </div>
-                    ` : '<div class="inspector-code">No committed holder history yet.</div>'}
-                </div>
+                    </div>
+                ` : ''}
 
                 <div class="inspector-section">
-                    <div class="inspector-section-title">Recent Operations</div>
+                    <div class="inspector-section-title">Trace</div>
                     ${renderOperationItems(data.recent_operations)}
                 </div>
             `;
@@ -1673,7 +1932,7 @@
                         <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 12h6m-6 4h6M7 4h10a2 2 0 012 2v12a2 2 0 01-2 2H7a2 2 0 01-2-2V6a2 2 0 012-2z"/>
                         </svg>
-                        <span>Select a session card or lease path to inspect details.</span>
+                        <span>Select a session card or path to inspect details.</span>
                     </div>
                 `;
                 return;
@@ -1697,7 +1956,7 @@
                 return;
             }
 
-            container.innerHTML = renderLeaseInspector(selectedInspector.data);
+            container.innerHTML = renderPathInspector(selectedInspector.data);
         }
 
         function setStreamStatus(kind, connected) {

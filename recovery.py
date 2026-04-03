@@ -27,7 +27,7 @@ import os
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime
 
-from models import Node, Session, Operation, NodeType, EventType, OperationType
+from models import Node, Session, Operation, NodeType, EventType, OperationType, decode_delete_operation_payload
 from metadata_tree import MetadataTree
 from session_manager import SessionManager
 from watch_manager import WatchManager
@@ -297,14 +297,27 @@ class RecoveryManager:
         """Decode all paths affected by a delete operation."""
         if op.data:
             try:
-                payload = json.loads(op.data.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError) as e:
-                raise ValueError(f"Invalid delete payload for seq={op.sequence_number}") from e
+                payload = decode_delete_operation_payload(op.data)
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as e:
+                try:
+                    raw = op.data.decode("utf-8") if isinstance(op.data, (bytes, bytearray)) else str(op.data)
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, str):
+                        payload = decode_delete_operation_payload(parsed)
+                    elif isinstance(parsed, list):
+                        payload = {"paths": [str(path).strip() for path in parsed if str(path).strip()]}
+                    elif isinstance(parsed, dict):
+                        raw_paths = parsed.get("paths", parsed.get("delete_paths", []))
+                        if not isinstance(raw_paths, list):
+                            raise ValueError("Delete payload paths must be a list")
+                        payload = dict(parsed)
+                        payload["paths"] = [str(path).strip() for path in raw_paths if str(path).strip()]
+                    else:
+                        raise ValueError("Delete payload must decode to a list, object, or JSON string")
+                except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as fallback_error:
+                    raise ValueError(f"Invalid delete payload for seq={op.sequence_number}") from fallback_error
 
-            if not isinstance(payload, list):
-                raise ValueError(f"Delete payload must be a list for seq={op.sequence_number}")
-
-            paths = [str(path).strip() for path in payload if str(path).strip()]
+            paths = [str(path).strip() for path in payload.get("paths", []) if str(path).strip()]
             if paths:
                 return paths
 

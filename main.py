@@ -252,9 +252,21 @@ class OperationsResponse(BaseModel):
     status: str = "ok"
 
 
+class WatchFireResponse(BaseModel):
+    cause_sequence_number: int
+    ordinal: int
+    watch_id: str
+    watch_session_id: str
+    watch_path: str
+    observed_path: str
+    event_type: str
+    timestamp: float
+
+
 class SessionDetailResponse(SessionSummaryResponse):
     owned_nodes: List[OwnedNodeResponse] = Field(default_factory=list)
     watches: List[WatchSummaryResponse] = Field(default_factory=list)
+    recent_watch_fires: List[WatchFireResponse] = Field(default_factory=list)
     recent_operations: List[OperationResponse] = Field(default_factory=list)
 
 
@@ -276,22 +288,72 @@ class LeaseDetailResponse(BaseModel):
     recent_operations: List[OperationResponse] = Field(default_factory=list)
 
 
+class PathNodeResponse(BaseModel):
+    path: str
+    node_type: Optional[str] = None
+    version: int
+    session_id: Optional[str] = None
+    data_preview: str = ""
+    created_at: float
+    modified_at: float
+    holder: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    lease_token: Optional[int] = None
+
+
+class PathDisappearanceResponse(BaseModel):
+    state: str
+    cause_kind: str
+    reason: Optional[str] = None
+    cause_session_id: Optional[str] = None
+    delete_operation: OperationResponse
+    cause_operation: Optional[OperationResponse] = None
+
+
+class PathDetailResponse(BaseModel):
+    path: str
+    current_node: Optional[PathNodeResponse] = None
+    last_known_node: Optional[PathNodeResponse] = None
+    owner_session: Optional[SessionSummaryResponse] = None
+    current_lease: Optional[LeaseResponse] = None
+    holder_session: Optional[SessionSummaryResponse] = None
+    waiters: List[str] = Field(default_factory=list)
+    waiter_count: int
+    holder_history: List[LeaseHistoryEntryResponse] = Field(default_factory=list)
+    active_watches: List[WatchSummaryResponse] = Field(default_factory=list)
+    fired_watches: List[WatchFireResponse] = Field(default_factory=list)
+    disappearance: Optional[PathDisappearanceResponse] = None
+    recent_operations: List[OperationResponse] = Field(default_factory=list)
+
+
 class ErrorResponse(BaseModel):
     error: str
     detail: str
 
 
+def _decode_delete_paths_payload(operation: Operation) -> List[str]:
+    """Decode delete-path payloads from current or future shapes."""
+    if operation.operation_type != OperationType.DELETE or not operation.data:
+        return []
+
+    try:
+        decoded = json.loads(operation.data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return []
+
+    if isinstance(decoded, list):
+        return [str(path) for path in decoded]
+    if isinstance(decoded, dict):
+        paths = decoded.get("paths")
+        if isinstance(paths, list):
+            return [str(path) for path in paths]
+    return []
+
+
 def _serialize_operation(operation: Operation) -> OperationResponse:
     """Convert an internal operation into an API response model."""
     payload = operation.to_dict()
-    delete_paths: List[str] = []
-    if operation.operation_type == OperationType.DELETE and operation.data:
-        try:
-            decoded = json.loads(operation.data.decode("utf-8"))
-            if isinstance(decoded, list):
-                delete_paths = [str(path) for path in decoded]
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            delete_paths = []
+    delete_paths = _decode_delete_paths_payload(operation)
 
     data_preview = payload["data"]
     if len(data_preview) > 120:
@@ -437,7 +499,7 @@ async def session_detail(
         raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
 
     return SessionDetailResponse(
-        **{key: value for key, value in detail.items() if key not in {"owned_nodes", "watches", "recent_operations"}},
+        **{key: value for key, value in detail.items() if key not in {"owned_nodes", "watches", "recent_watch_fires", "recent_operations"}},
         owned_nodes=[OwnedNodeResponse(**node) for node in detail.get("owned_nodes", [])],
         watches=[
             WatchSummaryResponse(
@@ -450,6 +512,57 @@ async def session_detail(
             )
             for watch in detail["watches"]
         ],
+        recent_watch_fires=[WatchFireResponse(**record) for record in detail.get("recent_watch_fires", [])],
+        recent_operations=[_serialize_operation(operation) for operation in detail["recent_operations"]],
+    )
+
+
+@app.get("/api/path/detail", response_model=PathDetailResponse)
+async def path_detail(
+    path: str = Query(..., description="Exact node path"),
+    operation_limit: int = Query(default=20, ge=1, le=100),
+    watch_limit: int = Query(default=20, ge=1, le=100),
+) -> PathDetailResponse:
+    """Return a current or historical trace for an exact path."""
+    detail = coordinator.get_path_detail(
+        path=path,
+        operation_limit=operation_limit,
+        watch_limit=watch_limit,
+    )
+    if detail is None:
+        raise HTTPException(status_code=404, detail=f"Path not found in current state or history: {path}")
+
+    disappearance = detail.get("disappearance")
+    return PathDetailResponse(
+        path=detail["path"],
+        current_node=PathNodeResponse(**detail["current_node"]) if detail.get("current_node") else None,
+        last_known_node=PathNodeResponse(**detail["last_known_node"]) if detail.get("last_known_node") else None,
+        owner_session=SessionSummaryResponse(**detail["owner_session"]) if detail.get("owner_session") else None,
+        current_lease=LeaseResponse(**detail["current_lease"]) if detail.get("current_lease") else None,
+        holder_session=SessionSummaryResponse(**detail["holder_session"]) if detail.get("holder_session") else None,
+        waiters=detail.get("waiters", []),
+        waiter_count=detail.get("waiter_count", 0),
+        holder_history=[LeaseHistoryEntryResponse(**entry) for entry in detail.get("holder_history", [])],
+        active_watches=[
+            WatchSummaryResponse(
+                watch_id=watch["watch_id"],
+                path=watch["path"],
+                session_id=watch["session_id"],
+                event_types=[event_type.value if hasattr(event_type, "value") else str(event_type) for event_type in watch["event_types"]],
+                is_fired=watch["is_fired"],
+                created_at=watch["created_at"],
+            )
+            for watch in detail.get("active_watches", [])
+        ],
+        fired_watches=[WatchFireResponse(**record) for record in detail.get("fired_watches", [])],
+        disappearance=PathDisappearanceResponse(
+            state=disappearance["state"],
+            cause_kind=disappearance["cause_kind"],
+            reason=disappearance.get("reason"),
+            cause_session_id=disappearance.get("cause_session_id"),
+            delete_operation=_serialize_operation(disappearance["delete_operation"]),
+            cause_operation=_serialize_operation(disappearance["cause_operation"]) if disappearance.get("cause_operation") else None,
+        ) if disappearance else None,
         recent_operations=[_serialize_operation(operation) for operation in detail["recent_operations"]],
     )
 

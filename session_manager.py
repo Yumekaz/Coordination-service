@@ -46,7 +46,7 @@ class SessionManager:
         """Initialize the session manager."""
         self._lock = threading.RLock()
         self._sessions: Dict[str, Session] = {}
-        self._expiry_callbacks: List[Callable[[Session], None]] = []
+        self._expiry_callbacks: List[Callable[[Session, str], None]] = []
         
         # Background thread for timeout detection
         self._running = False
@@ -225,7 +225,7 @@ class SessionManager:
         # Notify expiry callbacks outside the lock
         for callback in self._expiry_callbacks:
             try:
-                callback(session)
+                callback(session, "timeout")
             except Exception as e:
                 with self._lock:
                     self._sessions[session_id] = snapshot
@@ -255,7 +255,7 @@ class SessionManager:
         # Notify expiry callbacks
         for callback in self._expiry_callbacks:
             try:
-                callback(session)
+                callback(session, "explicit")
             except Exception as e:
                 with self._lock:
                     self._sessions[session_id] = snapshot
@@ -296,7 +296,7 @@ class SessionManager:
                 return set()
             return set(self._sessions[session_id].ephemeral_nodes)
     
-    def add_expiry_callback(self, callback: Callable[[Session], None]) -> None:
+    def add_expiry_callback(self, callback: Callable[[Session, str], None]) -> None:
         """
         Add a callback to be notified when sessions expire.
         
@@ -305,7 +305,7 @@ class SessionManager:
         with self._lock:
             self._expiry_callbacks.append(callback)
     
-    def remove_expiry_callback(self, callback: Callable[[Session], None]) -> None:
+    def remove_expiry_callback(self, callback: Callable[[Session, str], None]) -> None:
         """Remove an expiry callback."""
         with self._lock:
             if callback in self._expiry_callbacks:

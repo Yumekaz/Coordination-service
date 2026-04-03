@@ -26,7 +26,7 @@ from typing import Dict, Generator, List, Optional, Tuple
 from datetime import datetime
 from contextlib import contextmanager
 
-from models import Node, Session, Operation, NodeType, OperationType
+from models import Node, Session, Operation, NodeType, OperationType, WatchFireRecord, EventType, encode_delete_operation_payload
 from logger import get_logger
 from config import DATABASE_PATH, WAL_MODE, FSYNC_ON_COMMIT
 
@@ -415,6 +415,23 @@ class Persistence:
                 CREATE INDEX IF NOT EXISTS idx_operations_timestamp 
                 ON operations(timestamp)
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS watch_fires (
+                    cause_sequence_number INTEGER NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    watch_id TEXT NOT NULL,
+                    watch_session_id TEXT NOT NULL,
+                    watch_path TEXT NOT NULL,
+                    observed_path TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    timestamp REAL NOT NULL,
+                    PRIMARY KEY (cause_sequence_number, ordinal)
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_watch_fires_observed_path
+                ON watch_fires(observed_path, cause_sequence_number DESC, ordinal ASC)
+            """)
             
             # Note: DDL statements are auto-committed in isolation_level=None mode
             logger.info("Database schema initialized")
@@ -574,24 +591,15 @@ class Persistence:
         self,
         session: Session,
         operation: Optional[Operation] = None,
+        extra_operations: Optional[List[Operation]] = None,
     ) -> None:
         """Atomically persist a session update and an optional operation log entry."""
         with self._lock:
             with self._transaction() as conn:
                 if operation is not None:
-                    conn.execute("""
-                        INSERT INTO operations
-                        (sequence_number, operation_type, path, data, session_id, timestamp, node_type)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        operation.sequence_number,
-                        operation.operation_type.value,
-                        operation.path,
-                        operation.data,
-                        operation.session_id,
-                        operation.timestamp,
-                        operation.node_type.value if operation.node_type else None,
-                    ))
+                    self._insert_operation(conn, operation)
+                for extra_operation in extra_operations or []:
+                    self._insert_operation(conn, extra_operation)
 
                 conn.execute("""
                     INSERT OR REPLACE INTO sessions
@@ -763,6 +771,49 @@ class Persistence:
             self._wal_writer.append(operation)
         except Exception as e:
             logger.error(f"Custom WAL append failed after commit for seq={operation.sequence_number}: {e}")
+
+    def _insert_operation(self, conn: sqlite3.Connection, operation: Operation) -> None:
+        """Insert one committed operation row."""
+        conn.execute("""
+            INSERT INTO operations
+            (sequence_number, operation_type, path, data, session_id, timestamp, node_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            operation.sequence_number,
+            operation.operation_type.value,
+            operation.path,
+            operation.data,
+            operation.session_id,
+            operation.timestamp,
+            operation.node_type.value if operation.node_type else None,
+        ))
+
+    def _insert_watch_fires(
+        self,
+        conn: sqlite3.Connection,
+        watch_fires: Optional[List[WatchFireRecord]],
+    ) -> None:
+        """Insert persisted watch-fire records for a committed operation."""
+        if not watch_fires:
+            return
+
+        conn.executemany("""
+            INSERT OR REPLACE INTO watch_fires
+            (cause_sequence_number, ordinal, watch_id, watch_session_id, watch_path, observed_path, event_type, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, [
+            (
+                record.cause_sequence_number,
+                record.ordinal,
+                record.watch_id,
+                record.watch_session_id,
+                record.watch_path,
+                record.observed_path,
+                record.event_type.value,
+                record.timestamp,
+            )
+            for record in watch_fires
+        ])
     
     # ========== Atomic Multi-Operation ==========
     
@@ -771,6 +822,7 @@ class Persistence:
         node: Node,
         operation: Operation,
         session: Optional[Session] = None,
+        watch_fires: Optional[List[WatchFireRecord]] = None,
     ) -> None:
         """
         Atomically create a node and log the operation.
@@ -780,20 +832,7 @@ class Persistence:
         """
         with self._lock:
             with self._transaction() as conn:
-                # Log operation to SQLite
-                conn.execute("""
-                    INSERT INTO operations
-                    (sequence_number, operation_type, path, data, session_id, timestamp, node_type)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    operation.sequence_number,
-                    operation.operation_type.value,
-                    operation.path,
-                    operation.data,
-                    operation.session_id,
-                    operation.timestamp,
-                    operation.node_type.value if operation.node_type else None,
-                ))
+                self._insert_operation(conn, operation)
                 
                 # Create node
                 conn.execute("""
@@ -824,6 +863,8 @@ class Persistence:
                         1 if session.is_alive else 0,
                         session.session_id,
                     ))
+
+                self._insert_watch_fires(conn, watch_fires)
                 
                 logger.debug(f"Atomic create: {node.path}")
 
@@ -833,24 +874,12 @@ class Persistence:
         self,
         node: Node,
         operation: Operation,
+        watch_fires: Optional[List[WatchFireRecord]] = None,
     ) -> None:
         """Atomically update a node and log the operation."""
         with self._lock:
             with self._transaction() as conn:
-                # Log operation to SQLite
-                conn.execute("""
-                    INSERT INTO operations
-                    (sequence_number, operation_type, path, data, session_id, timestamp, node_type)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    operation.sequence_number,
-                    operation.operation_type.value,
-                    operation.path,
-                    operation.data,
-                    operation.session_id,
-                    operation.timestamp,
-                    None,
-                ))
+                self._insert_operation(conn, operation)
                 
                 # Update node
                 conn.execute("""
@@ -862,6 +891,8 @@ class Persistence:
                     node.modified_at,
                     node.path,
                 ))
+
+                self._insert_watch_fires(conn, watch_fires)
                 
                 logger.debug(f"Atomic update: {node.path}")
 
@@ -872,26 +903,18 @@ class Persistence:
         paths: List[str],
         operation: Operation,
         sessions: Optional[List[Session]] = None,
+        watch_fires: Optional[List[WatchFireRecord]] = None,
+        extra_operations: Optional[List[Operation]] = None,
     ) -> None:
         """Atomically delete nodes and log the operation."""
         with self._lock:
-            operation.data = json.dumps(paths).encode()
+            if not operation.data:
+                operation.data = encode_delete_operation_payload(paths)
             
             with self._transaction() as conn:
-                # Log operation to SQLite
-                conn.execute("""
-                    INSERT INTO operations
-                    (sequence_number, operation_type, path, data, session_id, timestamp, node_type)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    operation.sequence_number,
-                    operation.operation_type.value,
-                    operation.path,
-                    operation.data,
-                    operation.session_id,
-                    operation.timestamp,
-                    None,
-                ))
+                for extra_operation in extra_operations or []:
+                    self._insert_operation(conn, extra_operation)
+                self._insert_operation(conn, operation)
                 
                 # Delete nodes
                 if paths:
@@ -915,6 +938,8 @@ class Persistence:
                         1 if session.is_alive else 0,
                         session.session_id,
                     ))
+
+                self._insert_watch_fires(conn, watch_fires)
                 
                 logger.debug(f"Atomic delete: {paths}")
 
@@ -929,6 +954,7 @@ class Persistence:
                 conn.execute("DELETE FROM nodes")
                 conn.execute("DELETE FROM sessions")
                 conn.execute("DELETE FROM operations")
+                conn.execute("DELETE FROM watch_fires")
             # Also truncate WAL file
             self._wal_writer.truncate()
             logger.info("Database cleared")
@@ -1019,6 +1045,78 @@ class Persistence:
                     node_type=NodeType(row[6]) if row[6] else None,
                 )
             return None
+
+    def load_watch_fires_for_path(
+        self,
+        path: str,
+        limit: int = 20,
+        cause_sequence_number: Optional[int] = None,
+    ) -> List[WatchFireRecord]:
+        """Load persisted watch-fire records for an observed path."""
+        with self._lock:
+            conn = self._get_connection()
+            query = """
+                SELECT cause_sequence_number, ordinal, watch_id, watch_session_id, watch_path, observed_path, event_type, timestamp
+                FROM watch_fires
+                WHERE observed_path = ?
+            """
+            params: List[object] = [path]
+            if cause_sequence_number is not None:
+                query += " AND cause_sequence_number = ?"
+                params.append(cause_sequence_number)
+            query += " ORDER BY cause_sequence_number DESC, ordinal ASC"
+            if limit > 0:
+                query += " LIMIT ?"
+                params.append(limit)
+
+            cursor = conn.execute(query, params)
+            return [
+                WatchFireRecord(
+                    cause_sequence_number=row["cause_sequence_number"],
+                    ordinal=row["ordinal"],
+                    watch_id=row["watch_id"],
+                    watch_session_id=row["watch_session_id"],
+                    watch_path=row["watch_path"],
+                    observed_path=row["observed_path"],
+                    event_type=EventType(row["event_type"]),
+                    timestamp=row["timestamp"],
+                )
+                for row in cursor
+            ]
+
+    def load_watch_fires_for_session(
+        self,
+        session_id: str,
+        limit: int = 20,
+    ) -> List[WatchFireRecord]:
+        """Load persisted watch-fire records for a watcher session."""
+        with self._lock:
+            conn = self._get_connection()
+            query = """
+                SELECT cause_sequence_number, ordinal, watch_id, watch_session_id, watch_path, observed_path, event_type, timestamp
+                FROM watch_fires
+                WHERE watch_session_id = ?
+                ORDER BY cause_sequence_number DESC, ordinal ASC
+            """
+            params: List[object] = [session_id]
+            if limit > 0:
+                query += " LIMIT ?"
+                params.append(limit)
+
+            cursor = conn.execute(query, params)
+            return [
+                WatchFireRecord(
+                    cause_sequence_number=row["cause_sequence_number"],
+                    ordinal=row["ordinal"],
+                    watch_id=row["watch_id"],
+                    watch_session_id=row["watch_session_id"],
+                    watch_path=row["watch_path"],
+                    observed_path=row["observed_path"],
+                    event_type=EventType(row["event_type"]),
+                    timestamp=row["timestamp"],
+                )
+                for row in cursor
+            ]
     
     def save_operation(self, operation: Operation) -> None:
         """

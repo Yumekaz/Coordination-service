@@ -190,8 +190,8 @@ class TestSessionExpiry:
         """Should call expiry callbacks."""
         callback_sessions = []
         
-        def on_expire(session):
-            callback_sessions.append(session)
+        def on_expire(session, reason):
+            callback_sessions.append((session, reason))
         
         session_manager.add_expiry_callback(on_expire)
         session = session_manager.open_session()
@@ -199,7 +199,8 @@ class TestSessionExpiry:
         session_manager.expire_session(session.session_id)
         
         assert len(callback_sessions) == 1
-        assert callback_sessions[0].session_id == session.session_id
+        assert callback_sessions[0][0].session_id == session.session_id
+        assert callback_sessions[0][1] == "timeout"
 
 
 class TestSessionConcurrent:

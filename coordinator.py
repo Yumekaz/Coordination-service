@@ -266,15 +266,158 @@ class Coordinator:
                 limit=operation_limit,
                 session_id=session_id,
             )
+            recent_watch_fires = [
+                record.to_dict()
+                for record in self._persistence.load_watch_fires_for_session(
+                    session_id,
+                    limit=operation_limit,
+                )
+            ]
 
             return {
                 **session_summary,
                 "owned_nodes": owned_nodes,
                 "watches": watches,
+                "recent_watch_fires": recent_watch_fires,
+                "recent_operations": recent_operations,
+            }
+
+    def get_path_detail(
+        self,
+        path: str,
+        operation_limit: int = 20,
+        watch_limit: int = 20,
+    ) -> Optional[Dict[str, Any]]:
+        """Return a current or historical drill-down for an exact path."""
+        normalized_path = self._normalize_path(path)
+        with self._lock:
+            node = self._metadata_tree.get(normalized_path)
+            history = self._reconstruct_path_history_locked(normalized_path)
+            recent_operations = self._get_operations_for_exact_path_locked(
+                normalized_path,
+                limit=operation_limit,
+            )
+            if node is None and not recent_operations:
+                return None
+
+            current_node = None
+            current_lease = None
+            holder_session = None
+            if node is not None:
+                current_node = self._build_path_node_view(
+                    path=node.path,
+                    data=node.data,
+                    version=node.version,
+                    node_type=node.node_type,
+                    session_id=node.session_id,
+                    created_at=node.created_at,
+                    modified_at=node.modified_at,
+                    lease_token=self._get_lease_token(node.path) if node.node_type == NodeType.EPHEMERAL else None,
+                )
+                if node.node_type == NodeType.EPHEMERAL:
+                    current_lease = self._lease_info_from_node(node)
+                    holder_session = self._lookup_session_view_locked(node.session_id)
+
+            last_known_node = None
+            if current_node is None and history["last_known_state"] is not None:
+                last_known_state = history["last_known_state"]
+                last_known_node = self._build_path_node_view(
+                    path=last_known_state["path"],
+                    data=last_known_state["data"],
+                    version=last_known_state["version"],
+                    node_type=last_known_state["node_type"],
+                    session_id=last_known_state["session_id"],
+                    created_at=last_known_state["created_at"],
+                    modified_at=last_known_state["modified_at"],
+                    lease_token=last_known_state["lease_token"],
+                )
+
+            owner_session_id = None
+            if current_node is not None:
+                owner_session_id = current_node.get("session_id")
+            elif last_known_node is not None:
+                owner_session_id = last_known_node.get("session_id")
+
+            owner_session = self._lookup_session_view_locked(owner_session_id)
+            active_watches = [
+                watch.to_dict()
+                for watch in self._get_relevant_watches_for_path_locked(normalized_path)
+                if not watch.is_fired
+            ]
+            waiters = sorted({
+                watch.session_id
+                for watch in self._watch_manager.get_watches_for_path(normalized_path)
+                if EventType.DELETE in watch.event_types and (current_lease is None or watch.session_id != current_lease["session_id"])
+            })
+
+            last_delete = history["last_delete"]
+            session_close_operation = self._find_session_close_operation_locked(
+                owner_session_id,
+                before_sequence=last_delete.sequence_number if last_delete else None,
+            )
+            close_reason = self._decode_session_close_reason(session_close_operation)
+            if session_close_operation is not None and all(
+                operation.sequence_number != session_close_operation.sequence_number
+                for operation in recent_operations
+            ):
+                recent_operations = sorted(
+                    [*recent_operations, session_close_operation],
+                    key=lambda operation: operation.sequence_number,
+                    reverse=True,
+                )[:operation_limit]
+
+            disappearance = None
+            fired_watches = []
+            if last_delete is not None:
+                fired_watches = [
+                    record.to_dict()
+                    for record in self._persistence.load_watch_fires_for_path(
+                        normalized_path,
+                        limit=watch_limit,
+                        cause_sequence_number=last_delete.sequence_number,
+                    )
+                ]
+
+                if close_reason == "explicit":
+                    cause_kind = "session_closed_cleanup"
+                elif close_reason == "timeout":
+                    cause_kind = "session_timeout_cleanup"
+                elif (
+                    owner_session_id
+                    and last_delete.session_id == owner_session_id
+                    and last_known_node is not None
+                    and last_known_node.get("node_type") == NodeType.EPHEMERAL.value
+                ):
+                    cause_kind = "owner_delete"
+                else:
+                    cause_kind = "delete"
+
+                disappearance = {
+                    "state": "deleted",
+                    "cause_kind": cause_kind,
+                    "reason": close_reason,
+                    "cause_session_id": session_close_operation.session_id if session_close_operation else last_delete.session_id,
+                    "delete_operation": last_delete,
+                    "cause_operation": session_close_operation,
+                }
+
+            return {
+                "path": normalized_path,
+                "current_node": current_node,
+                "last_known_node": last_known_node,
+                "owner_session": owner_session,
+                "current_lease": current_lease,
+                "holder_session": holder_session,
+                "waiters": waiters,
+                "waiter_count": len(waiters),
+                "holder_history": history["holder_history"],
+                "active_watches": active_watches,
+                "fired_watches": fired_watches,
+                "disappearance": disappearance,
                 "recent_operations": recent_operations,
             }
     
-    def _on_session_expired(self, session: Session) -> None:
+    def _on_session_expired(self, session: Session, reason: str = "timeout") -> None:
         """
         Handle session expiration.
         
@@ -287,35 +430,58 @@ class Coordinator:
             deleted_paths = self._metadata_tree.plan_delete_session_nodes(session.session_id)
             persisted_session = self._clone_session(session)
             persisted_session.ephemeral_nodes.difference_update(deleted_paths)
+            session_close_operation = self._operation_log.append(
+                operation_type=OperationType.SESSION_CLOSE,
+                session_id=session.session_id,
+                data=self._encode_session_close_payload(reason),
+            )
 
             if deleted_paths:
-                operation = self._operation_log.append(
+                delete_operation = self._operation_log.append(
                     operation_type=OperationType.DELETE,
                     path=",".join(deleted_paths),
                     session_id=session.session_id,
                 )
+                watch_fires = self._collect_watch_fire_records_locked(
+                    deleted_paths,
+                    event_type=EventType.DELETE,
+                    sequence_number=delete_operation.sequence_number,
+                    timestamp=delete_operation.timestamp,
+                )
                 try:
                     self._persistence.atomic_delete_node(
                         deleted_paths,
-                        operation,
+                        delete_operation,
                         sessions=[persisted_session],
+                        watch_fires=watch_fires,
+                        extra_operations=[session_close_operation],
                     )
                 except Exception:
-                    self._operation_log.discard_last_operation(operation.sequence_number)
+                    self._operation_log.discard_last_operation(delete_operation.sequence_number)
+                    self._operation_log.discard_last_operation(session_close_operation.sequence_number)
                     raise
 
                 self._metadata_tree.apply_delete_paths(deleted_paths)
                 session.ephemeral_nodes.clear()
-                self._operation_log.commit(operation)
+                self._operation_log.commit(session_close_operation)
+                self._operation_log.commit(delete_operation)
 
                 for path in deleted_paths:
                     self._watch_manager.trigger(
                         path=path,
                         event_type=EventType.DELETE,
-                        sequence_number=operation.sequence_number,
+                        sequence_number=delete_operation.sequence_number,
                     )
             else:
-                self._persistence.save_session(persisted_session)
+                try:
+                    self._persistence.atomic_save_session(
+                        persisted_session,
+                        operation=session_close_operation,
+                    )
+                except Exception:
+                    self._operation_log.discard_last_operation(session_close_operation.sequence_number)
+                    raise
+                self._operation_log.commit(session_close_operation)
 
             self._watch_manager.clear_session_watches(session.session_id)
 
@@ -405,9 +571,20 @@ class Coordinator:
             session_id=session_id,
             node_type=node_type,
         )
+        watch_fires = self._collect_watch_fire_records_locked(
+            [node.path],
+            event_type=EventType.CREATE,
+            sequence_number=operation.sequence_number,
+            timestamp=operation.timestamp,
+        )
         
         try:
-            self._persistence.atomic_create_node(node, operation, persisted_session)
+            self._persistence.atomic_create_node(
+                node,
+                operation,
+                persisted_session,
+                watch_fires=watch_fires,
+            )
         except Exception:
             self._operation_log.discard_last_operation(operation.sequence_number)
             raise
@@ -506,6 +683,57 @@ class Coordinator:
         if session_id is not None:
             operations = [operation for operation in operations if operation.session_id == session_id]
         return operations[:limit]
+
+    def _lookup_session_view_locked(self, session_id: Optional[str]) -> Optional[Dict[str, Any]]:
+        """Look up a detached session summary by ID."""
+        if not session_id:
+            return None
+
+        for item in self._build_session_views_locked(alive_only=False):
+            if item["session_id"] == session_id:
+                return item
+        return None
+
+    def _encode_session_close_payload(self, reason: str) -> bytes:
+        """Encode the durable breadcrumb for a session close/timeout."""
+        return json.dumps({"reason": reason}, sort_keys=True).encode("utf-8")
+
+    def _decode_session_close_reason(self, operation: Optional[Operation]) -> Optional[str]:
+        """Decode the close/timeout reason from a session-close operation."""
+        if operation is None or not operation.data:
+            return None
+
+        try:
+            payload = json.loads(operation.data.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+
+        if not isinstance(payload, dict):
+            return None
+        reason = payload.get("reason")
+        return str(reason) if reason else None
+
+    def _collect_watch_fire_records_locked(
+        self,
+        paths: List[str],
+        event_type: EventType,
+        sequence_number: int,
+        timestamp: float,
+    ) -> List[Any]:
+        """Plan persisted watch-fire records in the same order trigger() will use."""
+        planned_records = []
+        ordinal = 1
+        for observed_path in paths:
+            for record in self._watch_manager.plan_triggers(
+                observed_path,
+                event_type=event_type,
+                sequence_number=sequence_number,
+                timestamp=timestamp,
+            ):
+                record.ordinal = ordinal
+                planned_records.append(record)
+                ordinal += 1
+        return planned_records
 
     def _build_session_updates_for_deleted_paths(
         self,
@@ -610,29 +838,174 @@ class Coordinator:
                 return operation.sequence_number
         return None
 
+    def _decode_delete_paths(self, operation: Operation) -> List[str]:
+        """Decode all paths affected by a delete operation."""
+        if operation.operation_type != OperationType.DELETE:
+            return []
+        if not operation.data:
+            return [operation.path] if operation.path else []
+
+        try:
+            payload = json.loads(operation.data.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return [operation.path] if operation.path else []
+
+        if isinstance(payload, list):
+            return [str(path).strip() for path in payload if str(path).strip()]
+        if isinstance(payload, dict):
+            paths = payload.get("paths")
+            if isinstance(paths, list):
+                return [str(path).strip() for path in paths if str(path).strip()]
+
+        return [operation.path] if operation.path else []
+
     def _get_operations_for_exact_path_locked(
         self,
         path: str,
-        limit: int = 20,
+        limit: Optional[int] = 20,
     ) -> List[Operation]:
         """Return the most recent operations that touched an exact path."""
         matched: List[Operation] = []
         for operation in reversed(self._operation_log.get_all_operations()):
             include = operation.path == path
             if not include and operation.operation_type == OperationType.DELETE and operation.data:
-                try:
-                    deleted_paths = json.loads(operation.data.decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    deleted_paths = []
-                if isinstance(deleted_paths, list) and path in deleted_paths:
+                deleted_paths = self._decode_delete_paths(operation)
+                if path in deleted_paths:
                     include = True
 
             if include:
                 matched.append(operation)
-            if len(matched) >= limit:
+            if limit is not None and len(matched) >= limit:
                 break
 
         return matched
+
+    def _find_session_close_operation_locked(
+        self,
+        session_id: Optional[str],
+        before_sequence: Optional[int] = None,
+    ) -> Optional[Operation]:
+        """Find the latest committed session-close operation for a session."""
+        if not session_id:
+            return None
+
+        for operation in reversed(self._operation_log.get_all_operations()):
+            if operation.operation_type != OperationType.SESSION_CLOSE:
+                continue
+            if operation.session_id != session_id:
+                continue
+            if before_sequence is not None and operation.sequence_number > before_sequence:
+                continue
+            return operation
+        return None
+
+    def _get_relevant_watches_for_path_locked(self, path: str) -> List[Watch]:
+        """Return direct watches plus parent CHILDREN watches relevant to a path."""
+        relevant: List[Watch] = []
+        seen: Set[str] = set()
+
+        for watch in self._watch_manager.get_watches_for_path(path):
+            if watch.watch_id not in seen:
+                relevant.append(watch)
+                seen.add(watch.watch_id)
+
+        parent_path = self._normalize_path(path).rsplit("/", 1)[0] if path != "/" else ""
+        if not parent_path:
+            parent_path = "/"
+        if parent_path and parent_path != path:
+            for watch in self._watch_manager.get_watches_for_path(parent_path):
+                if EventType.CHILDREN not in watch.event_types:
+                    continue
+                if watch.watch_id in seen:
+                    continue
+                relevant.append(watch)
+                seen.add(watch.watch_id)
+
+        return relevant
+
+    def _build_path_node_view(
+        self,
+        *,
+        path: str,
+        data: bytes,
+        version: int,
+        node_type: Optional[NodeType],
+        session_id: Optional[str],
+        created_at: float,
+        modified_at: float,
+        lease_token: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Build a serializable current or historical view of a path."""
+        raw_data = data.decode("utf-8") if isinstance(data, bytes) else str(data)
+        preview = raw_data if len(raw_data) <= 120 else raw_data[:117] + "..."
+        holder = None
+        metadata: Dict[str, Any] = {}
+        if node_type == NodeType.EPHEMERAL:
+            holder, metadata = self._decode_lease_payload_data(data, session_id)
+
+        return {
+            "path": path,
+            "node_type": node_type.value if node_type else None,
+            "version": version,
+            "session_id": session_id,
+            "data_preview": preview,
+            "created_at": created_at,
+            "modified_at": modified_at,
+            "holder": holder,
+            "metadata": metadata,
+            "lease_token": lease_token,
+        }
+
+    def _reconstruct_path_history_locked(self, path: str) -> Dict[str, Any]:
+        """Reconstruct the latest lifecycle for a path from committed operations."""
+        chronological_ops = list(reversed(self._get_operations_for_exact_path_locked(path, limit=None)))
+        state: Optional[Dict[str, Any]] = None
+        last_known: Optional[Dict[str, Any]] = None
+        last_delete: Optional[Operation] = None
+        holder_history: List[Dict[str, Any]] = []
+
+        for operation in chronological_ops:
+            if operation.operation_type == OperationType.CREATE and operation.path == path:
+                state = {
+                    "path": path,
+                    "data": operation.data,
+                    "version": 1,
+                    "node_type": operation.node_type,
+                    "session_id": operation.session_id,
+                    "created_at": operation.timestamp,
+                    "modified_at": operation.timestamp,
+                    "lease_token": operation.sequence_number if operation.node_type == NodeType.EPHEMERAL else None,
+                }
+                if operation.node_type == NodeType.EPHEMERAL:
+                    holder, metadata = self._decode_lease_payload_data(operation.data, operation.session_id)
+                    holder_history.append({
+                        "sequence_number": operation.sequence_number,
+                        "timestamp": operation.timestamp,
+                        "session_id": operation.session_id,
+                        "holder": holder,
+                        "metadata": metadata,
+                    })
+                continue
+
+            if operation.operation_type == OperationType.SET and operation.path == path and state is not None:
+                state["data"] = operation.data
+                state["version"] += 1
+                state["modified_at"] = operation.timestamp
+                continue
+
+            if operation.operation_type == OperationType.DELETE and path in self._decode_delete_paths(operation):
+                if state is not None:
+                    last_known = dict(state)
+                last_delete = operation
+                state = None
+
+        return {
+            "current_state": state,
+            "last_known_state": last_known,
+            "last_delete": last_delete,
+            "holder_history": holder_history,
+            "chronological_operations": chronological_ops,
+        }
 
     def _lease_info_from_node(
         self,
@@ -890,9 +1263,19 @@ class Coordinator:
                 path=path,
                 data=data,
             )
+            watch_fires = self._collect_watch_fire_records_locked(
+                [path],
+                event_type=EventType.UPDATE,
+                sequence_number=operation.sequence_number,
+                timestamp=operation.timestamp,
+            )
             
             try:
-                self._persistence.atomic_update_node(node, operation)
+                self._persistence.atomic_update_node(
+                    node,
+                    operation,
+                    watch_fires=watch_fires,
+                )
             except Exception:
                 self._operation_log.discard_last_operation(operation.sequence_number)
                 raise
@@ -941,12 +1324,19 @@ class Coordinator:
                 path=path,
                 session_id=node.session_id,
             )
+            watch_fires = self._collect_watch_fire_records_locked(
+                deleted_paths,
+                event_type=EventType.DELETE,
+                sequence_number=operation.sequence_number,
+                timestamp=operation.timestamp,
+            )
             
             try:
                 self._persistence.atomic_delete_node(
                     deleted_paths,
                     operation,
                     sessions=[snapshot for _, snapshot in session_updates.values()],
+                    watch_fires=watch_fires,
                 )
             except Exception:
                 self._operation_log.discard_last_operation(operation.sequence_number)

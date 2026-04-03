@@ -769,6 +769,92 @@ class TestInspectorEndpoints:
         assert any(op["operation_type"] == "SESSION_OPEN" for op in data["recent_operations"])
         assert any(op["path"] == "/inspect-session" for op in data["recent_operations"])
 
+    def test_session_detail_includes_recent_watch_fires(self, client):
+        """Session detail should expose watch firings observed by that session."""
+        owner_session = client.post("/api/session/open", json={"timeout_seconds": 30}).json()["session_id"]
+        watcher_session = client.post("/api/session/open", json={"timeout_seconds": 30}).json()["session_id"]
+
+        client.post("/api/node/create", json={
+            "path": "/inspect-fired-watch",
+            "data": "v1",
+            "persistent": True,
+            "session_id": owner_session,
+        })
+        client.post("/api/watch/register", json={
+            "path": "/inspect-fired-watch",
+            "session_id": watcher_session,
+            "event_types": ["UPDATE"],
+        })
+        client.post("/api/node/set", json={
+            "path": "/inspect-fired-watch",
+            "data": "v2",
+        })
+
+        response = client.get("/api/session/detail", params={"session_id": watcher_session})
+        assert response.status_code == 200
+
+        data = response.json()
+        assert any(record["observed_path"] == "/inspect-fired-watch" for record in data["recent_watch_fires"])
+        assert any(record["watch_session_id"] == watcher_session for record in data["recent_watch_fires"])
+        assert any(record["event_type"] == "UPDATE" for record in data["recent_watch_fires"])
+
+    def test_path_detail_exposes_current_state_for_persistent_node(self, client):
+        """Path detail should describe current state for ordinary persistent nodes too."""
+        session_id = client.post("/api/session/open", json={"timeout_seconds": 30}).json()["session_id"]
+        client.post("/api/node/create", json={
+            "path": "/inspect-path",
+            "data": "payload",
+            "persistent": True,
+            "session_id": session_id,
+        })
+
+        response = client.get("/api/path/detail", params={"path": "/inspect-path"})
+        assert response.status_code == 200
+
+        data = response.json()
+        assert data["path"] == "/inspect-path"
+        assert data["current_node"]["path"] == "/inspect-path"
+        assert data["current_node"]["node_type"] == "PERSISTENT"
+        assert data["disappearance"] is None
+        assert any(op["path"] == "/inspect-path" for op in data["recent_operations"])
+
+    def test_path_detail_includes_disappearance_story_and_fired_watches(self, client):
+        """Deleted lease-like paths should keep the causal chain and triggered watches."""
+        owner_session = client.post("/api/session/open", json={"timeout_seconds": 30}).json()["session_id"]
+        watcher_session = client.post("/api/session/open", json={"timeout_seconds": 30}).json()["session_id"]
+
+        acquired = client.post("/api/lease/acquire", json={
+            "path": "/inspect-postmortem",
+            "session_id": owner_session,
+            "holder": "alpha",
+        })
+        assert acquired.status_code == 200
+
+        watch = client.post("/api/watch/register", json={
+            "path": "/inspect-postmortem",
+            "session_id": watcher_session,
+            "event_types": ["DELETE"],
+        })
+        assert watch.status_code == 200
+
+        released = client.post("/api/lease/release", json={
+            "path": "/inspect-postmortem",
+            "session_id": owner_session,
+        })
+        assert released.status_code == 200
+
+        response = client.get("/api/path/detail", params={"path": "/inspect-postmortem"})
+        assert response.status_code == 200
+
+        data = response.json()
+        assert data["current_node"] is None
+        assert data["last_known_node"]["path"] == "/inspect-postmortem"
+        assert data["disappearance"]["state"] == "deleted"
+        assert data["disappearance"]["cause_kind"] == "owner_delete"
+        assert data["disappearance"]["delete_operation"]["operation_type"] == "DELETE"
+        assert any(record["observed_path"] == "/inspect-postmortem" for record in data["fired_watches"])
+        assert any(record["watch_session_id"] == watcher_session for record in data["fired_watches"])
+
     def test_lease_detail_includes_waiters_and_history(self, client):
         """Lease detail should expose current holder, live waiters, and holder history."""
         holder_session = client.post("/api/session/open", json={"timeout_seconds": 30}).json()["session_id"]
@@ -845,6 +931,99 @@ class TestInspectorEndpoints:
         assert any(entry["holder"] == "historian" for entry in data["holder_history"])
         assert any(op["operation_type"] == "CREATE" for op in data["recent_operations"])
         assert any(op["operation_type"] == "DELETE" for op in data["recent_operations"])
+
+    def test_path_detail_shows_live_persistent_state(self, client):
+        """Path detail should inspect ordinary live nodes, not just leases."""
+        session_id = client.post("/api/session/open", json={"timeout_seconds": 30}).json()["session_id"]
+        parent = client.post("/api/node/create", json={
+            "path": "/inspect",
+            "data": "",
+            "persistent": True,
+            "session_id": session_id,
+        })
+        assert parent.status_code == 200
+        created = client.post("/api/node/create", json={
+            "path": "/inspect/live-node",
+            "data": "payload",
+            "persistent": True,
+            "session_id": session_id,
+        })
+        assert created.status_code == 200
+
+        watch = client.post("/api/watch/register", json={
+            "path": "/inspect/live-node",
+            "session_id": session_id,
+            "event_types": ["UPDATE"],
+        })
+        assert watch.status_code == 200
+
+        response = client.get("/api/path/detail", params={"path": "/inspect/live-node"})
+        assert response.status_code == 200
+
+        data = response.json()
+        assert data["path"] == "/inspect/live-node"
+        assert data["current_node"]["node_type"] == "PERSISTENT"
+        assert data["current_node"]["version"] == 1
+        assert data["disappearance"] is None
+        assert any(watch["path"] == "/inspect/live-node" for watch in data["active_watches"])
+        assert any(op["operation_type"] == "CREATE" for op in data["recent_operations"])
+
+    def test_path_detail_explains_session_cleanup_and_fired_watches(self, client):
+        """Path detail should explain cleanup cause and which watches fired."""
+        owner_session = client.post("/api/session/open", json={"timeout_seconds": 30}).json()["session_id"]
+        direct_watch_session = client.post("/api/session/open", json={"timeout_seconds": 30}).json()["session_id"]
+        parent_watch_session = client.post("/api/session/open", json={"timeout_seconds": 30}).json()["session_id"]
+
+        root = client.post("/api/node/create", json={
+            "path": "/trace",
+            "data": "",
+            "persistent": True,
+            "session_id": owner_session,
+        })
+        assert root.status_code == 200
+
+        acquired = client.post("/api/lease/acquire", json={
+            "path": "/trace/lease",
+            "session_id": owner_session,
+            "holder": "alpha",
+            "metadata": {"role": "leader"},
+        })
+        assert acquired.status_code == 200
+
+        direct_watch = client.post("/api/watch/register", json={
+            "path": "/trace/lease",
+            "session_id": direct_watch_session,
+            "event_types": ["DELETE"],
+        })
+        assert direct_watch.status_code == 200
+
+        parent_watch = client.post("/api/watch/register", json={
+            "path": "/trace",
+            "session_id": parent_watch_session,
+            "event_types": ["CHILDREN"],
+        })
+        assert parent_watch.status_code == 200
+
+        closed = client.post("/api/session/close", json={"session_id": owner_session})
+        assert closed.status_code == 200
+
+        response = client.get("/api/path/detail", params={"path": "/trace/lease"})
+        assert response.status_code == 200
+
+        data = response.json()
+        assert data["current_node"] is None
+        assert data["last_known_node"]["node_type"] == "EPHEMERAL"
+        assert data["last_known_node"]["holder"] == "alpha"
+        assert data["owner_session"]["session_id"] == owner_session
+        assert data["disappearance"]["cause_kind"] == "session_closed_cleanup"
+        assert data["disappearance"]["reason"] == "explicit"
+        assert data["disappearance"]["delete_operation"]["operation_type"] == "DELETE"
+        assert data["disappearance"]["cause_operation"]["operation_type"] == "SESSION_CLOSE"
+        assert data["disappearance"]["cause_session_id"] == owner_session
+        assert data["fired_watches"][0]["ordinal"] < data["fired_watches"][1]["ordinal"]
+        assert {entry["watch_session_id"] for entry in data["fired_watches"]} == {direct_watch_session, parent_watch_session}
+        assert {entry["event_type"] for entry in data["fired_watches"]} == {"DELETE", "CHILDREN"}
+        assert any(op["operation_type"] == "SESSION_CLOSE" for op in data["recent_operations"])
 
 
 class TestStreamingEndpoints:

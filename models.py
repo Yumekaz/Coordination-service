@@ -5,8 +5,9 @@ Defines Node, Session, Watch, Event, and Operation data structures.
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional, Set, Any
+from typing import Optional, Set, Any, Dict, List
 from datetime import datetime
+import json
 import uuid
 
 
@@ -32,6 +33,55 @@ class OperationType(Enum):
     SESSION_OPEN = "SESSION_OPEN"
     SESSION_CLOSE = "SESSION_CLOSE"
     SESSION_HEARTBEAT = "SESSION_HEARTBEAT"
+
+
+DELETE_CAUSE_DELETE = "delete"
+DELETE_CAUSE_LEASE_RELEASE = "lease_release"
+DELETE_CAUSE_SESSION_CLOSED = "session_closed"
+DELETE_CAUSE_SESSION_EXPIRED = "session_expired"
+
+
+def encode_delete_operation_payload(
+    paths: List[str],
+    cause: str = DELETE_CAUSE_DELETE,
+    **extra: Any,
+) -> bytes:
+    """Encode delete metadata while staying backward-compatible with older logs."""
+    payload: Dict[str, Any] = {
+        "paths": [str(path).strip() for path in paths if str(path).strip()],
+        "cause": cause or DELETE_CAUSE_DELETE,
+    }
+    for key, value in extra.items():
+        if value is not None:
+            payload[key] = value
+    return json.dumps(payload, sort_keys=True).encode("utf-8")
+
+
+def decode_delete_operation_payload(data: Any) -> Dict[str, Any]:
+    """Decode delete metadata from either the legacy list or the new dict shape."""
+    if not data:
+        return {"paths": [], "cause": DELETE_CAUSE_DELETE}
+
+    raw = data.decode("utf-8") if isinstance(data, (bytes, bytearray)) else str(data)
+    parsed = json.loads(raw)
+
+    if isinstance(parsed, list):
+        return {
+            "paths": [str(path).strip() for path in parsed if str(path).strip()],
+            "cause": DELETE_CAUSE_DELETE,
+        }
+
+    if not isinstance(parsed, dict):
+        raise ValueError("Delete payload must be a list or object")
+
+    raw_paths = parsed.get("paths", parsed.get("delete_paths", []))
+    if not isinstance(raw_paths, list):
+        raise ValueError("Delete payload paths must be a list")
+
+    payload = dict(parsed)
+    payload["paths"] = [str(path).strip() for path in raw_paths if str(path).strip()]
+    payload["cause"] = str(payload.get("cause") or DELETE_CAUSE_DELETE)
+    return payload
 
 
 @dataclass
@@ -224,6 +274,58 @@ class Event:
             "sequence": self.sequence_number,
             "timestamp": self.timestamp,
         }
+
+
+@dataclass
+class WatchFireRecord:
+    """A persisted record of a watch that fired for a committed operation."""
+    cause_sequence_number: int
+    ordinal: int
+    watch_id: str
+    watch_session_id: str
+    watch_path: str
+    observed_path: str
+    event_type: EventType
+    registered_event_types: List[EventType] = field(default_factory=list)
+    watch_created_at: float = field(default_factory=lambda: datetime.now().timestamp())
+    timestamp: float = field(default_factory=lambda: datetime.now().timestamp())
+    data_preview: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert the watch fire record to a dictionary."""
+        return {
+            "cause_sequence_number": self.cause_sequence_number,
+            "ordinal": self.ordinal,
+            "watch_id": self.watch_id,
+            "watch_session_id": self.watch_session_id,
+            "watch_path": self.watch_path,
+            "observed_path": self.observed_path,
+            "event_type": self.event_type.value,
+            "registered_event_types": [event_type.value for event_type in self.registered_event_types],
+            "watch_created_at": self.watch_created_at,
+            "timestamp": self.timestamp,
+            "data_preview": self.data_preview,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "WatchFireRecord":
+        """Create a watch fire record from a dictionary."""
+        return cls(
+            cause_sequence_number=int(data["cause_sequence_number"]),
+            ordinal=int(data["ordinal"]),
+            watch_id=str(data["watch_id"]),
+            watch_session_id=str(data["watch_session_id"]),
+            watch_path=str(data["watch_path"]),
+            observed_path=str(data["observed_path"]),
+            event_type=EventType(data["event_type"]),
+            registered_event_types=[
+                EventType(event_type)
+                for event_type in data.get("registered_event_types", [])
+            ],
+            watch_created_at=float(data.get("watch_created_at", datetime.now().timestamp())),
+            timestamp=float(data.get("timestamp", datetime.now().timestamp())),
+            data_preview=str(data.get("data_preview", "")),
+        )
 
 
 @dataclass

@@ -15,14 +15,14 @@ Invariants:
 """
 
 import threading
-import queue
+from collections import deque
 from typing import Dict, List, Optional, Set, Tuple
 from datetime import datetime
 import uuid
 
-from models import Watch, Event, EventType
+from models import Watch, Event, EventType, WatchFireRecord
 from logger import get_logger
-from config import MAX_WATCHES_PER_SESSION, WATCH_WAIT_TIMEOUT
+from config import MAX_WATCHES_PER_SESSION, WATCH_EVENT_HISTORY_LIMIT, WATCH_WAIT_TIMEOUT
 
 logger = get_logger("watch_manager")
 
@@ -59,6 +59,9 @@ class WatchManager:
         
         # Global sequence counter for event ordering
         self._sequence_counter = 0
+
+        # Bounded fired-watch history for inspector and postmortem views
+        self._event_history: deque[WatchFireRecord] = deque(maxlen=WATCH_EVENT_HISTORY_LIMIT)
         
         logger.info("WatchManager initialized")
     
@@ -191,34 +194,13 @@ class WatchManager:
             List of Events that were created
         """
         events = []
-        
+
         with self._lock:
-            # Get sequence number
-            if sequence_number is None:
-                self._sequence_counter += 1
-                sequence_number = self._sequence_counter
-            else:
-                # Update counter if external sequence is higher
-                if sequence_number > self._sequence_counter:
-                    self._sequence_counter = sequence_number
-            
-            # Find watches on this path
-            watches_to_fire = []
-            for watch in self._watches_by_path.get(path, []):
-                watches_to_fire.append((watch, event_type))
-            
-            # Also check parent path for CHILDREN events
-            if event_type in (EventType.CREATE, EventType.DELETE):
-                parent_path = self._get_parent_path(path)
-                if parent_path:
-                    parent_watches = self._watches_by_path.get(parent_path, [])
-                    for watch in parent_watches:
-                        if EventType.CHILDREN in watch.event_types:
-                            # Fire with CHILDREN event type, not the original
-                            watches_to_fire.append((watch, EventType.CHILDREN))
-            
+            sequence_number = self._prepare_sequence_number(sequence_number)
+            watches_to_fire = self._collect_matching_watches_locked(path, event_type)
+
             # Fire matching watches
-            for watch, fire_event_type in watches_to_fire:
+            for ordinal, (watch, fire_event_type) in enumerate(watches_to_fire, start=1):
                 if watch.should_fire(fire_event_type):
                     try:
                         # Mark as fired (exactly-once)
@@ -233,6 +215,19 @@ class WatchManager:
                             sequence_number=sequence_number,
                         )
                         events.append(event)
+                        self._event_history.append(WatchFireRecord(
+                            cause_sequence_number=sequence_number,
+                            ordinal=ordinal,
+                            watch_id=watch.watch_id,
+                            watch_session_id=watch.session_id,
+                            watch_path=watch.path,
+                            observed_path=path,
+                            event_type=fire_event_type,
+                            registered_event_types=sorted(watch.event_types, key=lambda item: item.value),
+                            watch_created_at=watch.created_at,
+                            timestamp=event.timestamp,
+                            data_preview=self._make_data_preview(data),
+                        ))
                         
                         # Store for retrieval
                         self._pending_events[watch.watch_id] = event
@@ -248,6 +243,77 @@ class WatchManager:
                         logger.error(f"Watch already fired (invariant violation): {watch.watch_id}")
         
         return events
+
+    def plan_triggers(
+        self,
+        path: str,
+        event_type: EventType,
+        sequence_number: int,
+        timestamp: Optional[float] = None,
+    ) -> List[WatchFireRecord]:
+        """Preview persisted watch-fire records for a committed operation."""
+        with self._lock:
+            planned_timestamp = timestamp if timestamp is not None else datetime.now().timestamp()
+            records: List[WatchFireRecord] = []
+            for ordinal, (watch, fire_event_type) in enumerate(
+                self._collect_matching_watches_locked(path, event_type),
+                start=1,
+            ):
+                if not watch.should_fire(fire_event_type):
+                    continue
+                records.append(WatchFireRecord(
+                    cause_sequence_number=sequence_number,
+                    ordinal=ordinal,
+                    watch_id=watch.watch_id,
+                    watch_session_id=watch.session_id,
+                    watch_path=watch.path,
+                    observed_path=path,
+                    event_type=fire_event_type,
+                    registered_event_types=sorted(watch.event_types, key=lambda item: item.value),
+                    watch_created_at=watch.created_at,
+                    timestamp=planned_timestamp,
+                ))
+            return records
+
+    def _make_data_preview(self, data: bytes) -> str:
+        """Build a short preview for fired-watch inspector output."""
+        if not data:
+            return ""
+        preview = data.decode("utf-8", errors="replace") if isinstance(data, (bytes, bytearray)) else str(data)
+        if len(preview) > 120:
+            return preview[:117] + "..."
+        return preview
+
+    def _prepare_sequence_number(self, sequence_number: Optional[int]) -> int:
+        """Advance or synchronize the internal event sequence counter."""
+        if sequence_number is None:
+            self._sequence_counter += 1
+            return self._sequence_counter
+
+        if sequence_number > self._sequence_counter:
+            self._sequence_counter = sequence_number
+        return sequence_number
+
+    def _collect_matching_watches_locked(
+        self,
+        path: str,
+        event_type: EventType,
+    ) -> List[Tuple[Watch, EventType]]:
+        """Collect direct and parent-child watches that match an event."""
+        watches_to_fire: List[Tuple[Watch, EventType]] = []
+
+        for watch in self._watches_by_path.get(path, []):
+            watches_to_fire.append((watch, event_type))
+
+        if event_type in (EventType.CREATE, EventType.DELETE):
+            parent_path = self._get_parent_path(path)
+            if parent_path:
+                parent_watches = self._watches_by_path.get(parent_path, [])
+                for watch in parent_watches:
+                    if EventType.CHILDREN in watch.event_types:
+                        watches_to_fire.append((watch, EventType.CHILDREN))
+
+        return watches_to_fire
     
     def _get_parent_path(self, path: str) -> str:
         """Get the parent path of a given path."""
@@ -355,6 +421,28 @@ class WatchManager:
         """Get the total number of watches."""
         with self._lock:
             return len(self._watches_by_id)
+
+    def get_recent_events_for_path(self, path: str, limit: int = 20) -> List[WatchFireRecord]:
+        """Return recent fired-watch records touching a path."""
+        if limit <= 0:
+            return []
+        with self._lock:
+            return [
+                record
+                for record in reversed(self._event_history)
+                if record.observed_path == path or record.watch_path == path
+            ][:limit]
+
+    def get_recent_events_for_session(self, session_id: str, limit: int = 20) -> List[WatchFireRecord]:
+        """Return recent fired-watch records observed by one watcher session."""
+        if limit <= 0:
+            return []
+        with self._lock:
+            return [
+                record
+                for record in reversed(self._event_history)
+                if record.watch_session_id == session_id
+            ][:limit]
     
     def clear(self) -> None:
         """Clear all watches (used for testing and recovery)."""
@@ -364,6 +452,7 @@ class WatchManager:
             self._watches_by_session.clear()
             self._pending_events.clear()
             self._wait_conditions.clear()
+            self._event_history.clear()
             logger.info("WatchManager cleared")
     
     def restore_sequence(self, sequence_number: int) -> None:
