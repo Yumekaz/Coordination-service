@@ -1025,6 +1025,215 @@ class TestInspectorEndpoints:
         assert {entry["event_type"] for entry in data["fired_watches"]} == {"DELETE", "CHILDREN"}
         assert any(op["operation_type"] == "SESSION_CLOSE" for op in data["recent_operations"])
 
+    def test_operation_detail_alias_exposes_session_cleanup_blast_radius(self, client):
+        """The visualizer alias should expose a full cleanup incident for session close."""
+        owner_session = client.post("/api/session/open", json={"timeout_seconds": 30}).json()["session_id"]
+        direct_watch_session = client.post("/api/session/open", json={"timeout_seconds": 30}).json()["session_id"]
+        parent_watch_session = client.post("/api/session/open", json={"timeout_seconds": 30}).json()["session_id"]
+
+        client.post("/api/node/create", json={
+            "path": "/incident",
+            "data": "",
+            "persistent": True,
+            "session_id": owner_session,
+        })
+        client.post("/api/lease/acquire", json={
+            "path": "/incident/lease",
+            "session_id": owner_session,
+            "holder": "alpha",
+            "metadata": {"role": "leader"},
+        })
+        client.post("/api/watch/register", json={
+            "path": "/incident/lease",
+            "session_id": direct_watch_session,
+            "event_types": ["DELETE"],
+        })
+        client.post("/api/watch/register", json={
+            "path": "/incident",
+            "session_id": parent_watch_session,
+            "event_types": ["CHILDREN"],
+        })
+
+        closed = client.post("/api/session/close", json={"session_id": owner_session})
+        assert closed.status_code == 200
+
+        operations = client.get("/api/operations", params={"since_sequence": 0, "limit": 50}).json()["operations"]
+        session_close = next(
+            op for op in operations
+            if op["operation_type"] == "SESSION_CLOSE" and op["session_id"] == owner_session
+        )
+
+        response = client.get("/api/operation/detail", params={"sequence_number": session_close["sequence_number"]})
+        assert response.status_code == 200
+
+        data = response.json()
+        assert data["sequence_number"] == session_close["sequence_number"]
+        assert data["source_session"]["session_id"] == owner_session
+        assert data["affected_path_count"] == 1
+        assert data["primary_path"] == "/incident/lease"
+        assert data["blast_radius"]["watches_fired"] == 2
+        assert data["related_operations"][0]["operation_type"] == "DELETE"
+        assert [op["operation_type"] for op in data["causal_chain"]] == ["SESSION_CLOSE", "DELETE"]
+        assert data["affected_paths"][0]["path"] == "/incident/lease"
+        assert data["affected_paths"][0]["change_kind"] == "deleted"
+        assert data["affected_paths"][0]["before"]["node_type"] == "EPHEMERAL"
+        assert data["affected_paths"][0]["after"] is None
+        assert set(record["event_type"] for record in data["watch_fires"]) == {"DELETE", "CHILDREN"}
+        assert any("reason" in note.lower() for note in data["notes"])
+
+    def test_operation_incident_for_update_includes_before_and_after_snapshots(self, client):
+        """Operation incident reports should show a real before/after delta for a write."""
+        session_id = client.post("/api/session/open", json={"timeout_seconds": 30}).json()["session_id"]
+        client.post("/api/node/create", json={
+            "path": "/op-set",
+            "data": "v1",
+            "persistent": True,
+            "session_id": session_id,
+        })
+        updated = client.post("/api/node/set", json={
+            "path": "/op-set",
+            "data": "v2",
+        })
+        assert updated.status_code == 200
+
+        operations = client.get("/api/operations", params={"since_sequence": 0, "limit": 20}).json()["operations"]
+        set_operation = next(
+            op for op in operations
+            if op["operation_type"] == "SET" and op["path"] == "/op-set"
+        )
+
+        response = client.get(f"/api/operations/{set_operation['sequence_number']}/incident")
+        assert response.status_code == 200
+
+        data = response.json()
+        assert data["incident_kind"] == "mutation"
+        assert data["primary_path"] == "/op-set"
+        assert data["affected_path_count"] == 1
+        assert data["affected_paths"][0]["path"] == "/op-set"
+        assert data["affected_paths"][0]["version_before"] == 1
+        assert data["affected_paths"][0]["version_after"] == 2
+        assert data["affected_paths"][0]["before"]["data_preview"] == "v1"
+        assert data["affected_paths"][0]["after"]["data_preview"] == "v2"
+        assert data["blast_radius"]["affected_paths"] == 1
+        assert data["watch_fires"] == []
+
+    def test_operation_incident_reports_recursive_delete_blast_radius(self, client):
+        """Operation incident detail should summarize recursive delete impact across paths and watches."""
+        owner_session = client.post("/api/session/open", json={"timeout_seconds": 30}).json()["session_id"]
+        direct_watch_session = client.post("/api/session/open", json={"timeout_seconds": 30}).json()["session_id"]
+        parent_watch_session = client.post("/api/session/open", json={"timeout_seconds": 30}).json()["session_id"]
+
+        client.post("/api/node/create", json={
+            "path": "/incident",
+            "data": "",
+            "persistent": True,
+            "session_id": owner_session,
+        })
+        client.post("/api/node/create", json={
+            "path": "/incident/a",
+            "data": "one",
+            "persistent": True,
+            "session_id": owner_session,
+        })
+        client.post("/api/node/create", json={
+            "path": "/incident/b",
+            "data": "two",
+            "persistent": True,
+            "session_id": owner_session,
+        })
+
+        client.post("/api/watch/register", json={
+            "path": "/incident/b",
+            "session_id": direct_watch_session,
+            "event_types": ["DELETE"],
+        })
+        client.post("/api/watch/register", json={
+            "path": "/incident",
+            "session_id": parent_watch_session,
+            "event_types": ["CHILDREN"],
+        })
+
+        deleted = client.delete("/api/node/delete", params={"path": "/incident"})
+        assert deleted.status_code == 200
+        assert set(deleted.json()["deleted_paths"]) == {"/incident", "/incident/a", "/incident/b"}
+
+        operations = client.get("/api/operations", params={"path_prefix": "/incident", "limit": 20})
+        assert operations.status_code == 200
+        delete_operation = next(
+            op for op in reversed(operations.json()["operations"])
+            if op["operation_type"] == "DELETE" and op["path"] == "/incident"
+        )
+
+        response = client.get(f"/api/operations/{delete_operation['sequence_number']}/incident")
+        assert response.status_code == 200
+
+        data = response.json()
+        assert data["incident_kind"] == "recursive_delete"
+        assert data["operation"]["operation_type"] == "DELETE"
+        assert data["blast_radius"]["affected_paths"] == 3
+        assert data["affected_path_count"] == 3
+        assert {item["path"] for item in data["affected_paths"]} == {"/incident", "/incident/a", "/incident/b"}
+        assert {item["watch_session_id"] for item in data["watch_firings"]} == {direct_watch_session, parent_watch_session}
+        assert any(session["session_id"] == owner_session and "actor" in session["roles"] for session in data["impacted_sessions"])
+        assert data["causal_chain"][0]["sequence_number"] == delete_operation["sequence_number"]
+
+    def test_operation_incident_reports_session_cleanup_cascade(self, client):
+        """Session-close incidents should expose the cleanup delete and impacted watchers."""
+        owner_session = client.post("/api/session/open", json={"timeout_seconds": 30}).json()["session_id"]
+        direct_watch_session = client.post("/api/session/open", json={"timeout_seconds": 30}).json()["session_id"]
+        parent_watch_session = client.post("/api/session/open", json={"timeout_seconds": 30}).json()["session_id"]
+
+        root = client.post("/api/node/create", json={
+            "path": "/incident-trace",
+            "data": "",
+            "persistent": True,
+            "session_id": owner_session,
+        })
+        assert root.status_code == 200
+
+        lease = client.post("/api/lease/acquire", json={
+            "path": "/incident-trace/lease",
+            "session_id": owner_session,
+            "holder": "alpha",
+        })
+        assert lease.status_code == 200
+
+        client.post("/api/watch/register", json={
+            "path": "/incident-trace/lease",
+            "session_id": direct_watch_session,
+            "event_types": ["DELETE"],
+        })
+        client.post("/api/watch/register", json={
+            "path": "/incident-trace",
+            "session_id": parent_watch_session,
+            "event_types": ["CHILDREN"],
+        })
+
+        closed = client.post("/api/session/close", json={"session_id": owner_session})
+        assert closed.status_code == 200
+
+        operations = client.get("/api/operations", params={"session_id": owner_session, "limit": 20})
+        assert operations.status_code == 200
+        session_close = next(
+            op for op in operations.json()["operations"]
+            if op["operation_type"] == "SESSION_CLOSE"
+        )
+
+        response = client.get("/api/operation/detail", params={"sequence_number": session_close["sequence_number"]})
+        assert response.status_code == 200
+
+        data = response.json()
+        assert data["incident_kind"] == "session_cleanup"
+        assert data["operation"]["operation_type"] == "SESSION_CLOSE"
+        assert data["source_session"]["session_id"] == owner_session
+        assert data["blast_radius"]["affected_paths"] == 1
+        assert len(data["related_operations"]) == 1
+        assert data["related_operations"][0]["operation_type"] == "DELETE"
+        assert any(item["path"] == "/incident-trace/lease" for item in data["affected_paths"])
+        assert {item["watch_session_id"] for item in data["watch_firings"]} == {direct_watch_session, parent_watch_session}
+        assert any(session["session_id"] == owner_session and "actor" in session["roles"] for session in data["impacted_sessions"])
+        assert [op["operation_type"] for op in data["causal_chain"]] == ["SESSION_CLOSE", "DELETE"]
+
 
 class TestStreamingEndpoints:
     """Tests for SSE streaming APIs."""

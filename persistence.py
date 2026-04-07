@@ -1117,6 +1117,40 @@ class Persistence:
                 )
                 for row in cursor
             ]
+
+    def load_watch_fires_for_operation(
+        self,
+        cause_sequence_number: int,
+        limit: int = 50,
+    ) -> List[WatchFireRecord]:
+        """Load persisted watch-fire records caused by one committed operation."""
+        with self._lock:
+            conn = self._get_connection()
+            query = """
+                SELECT cause_sequence_number, ordinal, watch_id, watch_session_id, watch_path, observed_path, event_type, timestamp
+                FROM watch_fires
+                WHERE cause_sequence_number = ?
+                ORDER BY ordinal ASC
+            """
+            params: List[object] = [cause_sequence_number]
+            if limit > 0:
+                query += " LIMIT ?"
+                params.append(limit)
+
+            cursor = conn.execute(query, params)
+            return [
+                WatchFireRecord(
+                    cause_sequence_number=row["cause_sequence_number"],
+                    ordinal=row["ordinal"],
+                    watch_id=row["watch_id"],
+                    watch_session_id=row["watch_session_id"],
+                    watch_path=row["watch_path"],
+                    observed_path=row["observed_path"],
+                    event_type=EventType(row["event_type"]),
+                    timestamp=row["timestamp"],
+                )
+                for row in cursor
+            ]
     
     def save_operation(self, operation: Operation) -> None:
         """

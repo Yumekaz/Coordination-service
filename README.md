@@ -2,7 +2,7 @@
 
 A single-node coordination engine for hierarchical metadata, session-backed leases, one-shot watches, committed operation history, and crash recovery.
 
-`245 tests passing` | `Python + FastAPI + SQLite`
+`257 tests passing` | `Python + FastAPI + SQLite`
 
 ## What It Does
 
@@ -12,6 +12,7 @@ A single-node coordination engine for hierarchical metadata, session-backed leas
 - Exclusive leases with monotonic fencing tokens
 - One-shot watches with `event_types` filtering
 - Committed operation timeline with per-operation lookup
+- Operation-centric incident reports with blast radius and causality
 - Startup recovery report plus WAL-backed replay
 - Rollback-safe metadata and session persistence paths
 
@@ -46,6 +47,8 @@ A single-node coordination engine for hierarchical metadata, session-backed leas
 - `GET /api/operations`
 - `GET /api/operations/tail`
 - `GET /api/operations/{sequence_number}`
+- `GET /api/operations/{sequence_number}/incident`
+- `GET /api/operation/detail`
 - `GET /api/stream/operations`
 - `GET /api/recovery/last`
 
@@ -53,6 +56,7 @@ A single-node coordination engine for hierarchical metadata, session-backed leas
 - `GET /`
 - Live node tree
 - Committed operations timeline
+- Operation incident inspector with causal chain, blast radius, and affected paths
 - Startup recovery summary
 - Live session inventory sourced from the backend
 - SSE-driven updates for sessions and operations
@@ -88,6 +92,7 @@ Leases are implemented on top of ephemeral ownership. `lease_token` is derived f
 - `/api/operations/tail` blocks until a matching committed operation arrives or times out.
 - `/api/stream/operations` streams committed operations as SSE.
 - `/api/stream/sessions` streams live session inventory as SSE.
+- Timeline events can be inspected as first-class incidents with affected-path summaries, watch firings, and cleanup cascades.
 - `/api/recovery/last` exposes the last startup recovery report for the current process.
 
 ## Setup
@@ -117,7 +122,7 @@ The API listens on the host and port defined in `config.py`.
 .venv\Scripts\python.exe -m pytest -q
 ```
 
-Latest verified local run: `245 passed in 213.36s`.
+Latest verified local run: `257 passed in 225.23s`.
 
 ## Demos
 
@@ -136,7 +141,7 @@ The `demos/` folder still covers the core scenarios:
 
 - Recovery coverage includes WAL-only replay cases for `SET`, recursive delete, and ephemeral create behavior.
 - Atomicity coverage includes metadata writes, session lifecycle failures, and rollback behavior.
-- API coverage includes CAS, lease behavior, watch filtering, operation timeline, recovery reporting, session inventory, and SSE stream snapshots.
+- API coverage includes CAS, lease behavior, watch filtering, operation timeline, incident reporting, recovery reporting, session inventory, and SSE stream snapshots.
 - Integration coverage includes concurrent behavior and recovery scenarios.
 
 ## Honest Limits
@@ -151,11 +156,11 @@ The `demos/` folder still covers the core scenarios:
 
 If we keep pushing this as a product, the next high-value steps are:
 
-1. Session detail and ownership drill-down, not just top-level inventory.
-2. Streaming watch delivery over SSE or WebSocket.
-3. Richer lease inspection with holder history and contention visibility.
-4. More crash-injection tooling around persistence and recovery boundaries.
-5. More end-to-end examples that show why this is a coordination engine, not a generic key-value store.
+1. Streaming watch delivery over SSE or WebSocket.
+2. More crash-injection tooling around persistence and recovery boundaries.
+3. Timeline filtering and exportable postmortem snapshots.
+4. More end-to-end examples that show why this is a coordination engine, not a generic key-value store.
+5. Multi-node replication if this ever graduates from single-node serious prototype to system product.
 
 ## Project Layout
 

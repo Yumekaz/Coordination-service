@@ -19,7 +19,7 @@ import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 from datetime import datetime
 
-from models import Node, Session, Watch, Event, Operation, NodeType, EventType, OperationType
+from models import Node, Session, Watch, Event, Operation, NodeType, EventType, OperationType, WatchFireRecord
 from metadata_tree import MetadataTree
 from session_manager import SessionManager
 from watch_manager import WatchManager
@@ -416,6 +416,242 @@ class Coordinator:
                 "disappearance": disappearance,
                 "recent_operations": recent_operations,
             }
+
+    def get_operation_incident(
+        self,
+        sequence_number: int,
+        path_limit: int = 12,
+        watch_limit: int = 40,
+    ) -> Optional[Dict[str, Any]]:
+        """Return an operation-centric incident report for one committed operation."""
+        with self._lock:
+            operation = self._operation_log.get_operation(sequence_number)
+            if operation is None:
+                return None
+
+            cause_operation: Optional[Operation] = None
+            cleanup_operations: List[Operation] = []
+            watch_fire_records: List[WatchFireRecord] = []
+            incident_kind = operation.operation_type.value.lower()
+            summary = f"{operation.operation_type.value.replace('_', ' ').title()} committed"
+            subtitle = "Committed operation incident"
+            notes: List[str] = []
+            path_changes: List[Tuple[str, str, int]] = []
+
+            if operation.operation_type == OperationType.SESSION_CLOSE:
+                cleanup_operations = self._find_cleanup_delete_operations_locked(
+                    operation.session_id,
+                    after_sequence=operation.sequence_number,
+                )
+                cleanup_paths = self._collect_paths_for_operations(cleanup_operations)
+                for cleanup_operation in cleanup_operations:
+                    watch_fire_records.extend(
+                        self._persistence.load_watch_fires_for_operation(
+                            cleanup_operation.sequence_number,
+                            limit=watch_limit,
+                        )
+                    )
+                    path_changes.extend(
+                        (path, "deleted", cleanup_operation.sequence_number)
+                        for path in self._decode_delete_paths(cleanup_operation)
+                    )
+
+                close_reason = self._decode_session_close_reason(operation)
+                incident_kind = (
+                    "session_timeout_cleanup"
+                    if close_reason == "timeout"
+                    else "session_cleanup"
+                    if cleanup_paths
+                    else "session_close"
+                )
+                summary = (
+                    "Session timed out"
+                    if close_reason == "timeout"
+                    else "Session closed"
+                )
+                subtitle = (
+                    f"{len(cleanup_paths)} path(s) cleaned up and {len(watch_fire_records)} watch firing(s) recorded."
+                    if cleanup_paths
+                    else "No ephemeral cleanup was required after the session ended."
+                )
+                if close_reason:
+                    notes.append(f"Close reason recorded as {close_reason}.")
+            else:
+                if operation.operation_type == OperationType.DELETE:
+                    deleted_paths = self._decode_delete_paths(operation)
+                    path_changes.extend(
+                        (path, "deleted", operation.sequence_number)
+                        for path in deleted_paths
+                    )
+                    cause_operation = self._find_session_close_operation_locked(
+                        operation.session_id,
+                        before_sequence=operation.sequence_number,
+                    )
+                    close_reason = self._decode_session_close_reason(cause_operation)
+                    if cause_operation is not None:
+                        incident_kind = (
+                            "session_timeout_cleanup"
+                            if close_reason == "timeout"
+                            else "session_cleanup"
+                        )
+                        summary = (
+                            "Timeout cleanup deleted path(s)"
+                            if close_reason == "timeout"
+                            else "Session close cleanup deleted path(s)"
+                        )
+                        if close_reason:
+                            notes.append(f"Cleanup reason recorded as {close_reason}.")
+                    else:
+                        incident_kind = "recursive_delete" if len(deleted_paths) > 1 else "delete"
+                        summary = "Recursive delete committed" if len(deleted_paths) > 1 else "Delete committed"
+                elif operation.path:
+                    change_kind = "created" if operation.operation_type == OperationType.CREATE else "updated"
+                    path_changes.append((operation.path, change_kind, operation.sequence_number))
+                    if operation.operation_type == OperationType.CREATE and operation.node_type == NodeType.EPHEMERAL:
+                        incident_kind = "lease_acquire"
+                        summary = "Ephemeral lease acquired"
+                        subtitle = f"Lease path {operation.path} created for session-backed ownership."
+                    elif operation.operation_type == OperationType.CREATE:
+                        incident_kind = "create"
+                        summary = "Node created"
+                        subtitle = f"Persistent path {operation.path} entered the namespace."
+                    elif operation.operation_type == OperationType.SET:
+                        incident_kind = "mutation"
+                        summary = "Node updated"
+                        subtitle = f"Committed write to {operation.path}."
+                else:
+                    if operation.operation_type == OperationType.SESSION_OPEN:
+                        incident_kind = "session_open"
+                        summary = "Session opened"
+                        subtitle = "A new live session joined the coordinator."
+                    elif operation.operation_type == OperationType.SESSION_HEARTBEAT:
+                        incident_kind = "session_heartbeat"
+                        summary = "Session heartbeat recorded"
+                        subtitle = "Heartbeat advanced the session TTL without mutating paths."
+
+                watch_fire_records = self._persistence.load_watch_fires_for_operation(
+                    operation.sequence_number,
+                    limit=watch_limit,
+                )
+                if not subtitle or subtitle == "Committed operation incident":
+                    affected_count = len(path_changes)
+                    subtitle = (
+                        f"{affected_count} path(s) affected and {len(watch_fire_records)} watch firing(s) recorded."
+                        if affected_count or watch_fire_records
+                        else "No dependent paths or watch firings were recorded for this operation."
+                    )
+
+            deduped_path_changes: List[Tuple[str, str, int]] = []
+            seen_paths: Set[str] = set()
+            for path, change_kind, change_sequence in path_changes:
+                if path in seen_paths:
+                    continue
+                deduped_path_changes.append((path, change_kind, change_sequence))
+                seen_paths.add(path)
+
+            visible_path_changes = deduped_path_changes[:path_limit] if path_limit > 0 else deduped_path_changes
+            affected_paths = [
+                self._build_incident_path_entry_locked(
+                    path=path,
+                    operation_sequence=change_sequence,
+                    change_kind=change_kind,
+                )
+                for path, change_kind, change_sequence in visible_path_changes
+            ]
+
+            unique_watcher_session_ids: List[str] = []
+            seen_watcher_session_ids: Set[str] = set()
+            for record in watch_fire_records:
+                if record.watch_session_id in seen_watcher_session_ids:
+                    continue
+                unique_watcher_session_ids.append(record.watch_session_id)
+                seen_watcher_session_ids.add(record.watch_session_id)
+
+            watcher_sessions = [
+                session_view
+                for session_view in (
+                    self._lookup_session_view_locked(session_id)
+                    for session_id in unique_watcher_session_ids
+                )
+                if session_view is not None
+            ]
+
+            session_roles: Dict[str, Set[str]] = {}
+
+            def add_session_role(session_id: Optional[str], role: str) -> None:
+                if not session_id:
+                    return
+                session_roles.setdefault(session_id, set()).add(role)
+
+            add_session_role(operation.session_id, "actor")
+            add_session_role(cause_operation.session_id if cause_operation else None, "cause")
+            for cleanup_operation in cleanup_operations:
+                add_session_role(cleanup_operation.session_id, "cleanup")
+            for path_view in affected_paths:
+                add_session_role(path_view.get("session_id"), "owner")
+            for watcher_session in watcher_sessions:
+                add_session_role(watcher_session.get("session_id"), "watcher")
+
+            impacted_sessions = self._build_incident_session_views_locked(session_roles)
+            source_session = next(
+                (
+                    session_view
+                    for session_view in impacted_sessions
+                    if session_view["session_id"] == operation.session_id
+                ),
+                self._lookup_session_view_locked(operation.session_id),
+            )
+
+            causal_chain: List[Operation] = []
+            if cause_operation is not None:
+                causal_chain.append(cause_operation)
+            causal_chain.append(operation)
+            if operation.operation_type == OperationType.SESSION_CLOSE:
+                causal_chain.extend(cleanup_operations)
+            primary_path = ""
+            if operation.operation_type == OperationType.DELETE:
+                deleted_paths = self._decode_delete_paths(operation)
+                primary_path = deleted_paths[0] if deleted_paths else ""
+            elif deduped_path_changes:
+                primary_path = deduped_path_changes[0][0]
+            elif operation.path:
+                primary_path = operation.path
+
+            return {
+                "sequence_number": operation.sequence_number,
+                "operation": operation,
+                "incident_kind": incident_kind,
+                "summary": summary,
+                "subtitle": subtitle,
+                "primary_path": primary_path,
+                "source_session": source_session,
+                "cause_operation": cause_operation,
+                "cleanup_operations": cleanup_operations,
+                "related_operations": cleanup_operations,
+                "causal_chain": causal_chain,
+                "affected_path_count": len(deduped_path_changes),
+                "path_overflow_count": max(0, len(deduped_path_changes) - len(affected_paths)),
+                "affected_paths": affected_paths,
+                "watch_fire_count": len(watch_fire_records),
+                "watch_overflow_count": 0,
+                "watch_fires": [record.to_dict() for record in watch_fire_records],
+                "watcher_sessions": watcher_sessions,
+                "impacted_sessions": impacted_sessions,
+                "blast_radius": {
+                    "affected_paths": len(deduped_path_changes),
+                    "watches_fired": len(watch_fire_records),
+                    "related_operations": len(cleanup_operations) + (1 if cause_operation is not None else 0),
+                    "sessions_touched": len(impacted_sessions),
+                },
+                "stats": {
+                    "affected_paths": len(deduped_path_changes),
+                    "displayed_paths": len(affected_paths),
+                    "watch_fires": len(watch_fire_records),
+                    "impacted_sessions": len(impacted_sessions),
+                    "cascade_operations": len(cleanup_operations),
+                },
+                "notes": notes,
+            }
     
     def _on_session_expired(self, session: Session, reason: str = "timeout") -> None:
         """
@@ -713,6 +949,24 @@ class Coordinator:
         reason = payload.get("reason")
         return str(reason) if reason else None
 
+    def _find_session_cleanup_delete_operation_locked(
+        self,
+        session_id: Optional[str],
+        after_sequence: int,
+    ) -> Optional[Operation]:
+        """Return the immediate cleanup delete paired with a session-close op."""
+        if not session_id:
+            return None
+
+        candidate = self._operation_log.get_operation(after_sequence + 1)
+        if (
+            candidate is not None
+            and candidate.operation_type == OperationType.DELETE
+            and candidate.session_id == session_id
+        ):
+            return candidate
+        return None
+
     def _collect_watch_fire_records_locked(
         self,
         paths: List[str],
@@ -880,6 +1134,110 @@ class Coordinator:
 
         return matched
 
+    def _find_cleanup_delete_operations_locked(
+        self,
+        session_id: Optional[str],
+        after_sequence: int,
+    ) -> List[Operation]:
+        """Return committed delete operations emitted after a session close."""
+        if not session_id:
+            return []
+
+        matches: List[Operation] = []
+        for operation in self._operation_log.get_all_operations():
+            if operation.sequence_number <= after_sequence:
+                continue
+            if operation.session_id != session_id:
+                continue
+            if operation.operation_type != OperationType.DELETE:
+                continue
+            matches.append(operation)
+        return matches
+
+    def _collect_paths_for_operations(self, operations: List[Operation]) -> List[str]:
+        """Flatten and de-duplicate affected paths for a set of operations."""
+        paths: List[str] = []
+        for operation in operations:
+            if operation.operation_type == OperationType.DELETE:
+                paths.extend(self._decode_delete_paths(operation))
+            elif operation.path:
+                paths.append(operation.path)
+        return self._dedupe_paths(paths)
+
+    def _dedupe_paths(self, paths: List[str]) -> List[str]:
+        """Preserve input order while removing duplicate paths."""
+        ordered: List[str] = []
+        seen: Set[str] = set()
+        for path in paths:
+            if not path or path in seen:
+                continue
+            ordered.append(path)
+            seen.add(path)
+        return ordered
+
+    def _build_incident_path_entry_locked(
+        self,
+        path: str,
+        operation_sequence: int,
+        change_kind: str,
+    ) -> Dict[str, Any]:
+        """Build a rich before/after path summary for an operation incident."""
+        detail = self.get_path_detail(path, operation_limit=8, watch_limit=8)
+        before_history = self._reconstruct_path_history_locked(path, through_sequence=operation_sequence - 1)
+        after_history = self._reconstruct_path_history_locked(path, through_sequence=operation_sequence)
+        current_history = self._reconstruct_path_history_locked(path)
+
+        before_view = self._build_path_node_view_from_state_locked(before_history.get("current_state"))
+        after_view = self._build_path_node_view_from_state_locked(after_history.get("current_state"))
+        current_view = self._build_path_node_view_from_state_locked(current_history.get("current_state"))
+        last_known_view = self._build_path_node_view_from_state_locked(current_history.get("last_known_state"))
+        node = current_view or after_view or before_view or last_known_view or {}
+        disappearance = detail.get("disappearance") if detail else None
+
+        if current_view is not None and after_view is None:
+            state = "recreated"
+        elif current_view is not None:
+            state = "live"
+        elif disappearance is not None:
+            state = "deleted"
+        else:
+            state = "historical"
+
+        summary = {
+            "created": "Path created in this operation.",
+            "updated": "Path data changed in this operation.",
+            "deleted": "Path deleted in this operation.",
+        }.get(change_kind, "Path touched in this operation.")
+
+        if before_view and after_view and before_view.get("version") is not None and after_view.get("version") is not None:
+            summary = f"{summary.rstrip('.')} Version {before_view['version']} -> {after_view['version']}."
+
+        note = ""
+        if change_kind == "deleted" and disappearance is not None and disappearance.get("cause_kind"):
+            note = f"Current history records this as {disappearance['cause_kind']}."
+        elif state == "recreated":
+            note = "This path was later recreated after the inspected operation."
+
+        return {
+            "path": path,
+            "change_kind": change_kind,
+            "summary": summary,
+            "state": state,
+            "session_id": node.get("session_id"),
+            "node_type": node.get("node_type"),
+            "holder": node.get("holder"),
+            "data_preview": node.get("data_preview", ""),
+            "modified_at": node.get("modified_at"),
+            "version_before": before_view.get("version") if before_view else None,
+            "version_after": after_view.get("version") if after_view else None,
+            "before": before_view,
+            "after": after_view,
+            "note": note,
+            "cause_kind": disappearance.get("cause_kind") if disappearance else None,
+            "deleted_in_operation": change_kind == "deleted",
+            "delete_sequence_number": operation_sequence if change_kind == "deleted" else None,
+        }
+
     def _find_session_close_operation_locked(
         self,
         session_id: Optional[str],
@@ -956,9 +1314,38 @@ class Coordinator:
             "lease_token": lease_token,
         }
 
-    def _reconstruct_path_history_locked(self, path: str) -> Dict[str, Any]:
-        """Reconstruct the latest lifecycle for a path from committed operations."""
+    def _build_path_node_view_from_state_locked(
+        self,
+        state: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """Convert an internal reconstructed state dictionary into an API view."""
+        if state is None:
+            return None
+
+        return self._build_path_node_view(
+            path=state["path"],
+            data=state["data"],
+            version=state["version"],
+            node_type=state["node_type"],
+            session_id=state["session_id"],
+            created_at=state["created_at"],
+            modified_at=state["modified_at"],
+            lease_token=state.get("lease_token"),
+        )
+
+    def _reconstruct_path_history_locked(
+        self,
+        path: str,
+        through_sequence: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Reconstruct a path lifecycle from committed operations up to a sequence."""
         chronological_ops = list(reversed(self._get_operations_for_exact_path_locked(path, limit=None)))
+        if through_sequence is not None:
+            chronological_ops = [
+                operation
+                for operation in chronological_ops
+                if operation.sequence_number <= through_sequence
+            ]
         state: Optional[Dict[str, Any]] = None
         last_known: Optional[Dict[str, Any]] = None
         last_delete: Optional[Operation] = None
@@ -1006,6 +1393,50 @@ class Coordinator:
             "holder_history": holder_history,
             "chronological_operations": chronological_ops,
         }
+
+    def _build_incident_session_views_locked(
+        self,
+        session_roles: Dict[str, Set[str]],
+    ) -> List[Dict[str, Any]]:
+        """Project involved sessions into a stable incident view."""
+        priority = {
+            "actor": 0,
+            "cause": 1,
+            "cleanup": 2,
+            "owner": 3,
+            "watcher": 4,
+        }
+        session_views: List[Dict[str, Any]] = []
+        for session_id, roles in session_roles.items():
+            summary = self._lookup_session_view_locked(session_id)
+            ordered_roles = sorted(roles, key=lambda role: (priority.get(role, 99), role))
+            if summary is None:
+                session_views.append({
+                    "session_id": session_id,
+                    "created_at": 0.0,
+                    "last_heartbeat": 0.0,
+                    "timeout_seconds": 0,
+                    "expires_at": 0.0,
+                    "remaining_seconds": 0.0,
+                    "is_alive": False,
+                    "ephemeral_nodes": [],
+                    "ephemeral_node_count": 0,
+                    "watch_count": 0,
+                    "roles": ordered_roles,
+                })
+            else:
+                session_views.append({
+                    **summary,
+                    "roles": ordered_roles,
+                })
+
+        session_views.sort(
+            key=lambda session: (
+                min(priority.get(role, 99) for role in session["roles"]) if session["roles"] else 99,
+                session["session_id"],
+            )
+        )
+        return session_views
 
     def _lease_info_from_node(
         self,

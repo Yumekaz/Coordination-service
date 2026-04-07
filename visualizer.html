@@ -630,6 +630,12 @@
             border-color: rgba(59, 130, 246, 0.3);
         }
 
+        .inspector-button.inline {
+            width: auto;
+            flex: 1 1 auto;
+            min-width: 0;
+        }
+
         .inspector-code {
             font-family: 'JetBrains Mono', monospace;
             font-size: 11px;
@@ -702,6 +708,139 @@
             text-transform: uppercase;
             letter-spacing: 0.04em;
             margin-bottom: 4px;
+        }
+
+        .incident-card {
+            padding: 14px;
+            border-radius: 10px;
+            border: 1px solid rgba(59, 130, 246, 0.25);
+            background:
+                linear-gradient(135deg, rgba(59, 130, 246, 0.12), rgba(59, 130, 246, 0.02)),
+                var(--bg-tertiary);
+            min-width: 0;
+        }
+
+        .incident-card.delete {
+            border-color: rgba(239, 68, 68, 0.35);
+            background:
+                linear-gradient(135deg, rgba(239, 68, 68, 0.12), rgba(239, 68, 68, 0.02)),
+                var(--bg-tertiary);
+        }
+
+        .incident-card.timeout {
+            border-color: rgba(245, 158, 11, 0.35);
+            background:
+                linear-gradient(135deg, rgba(245, 158, 11, 0.12), rgba(245, 158, 11, 0.02)),
+                var(--bg-tertiary);
+        }
+
+        .incident-card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            gap: 12px;
+            min-width: 0;
+        }
+
+        .incident-card-title {
+            font-size: 17px;
+            font-weight: 700;
+            color: var(--text-primary);
+            line-height: 1.3;
+            word-break: break-word;
+            overflow-wrap: anywhere;
+        }
+
+        .incident-card-subtitle {
+            margin-top: 4px;
+            font-size: 12px;
+            color: var(--text-secondary);
+            line-height: 1.5;
+            overflow-wrap: anywhere;
+        }
+
+        .incident-card-actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-top: 12px;
+        }
+
+        .incident-metrics {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 10px 14px;
+            margin-top: 14px;
+            min-width: 0;
+        }
+
+        .incident-snapshot-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 10px;
+            margin-top: 10px;
+            min-width: 0;
+        }
+
+        .incident-snapshot {
+            min-width: 0;
+        }
+
+        .incident-snapshot-label {
+            font-size: 10px;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            margin-bottom: 4px;
+        }
+
+        .incident-snapshot-value {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 11px;
+            color: var(--text-secondary);
+            white-space: pre-wrap;
+            word-break: break-word;
+            overflow-wrap: anywhere;
+        }
+
+        .incident-operation-list {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            min-width: 0;
+        }
+
+        .incident-operation-item {
+            padding: 10px 12px;
+            border-radius: 8px;
+            border: 1px solid var(--border);
+            background: rgba(10, 10, 11, 0.45);
+            min-width: 0;
+        }
+
+        .incident-operation-top {
+            display: flex;
+            justify-content: space-between;
+            gap: 10px;
+            align-items: flex-start;
+            min-width: 0;
+        }
+
+        .incident-operation-path {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 12px;
+            color: var(--text-primary);
+            word-break: break-word;
+            overflow-wrap: anywhere;
+        }
+
+        .incident-operation-meta {
+            margin-top: 4px;
+            font-size: 11px;
+            color: var(--text-secondary);
+            line-height: 1.5;
+            word-break: break-word;
+            overflow-wrap: anywhere;
         }
         
         /* Bottom Panel - Sessions */
@@ -1428,6 +1567,22 @@
             return JSON.stringify(value, null, 2);
         }
 
+        function asArray(value) {
+            if (Array.isArray(value)) {
+                return value;
+            }
+            return value == null ? [] : [value];
+        }
+
+        function firstDefined(...values) {
+            for (const value of values) {
+                if (value !== undefined && value !== null && value !== '') {
+                    return value;
+                }
+            }
+            return null;
+        }
+
         function isSelectedInspector(kind, key) {
             return selectedInspector.kind === kind && selectedInspector.key === key;
         }
@@ -1437,14 +1592,8 @@
         }
 
         function getOperationInspectTarget(operation) {
-            if (operation.session_id && operation.operation_type.startsWith('SESSION_')) {
-                return { kind: 'session', key: operation.session_id };
-            }
-            if (isInspectablePath(operation.path)) {
-                return { kind: 'path', key: operation.path };
-            }
-            if (operation.delete_paths && operation.delete_paths.length === 1 && isInspectablePath(operation.delete_paths[0])) {
-                return { kind: 'path', key: operation.delete_paths[0] };
+            if (operation && operation.sequence_number != null) {
+                return { kind: 'operation', key: String(operation.sequence_number) };
             }
             return null;
         }
@@ -1468,7 +1617,236 @@
             }
             if (kind === 'path') {
                 inspectPath(key);
+                return;
             }
+            if (kind === 'operation') {
+                inspectOperation(key);
+            }
+        }
+
+        function normalizeSessionSummary(session) {
+            if (!session) {
+                return null;
+            }
+            if (typeof session === 'string') {
+                return { session_id: session };
+            }
+            if (typeof session !== 'object') {
+                return null;
+            }
+            const sessionId = firstDefined(session.session_id, session.id, session.sessionId);
+            if (!sessionId) {
+                return null;
+            }
+            return {
+                session_id: String(sessionId),
+                is_alive: Boolean(firstDefined(session.is_alive, session.isAlive, true)),
+                timeout_seconds: Number(firstDefined(session.timeout_seconds, session.timeoutSeconds, 0)),
+                remaining_seconds: Number(firstDefined(session.remaining_seconds, session.remainingSeconds, 0)),
+                ephemeral_node_count: Number(firstDefined(session.ephemeral_node_count, session.ephemeralNodeCount, 0)),
+                watch_count: Number(firstDefined(session.watch_count, session.watchCount, 0)),
+                created_at: Number(firstDefined(session.created_at, session.createdAt, 0)),
+                last_heartbeat: Number(firstDefined(session.last_heartbeat, session.lastHeartbeat, 0)),
+                roles: asArray(firstDefined(session.roles, session.role_tags, session.roleTags)).filter(Boolean).map(role => String(role)),
+            };
+        }
+
+        function normalizeCommittedOperation(operation) {
+            if (!operation || typeof operation !== 'object') {
+                return null;
+            }
+            const source = operation.operation && typeof operation.operation === 'object'
+                ? operation.operation
+                : operation;
+            const sequenceNumber = firstDefined(source.sequence_number, source.sequenceNumber, source.sequence, source.seq);
+            const operationType = firstDefined(source.operation_type, source.operationType, source.type, 'INCIDENT');
+            const deletePaths = asArray(firstDefined(source.delete_paths, source.deletePaths))
+                .filter(path => typeof path === 'string' && path.length > 0);
+
+            return {
+                sequence_number: sequenceNumber != null ? Number(sequenceNumber) : null,
+                operation_type: String(operationType),
+                path: String(firstDefined(source.path, source.target_path, source.observed_path, '')),
+                data: firstDefined(source.data, ''),
+                data_preview: String(firstDefined(source.data_preview, source.dataPreview, '')),
+                delete_paths: deletePaths,
+                summary: String(firstDefined(source.summary, source.label, '')),
+                session_id: firstDefined(source.session_id, source.sessionId, source.source_session_id, source.watch_session_id),
+                timestamp: Number(firstDefined(source.timestamp, source.time, 0)),
+                node_type: firstDefined(source.node_type, source.nodeType, null),
+            };
+        }
+
+        function normalizeWatchFire(record) {
+            if (!record || typeof record !== 'object') {
+                return null;
+            }
+            const source = record.watch_fire && typeof record.watch_fire === 'object'
+                ? record.watch_fire
+                : record;
+            return {
+                cause_sequence_number: Number(firstDefined(source.cause_sequence_number, source.causeSequenceNumber, 0)),
+                ordinal: Number(firstDefined(source.ordinal, 0)),
+                watch_id: String(firstDefined(source.watch_id, source.watchId, '')),
+                watch_session_id: String(firstDefined(source.watch_session_id, source.watchSessionId, '')),
+                watch_path: String(firstDefined(source.watch_path, source.watchPath, source.path, '')),
+                observed_path: String(firstDefined(source.observed_path, source.observedPath, source.path, '')),
+                event_type: String(firstDefined(source.event_type, source.eventType, '')),
+                timestamp: Number(firstDefined(source.timestamp, source.time, 0)),
+            };
+        }
+
+        function normalizePathChange(item) {
+            if (!item) {
+                return null;
+            }
+            if (typeof item === 'string') {
+                return { path: item };
+            }
+            if (typeof item !== 'object') {
+                return null;
+            }
+            const source = item.path_change && typeof item.path_change === 'object'
+                ? item.path_change
+                : item;
+            const path = String(firstDefined(source.path, source.target_path, source.observed_path, ''));
+            if (!path) {
+                return null;
+            }
+            const fallbackSnapshot = (
+                firstDefined(source.version, source.data_preview, source.holder, source.metadata) !== null
+            ) ? {
+                version: firstDefined(source.version, null),
+                data_preview: String(firstDefined(source.data_preview, '')),
+                holder: firstDefined(source.holder, null),
+                metadata: firstDefined(source.metadata, null),
+            } : null;
+            const state = firstDefined(source.state, null);
+            return {
+                path,
+                change_kind: String(firstDefined(source.change_kind, source.action, source.kind, source.state, 'change')),
+                summary: String(firstDefined(source.summary, source.label, source.reason, '')),
+                state,
+                session_id: firstDefined(source.session_id, source.sessionId, null),
+                node_type: firstDefined(source.node_type, source.nodeType, null),
+                version_before: firstDefined(source.version_before, source.before_version, source.versionBefore, null),
+                version_after: firstDefined(source.version_after, source.after_version, source.versionAfter, source.version, null),
+                before: firstDefined(
+                    source.before,
+                    source.previous,
+                    source.previous_state,
+                    source.last_known_node,
+                    state === 'deleted' || state === 'historical' ? fallbackSnapshot : null
+                ),
+                after: firstDefined(
+                    source.after,
+                    source.next,
+                    source.current_state,
+                    source.current_node,
+                    source.node,
+                    state === 'live_node' || state === 'live_lease' || state === 'recreated' ? fallbackSnapshot : null
+                ),
+                metadata: firstDefined(source.metadata, null),
+                holder: firstDefined(source.holder, null),
+                deleted_in_operation: Boolean(firstDefined(source.deleted_in_operation, source.deletedInOperation, false)),
+                note: String(firstDefined(source.note, source.details, '')),
+            };
+        }
+
+        function normalizeIncidentDetail(raw) {
+            const source = raw && typeof raw === 'object' ? raw : {};
+            const operation = normalizeCommittedOperation(
+                firstDefined(
+                    source.operation,
+                    source.incident_operation,
+                    source.committed_operation,
+                    source.target_operation,
+                    source.base_operation,
+                    source
+                )
+            );
+
+            const sourceSession = normalizeSessionSummary(
+                firstDefined(source.source_session, source.session, source.owner_session, source.cause_session)
+            );
+            const affectedPaths = asArray(firstDefined(
+                source.affected_paths,
+                source.paths,
+                source.path_changes,
+                source.cleanup_paths,
+                source.impact_paths,
+                source.path_impact
+            )).map(normalizePathChange).filter(Boolean);
+            const watchFirings = asArray(firstDefined(
+                source.watch_firings,
+                source.fired_watches,
+                source.watch_fires,
+                source.watch_events
+            )).map(normalizeWatchFire).filter(Boolean);
+            const relatedOperations = asArray(firstDefined(
+                source.related_operations,
+                source.follow_up_operations,
+                source.cascade_operations,
+                source.cleanup_operations
+            )).map(normalizeCommittedOperation).filter(Boolean);
+            const causalChain = asArray(firstDefined(
+                source.causal_chain,
+                source.incident_chain,
+                source.timeline
+            )).map(normalizeCommittedOperation).filter(Boolean);
+            const impactedSessions = asArray(firstDefined(
+                source.impacted_sessions,
+                source.involved_sessions,
+                source.sessions_touched,
+                source.sessions
+            )).map(normalizeSessionSummary).filter(Boolean);
+            const primaryPath = String(firstDefined(
+                source.primary_path,
+                source.path,
+                operation?.path,
+                affectedPaths[0]?.path,
+                ''
+            ));
+            const sourceSessionId = firstDefined(
+                source.source_session_id,
+                source.cause_session_id,
+                operation?.session_id,
+                sourceSession?.session_id,
+                null
+            );
+            const distinctSessionIds = new Set(
+                [
+                    sourceSessionId,
+                    ...affectedPaths.map(item => item.session_id),
+                    ...watchFirings.map(item => item.watch_session_id),
+                    ...relatedOperations.map(item => item.session_id),
+                    ...causalChain.map(item => item.session_id),
+                ].filter(Boolean)
+            );
+            const blastRadius = source.blast_radius || source.blastRadius || {};
+            const headline = String(firstDefined(source.summary, source.title, operation?.summary, `${operation?.operation_type || 'INCIDENT'} ${primaryPath}`));
+
+            return {
+                sequence_number: Number(firstDefined(source.sequence_number, source.sequenceNumber, operation?.sequence_number, 0)),
+                summary: headline,
+                subtitle: String(firstDefined(source.subtitle, source.description, '')),
+                operation,
+                source_session: normalizeSessionSummary(source.source_session || sourceSessionId),
+                primary_path: primaryPath,
+                blast_radius: {
+                    affected_paths: Number(firstDefined(blastRadius.affected_paths, blastRadius.paths_affected, affectedPaths.length, 0)),
+                    watches_fired: Number(firstDefined(blastRadius.watches_fired, blastRadius.watch_fires, watchFirings.length, 0)),
+                    related_operations: Number(firstDefined(blastRadius.related_operations, relatedOperations.length, 0)),
+                    sessions_touched: Number(firstDefined(blastRadius.sessions_touched, blastRadius.sessions_affected, distinctSessionIds.size, 0)),
+                },
+                affected_paths: affectedPaths,
+                watch_firings: watchFirings,
+                related_operations: relatedOperations,
+                causal_chain: causalChain,
+                impacted_sessions: impactedSessions,
+                notes: asArray(source.notes).filter(note => note != null && `${note}`.trim().length > 0).map(note => String(note)),
+                raw: source,
+            };
         }
 
         function formatOperationLabel(operationType) {
@@ -1555,6 +1933,8 @@
                     await inspectSession(selectedInspector.key, { silent: true });
                 } else if (selectedInspector.kind === 'path') {
                     await inspectPath(selectedInspector.key, { silent: true });
+                } else if (selectedInspector.kind === 'operation') {
+                    await inspectOperation(selectedInspector.key, { silent: true });
                 }
             }, 140);
         }
@@ -1577,6 +1957,93 @@
                 setInspectorState({ kind: 'session', key: sessionId, data, loading: false, error: null });
             } catch (e) {
                 setInspectorState({ kind: 'session', key: sessionId, data: null, loading: false, error: e.message });
+            }
+        }
+
+        function buildLocalOperationIncident(sequenceNumber, hint = '') {
+            const seq = Number(sequenceNumber);
+            const operation = operations.find(item => Number(item.sequence_number) === seq);
+            if (!operation) {
+                return null;
+            }
+
+            const affectedPaths = [];
+            if (operation.operation_type === 'DELETE' && Array.isArray(operation.delete_paths) && operation.delete_paths.length) {
+                for (const path of operation.delete_paths) {
+                    affectedPaths.push({
+                        path,
+                        change_kind: 'deleted',
+                        summary: 'Local timeline summary',
+                        state: 'deleted',
+                        session_id: operation.session_id,
+                        node_type: operation.node_type,
+                        before: { operation_type: operation.operation_type, path },
+                        after: null,
+                        note: hint || 'Operation detail endpoint unavailable. Showing timeline-derived summary.',
+                    });
+                }
+            } else if (operation.path) {
+                affectedPaths.push({
+                    path: operation.path,
+                    change_kind: operation.operation_type.toLowerCase(),
+                    summary: 'Local timeline summary',
+                    state: 'changed',
+                    session_id: operation.session_id,
+                    node_type: operation.node_type,
+                    before: operation.operation_type === 'SET' ? { data_preview: operation.data_preview } : null,
+                    after: operation.operation_type !== 'DELETE' ? { data_preview: operation.data_preview } : null,
+                    note: hint || 'Operation detail endpoint unavailable. Showing timeline-derived summary.',
+                });
+            }
+
+            return {
+                sequence_number: operation.sequence_number,
+                summary: operation.summary || `${operation.operation_type} ${operation.path || '(system)'}`,
+                subtitle: hint || 'Showing local timeline data until the incident API is available.',
+                operation,
+                source_session: operation.session_id ? { session_id: operation.session_id } : null,
+                primary_path: operation.path || (affectedPaths[0] && affectedPaths[0].path) || '',
+                blast_radius: {
+                    affected_paths: affectedPaths.length,
+                    watches_fired: 0,
+                    related_operations: 0,
+                    sessions_touched: operation.session_id ? 1 : 0,
+                },
+                affected_paths: affectedPaths,
+                watch_firings: [],
+                related_operations: [],
+                causal_chain: [],
+                notes: hint ? [hint] : [],
+                raw: {
+                    source: 'local-fallback',
+                },
+            };
+        }
+
+        async function inspectOperation(sequenceNumber, options = {}) {
+            const key = String(sequenceNumber);
+            const { silent = false } = options;
+            if (!silent) {
+                setInspectorState({ kind: 'operation', key, data: null, loading: true, error: null });
+            } else {
+                selectedInspector.kind = 'operation';
+                selectedInspector.key = key;
+            }
+
+            try {
+                const response = await fetch(`${API_BASE}/operations/${encodeURIComponent(key)}/incident?path_limit=12&watch_limit=50`);
+                if (!response.ok) {
+                    throw new Error(`Operation detail unavailable (${response.status})`);
+                }
+                const data = await response.json();
+                setInspectorState({ kind: 'operation', key, data: normalizeIncidentDetail(data), loading: false, error: null });
+            } catch (e) {
+                const fallback = buildLocalOperationIncident(key, e.message);
+                if (fallback) {
+                    setInspectorState({ kind: 'operation', key, data: fallback, loading: false, error: null });
+                    return;
+                }
+                setInspectorState({ kind: 'operation', key, data: null, loading: false, error: e.message });
             }
         }
 
@@ -1620,16 +2087,18 @@
                     ${items.map(operation => {
                         const inspectTarget = getOperationInspectTarget(operation);
                         const classes = ['inspector-item'];
+                        const title = operation.summary || `${operation.operation_type || 'OPERATION'} ${operation.path || operation.session_id || ''}`.trim();
+                        const sequenceLabel = operation.sequence_number != null ? `#${operation.sequence_number}` : '#n/a';
                         if (inspectTarget) {
                             classes.push('inspectable');
                         }
                         return `
                         <div class="${classes.join(' ')}" ${buildInspectAttributes(inspectTarget)}>
                             <div class="inspector-item-row">
-                                <div class="inspector-item-title">${escapeHtml(operation.summary)}</div>
-                                <span class="inspector-chip">#${operation.sequence_number}</span>
+                                <div class="inspector-item-title">${escapeHtml(title)}</div>
+                                <span class="inspector-chip">${escapeHtml(sequenceLabel)}</span>
                             </div>
-                            <div class="inspector-item-meta">${escapeHtml(formatDateTime(operation.timestamp))} · ${escapeHtml(operation.operation_type)}</div>
+                            <div class="inspector-item-meta">${escapeHtml(formatOperationMeta(operation))}</div>
                         </div>
                     `;
                     }).join('')}
@@ -1657,7 +2126,9 @@
                     ${items.map(record => `
                         <div class="inspector-item">
                             <div class="inspector-item-row">
-                                <div class="inspector-item-title">${escapeHtml(record.watch_path)}</div>
+                                ${isInspectablePath(record.observed_path)
+                                    ? `<button class="inspector-button inline" type="button" ${buildInspectAttributes({ kind: 'path', key: record.observed_path })}>${escapeHtml(record.observed_path)}</button>`
+                                    : `<div class="inspector-item-title">${escapeHtml(record.observed_path)}</div>`}
                                 <span class="inspector-chip">#${record.cause_sequence_number}.${record.ordinal}</span>
                             </div>
                             <div class="inspector-item-meta">${escapeHtml(formatDateTime(record.timestamp))} · ${escapeHtml(record.event_type)} · watched by ${escapeHtml(record.watch_session_id.slice(0, 8))}...</div>
@@ -1669,6 +2140,200 @@
                         </div>
                     `).join('')}
                 </div>
+            `;
+        }
+
+        function renderIncidentSnapshot(label, value) {
+            if (value === undefined || value === null || value === '') {
+                return '';
+            }
+
+            const rendered = typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean'
+                ? String(value)
+                : formatMetadata(value);
+
+            return `
+                <div class="incident-snapshot">
+                    <div class="incident-snapshot-label">${escapeHtml(label)}</div>
+                    <div class="incident-snapshot-value">${escapeHtml(rendered)}</div>
+                </div>
+            `;
+        }
+
+        function renderAffectedPathItems(items) {
+            if (!items || items.length === 0) {
+                return '<div class="inspector-code">No affected paths reported yet.</div>';
+            }
+
+            return `
+                <div class="incident-operation-list">
+                    ${items.map(item => {
+                        const chips = [];
+                        if (item.change_kind) {
+                            chips.push(item.change_kind);
+                        }
+                        if (item.state) {
+                            chips.push(item.state);
+                        }
+                        if (item.node_type) {
+                            chips.push(item.node_type);
+                        }
+                        const summaryLine = [
+                            item.summary,
+                            item.session_id ? `session ${item.session_id.slice(0, 8)}...` : null,
+                            item.version_before !== null && item.version_before !== undefined && item.version_after !== null && item.version_after !== undefined
+                                ? `v${item.version_before} → v${item.version_after}`
+                                : null,
+                            item.note || null
+                        ].filter(Boolean).join(' · ');
+
+                        return `
+                            <div class="incident-operation-item">
+                                <div class="incident-operation-top">
+                                    ${isInspectablePath(item.path)
+                                        ? `<button class="inspector-button inline" type="button" ${buildInspectAttributes({ kind: 'path', key: item.path })}>${escapeHtml(item.path)}</button>`
+                                        : `<div class="incident-operation-path">${escapeHtml(item.path)}</div>`}
+                                    ${chips.length ? `<span class="inspector-chip">${escapeHtml(chips.join(' · '))}</span>` : ''}
+                                </div>
+                                ${summaryLine ? `<div class="incident-operation-meta">${escapeHtml(summaryLine)}</div>` : ''}
+                                ${(item.before !== null && item.before !== undefined) || (item.after !== null && item.after !== undefined) ? `
+                                    <div class="incident-snapshot-grid">
+                                        ${renderIncidentSnapshot('Before', item.before)}
+                                        ${renderIncidentSnapshot('After', item.after)}
+                                    </div>
+                                ` : ''}
+                            </div>
+                        `;
+                    }).join('')}
+                </div>
+            `;
+        }
+
+        function renderOperationIncidentList(items, emptyMessage) {
+            if (!items || items.length === 0) {
+                return `<div class="inspector-code">${escapeHtml(emptyMessage)}</div>`;
+            }
+
+            return renderOperationItems(items);
+        }
+
+        function renderIncidentSessionItems(items) {
+            if (!items || items.length === 0) {
+                return '<div class="inspector-code">No involved sessions captured for this incident.</div>';
+            }
+
+            return `
+                <div class="inspector-list">
+                    ${items.map(session => {
+                        const meta = [
+                            session.is_alive ? 'alive' : 'dead',
+                            session.roles && session.roles.length ? session.roles.join(' · ') : null,
+                            session.watch_count != null ? `${session.watch_count} watch(es)` : null,
+                            session.ephemeral_node_count != null ? `${session.ephemeral_node_count} ephemeral` : null
+                        ].filter(Boolean).join(' · ');
+                        return `
+                            <button class="inspector-button" type="button" ${buildInspectAttributes({ kind: 'session', key: session.session_id })}>
+                                <span>${escapeHtml(session.session_id.slice(0, 8))}...</span>
+                                <span class="inspector-item-meta">${escapeHtml(meta)}</span>
+                            </button>
+                        `;
+                    }).join('')}
+                </div>
+            `;
+        }
+
+        function renderOperationInspector(data) {
+            const incident = normalizeIncidentDetail(data);
+            const operation = incident.operation || {};
+            const sourceSession = incident.source_session;
+            const primaryPath = incident.primary_path || operation.path || '';
+            const blast = incident.blast_radius || {};
+            const affectedPaths = incident.affected_paths || [];
+            const watchFirings = incident.watch_firings || [];
+            const relatedOperations = incident.related_operations || [];
+            const causalChain = incident.causal_chain || [];
+            const impactedSessions = incident.impacted_sessions || [];
+            const incidentClass = operation.operation_type === 'DELETE'
+                ? 'incident-card delete'
+                : operation.operation_type === 'SESSION_CLOSE'
+                    ? 'incident-card timeout'
+                    : 'incident-card';
+            const title = incident.summary || operation.summary || `${operation.operation_type || 'INCIDENT'} ${primaryPath || ''}`.trim();
+            const subtitle = incident.subtitle || (primaryPath ? `Primary path ${primaryPath}` : 'Committed operation incident');
+            const sourceSessionId = sourceSession?.session_id || operation.session_id || '';
+            const metrics = {
+                Operation: operation.sequence_number ? `#${operation.sequence_number}` : 'n/a',
+                Type: operation.operation_type || 'n/a',
+                Source: sourceSessionId ? `${sourceSessionId.slice(0, 8)}...` : 'n/a',
+                'Primary Path': primaryPath || 'n/a',
+                'Affected Paths': blast.affected_paths,
+                'Watches Fired': blast.watches_fired,
+                'Related Ops': blast.related_operations,
+                'Sessions Touched': blast.sessions_touched,
+            };
+
+            return `
+                <div class="${incidentClass}">
+                    <div class="incident-card-header">
+                        <div style="min-width: 0;">
+                            <div class="inspector-kicker">Operation Incident</div>
+                            <div class="incident-card-title">${escapeHtml(title)}</div>
+                            <div class="incident-card-subtitle">${escapeHtml(subtitle)}</div>
+                        </div>
+                        <span class="inspector-chip">#${escapeHtml(String(operation.sequence_number ?? data.sequence_number ?? 'n/a'))}</span>
+                    </div>
+                    <div class="incident-card-actions">
+                        ${sourceSessionId ? `
+                            <button class="inspector-button inline" type="button" ${buildInspectAttributes({ kind: 'session', key: sourceSessionId })}>
+                                Open source session ${escapeHtml(sourceSessionId.slice(0, 8))}...
+                            </button>
+                        ` : ''}
+                        ${isInspectablePath(primaryPath) ? `
+                            <button class="inspector-button inline" type="button" ${buildInspectAttributes({ kind: 'path', key: primaryPath })}>
+                                Inspect primary path ${escapeHtml(primaryPath)}
+                            </button>
+                        ` : ''}
+                    </div>
+                    <div class="incident-metrics">
+                        ${renderInspectorStats(metrics)}
+                    </div>
+                    </div>
+
+                ${incident.notes && incident.notes.length ? `
+                    <div class="inspector-section">
+                        <div class="inspector-section-title">Notes</div>
+                        <div class="inspector-code">${escapeHtml(incident.notes.join(' '))}</div>
+                    </div>
+                ` : ''}
+
+                <div class="inspector-section">
+                    <div class="inspector-section-title">Blast Radius</div>
+                    ${renderAffectedPathItems(affectedPaths)}
+                </div>
+
+                <div class="inspector-section">
+                    <div class="inspector-section-title">Involved Sessions</div>
+                    ${renderIncidentSessionItems(impactedSessions)}
+                </div>
+
+                <div class="inspector-section">
+                    <div class="inspector-section-title">Watch Firings</div>
+                    ${watchFirings.length ? renderWatchFireItems(watchFirings) : '<div class="inspector-code">No watches fired for this incident.</div>'}
+                </div>
+
+                ${causalChain.length ? `
+                    <div class="inspector-section">
+                        <div class="inspector-section-title">Causal Chain</div>
+                        ${renderOperationIncidentList(causalChain, 'No causal chain captured.')}
+                    </div>
+                ` : ''}
+
+                ${relatedOperations.length ? `
+                    <div class="inspector-section">
+                        <div class="inspector-section-title">Related Operations</div>
+                        ${renderOperationIncidentList(relatedOperations, 'No related operations captured.')}
+                    </div>
+                ` : ''}
             `;
         }
 
@@ -1932,7 +2597,7 @@
                         <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 12h6m-6 4h6M7 4h10a2 2 0 012 2v12a2 2 0 01-2 2H7a2 2 0 01-2-2V6a2 2 0 012-2z"/>
                         </svg>
-                        <span>Select a session card or path to inspect details.</span>
+                        <span>Select a session card, path, or operation to inspect details.</span>
                     </div>
                 `;
                 return;
@@ -1950,13 +2615,18 @@
                 return;
             }
 
-            count.textContent = selectedInspector.kind;
+            count.textContent = selectedInspector.kind === 'operation' ? 'incident' : selectedInspector.kind;
             if (selectedInspector.kind === 'session') {
                 container.innerHTML = renderSessionInspector(selectedInspector.data);
                 return;
             }
 
-            container.innerHTML = renderPathInspector(selectedInspector.data);
+            if (selectedInspector.kind === 'path') {
+                container.innerHTML = renderPathInspector(selectedInspector.data);
+                return;
+            }
+
+            container.innerHTML = renderOperationInspector(selectedInspector.data);
         }
 
         function setStreamStatus(kind, connected) {

@@ -326,6 +326,67 @@ class PathDetailResponse(BaseModel):
     recent_operations: List[OperationResponse] = Field(default_factory=list)
 
 
+class IncidentPathResponse(BaseModel):
+    path: str
+    change_kind: str = "change"
+    summary: str = ""
+    state: str
+    session_id: Optional[str] = None
+    node_type: Optional[str] = None
+    holder: Optional[str] = None
+    data_preview: str = ""
+    modified_at: Optional[float] = None
+    version_before: Optional[int] = None
+    version_after: Optional[int] = None
+    before: Optional[Dict[str, Any]] = None
+    after: Optional[Dict[str, Any]] = None
+    note: str = ""
+    cause_kind: Optional[str] = None
+    deleted_in_operation: bool = False
+    delete_sequence_number: Optional[int] = None
+
+
+class IncidentSessionResponse(SessionSummaryResponse):
+    roles: List[str] = Field(default_factory=list)
+
+
+class IncidentStatsResponse(BaseModel):
+    affected_paths: int
+    displayed_paths: int
+    watch_fires: int
+    impacted_sessions: int
+    cascade_operations: int
+
+
+class IncidentBlastRadiusResponse(BaseModel):
+    affected_paths: int
+    watches_fired: int
+    related_operations: int
+    sessions_touched: int
+
+
+class OperationIncidentResponse(BaseModel):
+    sequence_number: int
+    incident_kind: str
+    summary: str
+    subtitle: str
+    operation: OperationResponse
+    source_session: Optional[IncidentSessionResponse] = None
+    primary_path: str = ""
+    blast_radius: IncidentBlastRadiusResponse
+    cause_operation: Optional[OperationResponse] = None
+    cascade_operations: List[OperationResponse] = Field(default_factory=list)
+    related_operations: List[OperationResponse] = Field(default_factory=list)
+    causal_chain: List[OperationResponse] = Field(default_factory=list)
+    affected_path_count: int
+    affected_paths: List[IncidentPathResponse] = Field(default_factory=list)
+    impacted_sessions: List[IncidentSessionResponse] = Field(default_factory=list)
+    watch_fires: List[WatchFireResponse] = Field(default_factory=list)
+    watch_firings: List[WatchFireResponse] = Field(default_factory=list)
+    notes: List[str] = Field(default_factory=list)
+    stats: IncidentStatsResponse
+
+
 class ErrorResponse(BaseModel):
     error: str
     detail: str
@@ -834,6 +895,147 @@ async def get_operation(sequence_number: int) -> OperationResponse:
     if operation is None:
         raise HTTPException(status_code=404, detail=f"Operation not found: {sequence_number}")
     return _serialize_operation(operation)
+
+
+@app.get("/api/operations/{sequence_number}/incident", response_model=OperationIncidentResponse)
+async def get_operation_incident(
+    sequence_number: int,
+    path_limit: int = Query(default=12, ge=1, le=100),
+    watch_limit: int = Query(default=50, ge=1, le=200),
+) -> OperationIncidentResponse:
+    """Return an operation-centric incident report with blast radius."""
+    incident = coordinator.get_operation_incident(
+        sequence_number=sequence_number,
+        path_limit=path_limit,
+        watch_limit=watch_limit,
+    )
+    if incident is None:
+        raise HTTPException(status_code=404, detail=f"Operation not found: {sequence_number}")
+
+    raw_source_session = incident.get("source_session")
+    impacted_sessions_by_id: Dict[str, Dict[str, Any]] = {}
+    if raw_source_session and raw_source_session.get("session_id"):
+        impacted_sessions_by_id[raw_source_session["session_id"]] = {
+            **raw_source_session,
+            "roles": ["actor", *raw_source_session.get("roles", [])],
+        }
+    elif incident["operation"].session_id:
+        impacted_sessions_by_id[incident["operation"].session_id] = {
+            "session_id": incident["operation"].session_id,
+            "is_alive": False,
+            "timeout_seconds": 0,
+            "remaining_seconds": 0,
+            "ephemeral_node_count": 0,
+            "watch_count": 0,
+            "created_at": 0,
+            "last_heartbeat": 0,
+            "roles": ["actor"],
+        }
+
+    for session in incident.get("impacted_sessions", []):
+        session_id = session.get("session_id")
+        if not session_id:
+            continue
+        roles = list(session.get("roles", []))
+        if session_id in impacted_sessions_by_id:
+            merged_roles = [*impacted_sessions_by_id[session_id].get("roles", []), *roles]
+            impacted_sessions_by_id[session_id] = {
+                **impacted_sessions_by_id[session_id],
+                **session,
+                "roles": list(dict.fromkeys(merged_roles)),
+            }
+            continue
+        impacted_sessions_by_id[session_id] = {
+            **session,
+            "roles": roles or ["watcher"],
+        }
+
+    impacted_sessions = [
+        IncidentSessionResponse(**session)
+        for session in impacted_sessions_by_id.values()
+    ]
+    source_session = next(
+        (session for session in impacted_sessions if "actor" in session.roles),
+        None,
+    )
+    cause_operation = incident.get("cause_operation")
+    cascade_operations = [_serialize_operation(operation) for operation in incident.get("cascade_operations", [])]
+    related_operations = [
+        _serialize_operation(operation)
+        for operation in incident.get("related_operations", incident.get("cascade_operations", []))
+    ]
+    causal_chain = [
+        _serialize_operation(operation)
+        for operation in incident.get("causal_chain", [cause_operation, incident["operation"], *incident.get("cascade_operations", [])])
+        if operation is not None
+    ]
+    primary_path = ""
+    if incident.get("primary_path"):
+        primary_path = incident["primary_path"]
+    elif incident.get("affected_paths"):
+        primary_path = incident["affected_paths"][0]["path"]
+    elif incident["operation"].path:
+        primary_path = incident["operation"].path
+
+    operation_response = _serialize_operation(incident["operation"])
+    incident_kind = incident["incident_kind"]
+    summary = incident.get("summary") or {
+        "session_cleanup": f"Session cleanup incident for {primary_path or operation_response.session_id or '(session)'}",
+        "session_timeout_cleanup": f"Session timeout cleanup for {primary_path or operation_response.session_id or '(session)'}",
+        "recursive_delete": f"Recursive delete across {incident.get('affected_path_count', 0)} path(s)",
+        "delete": operation_response.summary,
+        "create": operation_response.summary,
+        "update": operation_response.summary,
+        "session_close": operation_response.summary,
+        "session_timeout": operation_response.summary,
+    }.get(incident_kind, operation_response.summary)
+    subtitle = incident.get("subtitle") or "Committed operation incident"
+    blast_radius = incident.get("blast_radius") or {}
+    related_operation_count = len(related_operations) or (len(cascade_operations) + (1 if cause_operation is not None else 0))
+    notes = [note for note in incident.get("notes", []) if note]
+    if incident.get("affected_path_count", 0) > len(incident.get("affected_paths", [])):
+        notes.append(f"Showing first {path_limit} affected path(s).")
+
+    return OperationIncidentResponse(
+        sequence_number=incident["sequence_number"],
+        incident_kind=incident_kind,
+        summary=summary,
+        subtitle=subtitle,
+        operation=operation_response,
+        source_session=source_session,
+        primary_path=primary_path,
+        blast_radius=IncidentBlastRadiusResponse(
+            affected_paths=blast_radius.get("affected_paths", incident.get("affected_path_count", 0)),
+            watches_fired=blast_radius.get("watches_fired", len(incident.get("watch_fires", []))),
+            related_operations=blast_radius.get("related_operations", related_operation_count),
+            sessions_touched=blast_radius.get("sessions_touched", len(impacted_sessions)),
+        ),
+        cause_operation=_serialize_operation(cause_operation) if cause_operation else None,
+        cascade_operations=cascade_operations,
+        related_operations=related_operations,
+        causal_chain=causal_chain,
+        affected_path_count=incident.get("affected_path_count", 0),
+        affected_paths=[IncidentPathResponse(**path) for path in incident.get("affected_paths", [])],
+        impacted_sessions=impacted_sessions,
+        watch_fires=[WatchFireResponse(**record) for record in incident.get("watch_fires", [])],
+        watch_firings=[WatchFireResponse(**record) for record in incident.get("watch_fires", [])],
+        notes=notes,
+        stats=IncidentStatsResponse(**incident.get("stats", {})),
+    )
+
+
+@app.get("/api/operation/detail", response_model=OperationIncidentResponse)
+async def get_operation_incident_legacy(
+    sequence_number: int = Query(..., ge=1),
+    path_limit: int = Query(default=12, ge=1, le=100),
+    watch_limit: int = Query(default=50, ge=1, le=200),
+) -> OperationIncidentResponse:
+    """Legacy alias for operation incident detail used by the visualizer."""
+    return await get_operation_incident(
+        sequence_number=sequence_number,
+        path_limit=path_limit,
+        watch_limit=watch_limit,
+    )
 
 
 @app.get("/api/recovery/last")
