@@ -16,7 +16,7 @@ Responsibilities:
 import json
 import threading
 import time
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from datetime import datetime
 
 from models import (
@@ -75,6 +75,9 @@ class Coordinator:
         self._lease_waiters: Dict[str, List[str]] = {}
         self._lease_reaper_running = False
         self._lease_reaper_thread: Optional[threading.Thread] = None
+        self._read_only = False
+        self._read_only_reason = ""
+        self._write_guard: Optional[Callable[[], None]] = None
         
         # Initialize components
         self._persistence = Persistence(db_path)
@@ -146,6 +149,65 @@ class Coordinator:
             self._started = False
             
             logger.info("Coordinator stopped")
+
+    def set_read_only(self, read_only: bool, reason: str = "") -> None:
+        """Toggle read-only mode for follower replicas."""
+        with self._lock:
+            self._read_only = read_only
+            self._read_only_reason = reason or ""
+
+    def set_write_guard(self, guard: Optional[Callable[[], None]]) -> None:
+        """Install an optional guard that can reject client writes."""
+        with self._lock:
+            self._write_guard = guard
+
+    def get_read_only_status(self) -> Dict[str, Any]:
+        """Return current read-only status metadata."""
+        with self._lock:
+            return {
+                "read_only": self._read_only,
+                "reason": self._read_only_reason,
+            }
+
+    def add_commit_callback(self, callback: Callable[[Operation], None]) -> None:
+        """Register a callback for committed operations."""
+        self._operation_log.add_commit_callback(callback)
+
+    def remove_commit_callback(self, callback: Callable[[Operation], None]) -> None:
+        """Remove a previously registered commit callback."""
+        self._operation_log.remove_commit_callback(callback)
+
+    def disable_local_maintenance(self) -> None:
+        """Stop local expiry/TTL threads so follower replicas mirror the leader only."""
+        with self._lock:
+            self._session_manager.stop()
+            self._lease_reaper_running = False
+            if self._lease_reaper_thread:
+                self._lease_reaper_thread.join(timeout=2.0)
+                self._lease_reaper_thread = None
+
+    def enable_local_maintenance(self) -> None:
+        """Ensure local expiry/TTL threads are active on writable nodes."""
+        with self._lock:
+            self._session_manager.start()
+            if self._lease_reaper_thread is None:
+                self._lease_reaper_running = True
+                self._lease_reaper_thread = threading.Thread(
+                    target=self._lease_reaper_loop,
+                    daemon=True,
+                    name="lease-expiry-checker",
+                )
+                self._lease_reaper_thread.start()
+
+    def _assert_writable(self) -> None:
+        """Reject client writes when this coordinator is acting as a follower."""
+        if self._read_only:
+            raise ForbiddenError(
+                self._read_only_reason or "This node is read-only",
+                error="read_only_replica",
+            )
+        if self._write_guard is not None:
+            self._write_guard()
     
     # ========== Session Operations ==========
     
@@ -160,11 +222,13 @@ class Coordinator:
             The created Session
         """
         with self._lock:
+            self._assert_writable()
             session = self._session_manager.open_session(timeout_seconds)
             operation = self._operation_log.append(
                 operation_type=OperationType.SESSION_OPEN,
                 session_id=session.session_id,
             )
+            operation.data = self._encode_session_operation_payload(session)
             try:
                 self._persistence.atomic_save_session(session, operation)
             except Exception:
@@ -193,6 +257,7 @@ class Coordinator:
             ValueError: If session is dead
         """
         with self._lock:
+            self._assert_writable()
             existing = self._session_manager.get_session(session_id)
             if existing is None:
                 raise KeyError(f"Session does not exist: {session_id}")
@@ -203,6 +268,7 @@ class Coordinator:
                 operation_type=OperationType.SESSION_HEARTBEAT,
                 session_id=session_id,
             )
+            operation.data = self._encode_session_operation_payload(session)
             try:
                 self._persistence.atomic_save_session(session, operation)
             except Exception:
@@ -224,6 +290,7 @@ class Coordinator:
             The closed Session, or None if not found
         """
         with self._lock:
+            self._assert_writable()
             return self._session_manager.close_session(session_id)
 
     def get_sessions(self, alive_only: bool = False) -> List[Dict[str, Any]]:
@@ -709,7 +776,10 @@ class Coordinator:
             session_close_operation = self._operation_log.append(
                 operation_type=OperationType.SESSION_CLOSE,
                 session_id=session.session_id,
-                data=self._encode_session_close_payload(reason),
+            )
+            session_close_operation.data = self._encode_session_operation_payload(
+                persisted_session,
+                reason=reason,
             )
 
             if deleted_paths:
@@ -816,6 +886,7 @@ class Coordinator:
         session_id: Optional[str] = None,
     ) -> Tuple[Node, Operation]:
         """Internal create helper that returns the committed operation."""
+        self._assert_writable()
         # Determine node type
         node_type = NodeType.PERSISTENT if persistent else NodeType.EPHEMERAL
         
@@ -1058,24 +1129,48 @@ class Coordinator:
                 return item
         return None
 
-    def _encode_session_close_payload(self, reason: str) -> bytes:
-        """Encode the durable breadcrumb for a session close/timeout."""
-        return json.dumps({"reason": reason}, sort_keys=True).encode("utf-8")
+    def _encode_session_operation_payload(
+        self,
+        session: Session,
+        reason: Optional[str] = None,
+    ) -> bytes:
+        """Encode a committed session snapshot for replication and postmortems."""
+        payload: Dict[str, Any] = {"session": session.to_dict()}
+        if reason:
+            payload["reason"] = reason
+        return json.dumps(payload, sort_keys=True).encode("utf-8")
 
-    def _decode_session_close_reason(self, operation: Optional[Operation]) -> Optional[str]:
-        """Decode the close/timeout reason from a session-close operation."""
+    def _decode_session_operation_payload(
+        self,
+        operation: Optional[Operation],
+    ) -> Tuple[Optional[Session], Optional[str]]:
+        """Decode an optional session snapshot and close reason from an operation."""
         if operation is None or not operation.data:
-            return None
+            return None, None
 
         try:
             payload = json.loads(operation.data.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
-            return None
+            return None, None
 
         if not isinstance(payload, dict):
-            return None
+            return None, None
+
+        session_payload = payload.get("session")
+        session = None
+        if isinstance(session_payload, dict):
+            try:
+                session = Session.from_dict(session_payload)
+            except Exception:
+                session = None
+
         reason = payload.get("reason")
-        return str(reason) if reason else None
+        return session, str(reason) if reason else None
+
+    def _decode_session_close_reason(self, operation: Optional[Operation]) -> Optional[str]:
+        """Decode the close/timeout reason from a session-close operation."""
+        _, reason = self._decode_session_operation_payload(operation)
+        return reason
 
     def _find_session_cleanup_delete_operation_locked(
         self,
@@ -1724,6 +1819,19 @@ class Coordinator:
                     self._ensure_parent_paths(normalized_path)
                 
                 existing = self._metadata_tree.get(normalized_path)
+                waiters = self._get_lease_waiters_locked(normalized_path)
+                if existing is None and waiters and waiters[0] != session_id:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        self._dequeue_lease_waiter_locked(normalized_path, session_id)
+                        raise ConflictError(
+                            f"Lease already held: {normalized_path}",
+                            error="lease_conflict",
+                            path=normalized_path,
+                        )
+                    self._lease_wait_condition.wait(timeout=remaining)
+                    continue
+
                 if existing is None:
                     self._dequeue_lease_waiter_locked(normalized_path, session_id)
                     node, operation = self._create_node(
@@ -1848,6 +1956,153 @@ class Coordinator:
                 f"Lease renewed: {normalized_path} (session={session_id}, ttl={lease_ttl_seconds}s)"
             )
             return self._lease_info_from_node(updated_node)
+
+    def apply_replicated_operations(self, operations: List[Operation]) -> int:
+        """Apply an ordered batch of committed operations from a leader."""
+        applied = 0
+        for operation in operations:
+            if self.apply_replicated_operation(operation):
+                applied += 1
+        return applied
+
+    def apply_replicated_operation(self, operation: Operation) -> bool:
+        """
+        Apply one externally committed operation without allocating a new sequence.
+
+        Returns True when applied, False when already present locally.
+        """
+        with self._lock:
+            if self._operation_log.get_operation(operation.sequence_number) is not None:
+                return False
+
+            next_sequence = self._operation_log.current_sequence + 1
+            if operation.sequence_number != next_sequence:
+                raise ValueError(
+                    f"Replicated operation sequence gap: expected {next_sequence}, "
+                    f"got {operation.sequence_number}"
+                )
+
+            if operation.operation_type == OperationType.SESSION_OPEN:
+                session, _ = self._decode_session_operation_payload(operation)
+                if session is None:
+                    raise ValueError("SESSION_OPEN replication requires session payload")
+                self._persistence.atomic_save_session(session, operation)
+                self._session_manager.replace_session(session)
+                self._operation_log.append_external_committed(operation)
+                self._mark_session_inventory_changed()
+                return True
+
+            if operation.operation_type == OperationType.SESSION_HEARTBEAT:
+                session, _ = self._decode_session_operation_payload(operation)
+                if session is None:
+                    raise ValueError("SESSION_HEARTBEAT replication requires session payload")
+                self._persistence.atomic_save_session(session, operation)
+                self._session_manager.replace_session(session)
+                self._operation_log.append_external_committed(operation)
+                self._mark_session_inventory_changed()
+                return True
+
+            if operation.operation_type == OperationType.SESSION_CLOSE:
+                session, _ = self._decode_session_operation_payload(operation)
+                if session is None:
+                    raise ValueError("SESSION_CLOSE replication requires session payload")
+                self._persistence.atomic_save_session(session, operation)
+                self._session_manager.replace_session(session)
+                self._operation_log.append_external_committed(operation)
+                self._mark_session_inventory_changed()
+                return True
+
+            if operation.operation_type == OperationType.CREATE:
+                node_type = operation.node_type or NodeType.PERSISTENT
+                node = Node(
+                    path=operation.path,
+                    data=operation.data,
+                    version=1,
+                    node_type=node_type,
+                    session_id=operation.session_id,
+                    created_at=operation.timestamp,
+                    modified_at=operation.timestamp,
+                )
+                persisted_session = None
+                if node_type == NodeType.EPHEMERAL and operation.session_id:
+                    live_session = self._session_manager.get_session(operation.session_id)
+                    if live_session is None:
+                        raise KeyError(
+                            f"Replica cannot apply ephemeral create without session: "
+                            f"{operation.session_id}"
+                        )
+                    persisted_session = self._clone_session(live_session)
+                    persisted_session.ephemeral_nodes.add(node.path)
+
+                self._persistence.atomic_create_node(
+                    node,
+                    operation,
+                    persisted_session,
+                    watch_fires=None,
+                )
+                committed_node = self._metadata_tree.commit_create(node)
+                if node_type == NodeType.EPHEMERAL and operation.session_id:
+                    self._session_manager.add_ephemeral_node(operation.session_id, committed_node.path)
+                    self._mark_session_inventory_changed()
+                self._operation_log.append_external_committed(operation)
+                self._watch_manager.trigger(
+                    path=committed_node.path,
+                    event_type=EventType.CREATE,
+                    data=committed_node.data,
+                    sequence_number=operation.sequence_number,
+                )
+                return True
+
+            if operation.operation_type == OperationType.SET:
+                current = self._metadata_tree.get(operation.path)
+                if current is None:
+                    raise KeyError(f"Replica cannot apply SET for missing node: {operation.path}")
+                updated = Node(
+                    path=current.path,
+                    data=operation.data,
+                    version=current.version + 1,
+                    node_type=current.node_type,
+                    session_id=current.session_id,
+                    created_at=current.created_at,
+                    modified_at=operation.timestamp,
+                )
+                self._persistence.atomic_update_node(updated, operation, watch_fires=None)
+                self._metadata_tree.commit_set(updated)
+                self._operation_log.append_external_committed(operation)
+                self._watch_manager.trigger(
+                    path=updated.path,
+                    event_type=EventType.UPDATE,
+                    data=updated.data,
+                    sequence_number=operation.sequence_number,
+                )
+                return True
+
+            if operation.operation_type == OperationType.DELETE:
+                deleted_paths = self._decode_delete_paths(operation)
+                session_updates = self._build_session_updates_for_deleted_paths(deleted_paths)
+                self._persistence.atomic_delete_node(
+                    deleted_paths,
+                    operation,
+                    sessions=[snapshot for _, snapshot in session_updates.values()],
+                    watch_fires=None,
+                )
+                self._metadata_tree.apply_delete_paths(deleted_paths)
+                for live_session, snapshot in session_updates.values():
+                    live_session.ephemeral_nodes.clear()
+                    live_session.ephemeral_nodes.update(snapshot.ephemeral_nodes)
+                if session_updates:
+                    self._mark_session_inventory_changed()
+                self._operation_log.append_external_committed(operation)
+                for deleted_path in deleted_paths:
+                    self._watch_manager.trigger(
+                        path=deleted_path,
+                        event_type=EventType.DELETE,
+                        sequence_number=operation.sequence_number,
+                    )
+                self._notify_lease_waiters_locked()
+                return True
+
+            raise ValueError(f"Unsupported replicated operation: {operation.operation_type.value}")
     
     def get(self, path: str) -> Optional[Node]:
         """
@@ -1883,6 +2138,7 @@ class Coordinator:
             KeyError: If node doesn't exist
         """
         with self._lock:
+            self._assert_writable()
             # Convert data to bytes if needed
             if isinstance(data, str):
                 data = data.encode("utf-8")
@@ -1946,6 +2202,7 @@ class Coordinator:
             ValueError: If trying to delete root
         """
         with self._lock:
+            self._assert_writable()
             # Get node info before deletion
             node = self._metadata_tree.get(path)
             if node is None:

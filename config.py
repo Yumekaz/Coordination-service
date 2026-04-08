@@ -18,6 +18,7 @@ MAX_SESSION_TIMEOUT = 300  # maximum allowed timeout
 # Watch configuration
 WATCH_WAIT_TIMEOUT = 30  # default timeout for watch wait
 MAX_WATCHES_PER_SESSION = 1000  # prevent resource exhaustion
+WATCH_EVENT_HISTORY_LIMIT = 1000  # bounded in-memory fired-watch history for postmortems
 
 # Server configuration
 HOST = os.environ.get("COORD_HOST", "0.0.0.0")

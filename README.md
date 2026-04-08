@@ -1,8 +1,8 @@
 # Coordination Service
 
-A single-node coordination engine for hierarchical metadata, session-backed leases, one-shot watches, committed operation history, and crash recovery.
+A coordination engine for hierarchical metadata, session-backed leases, one-shot watches, committed operation history, crash recovery, and leader/follower replication groundwork with quorum-aware health gating.
 
-`259 tests passing` | `Python + FastAPI + SQLite`
+`260 tests passing` | `Python + FastAPI + SQLite`
 
 ## What It Does
 
@@ -15,6 +15,10 @@ A single-node coordination engine for hierarchical metadata, session-backed leas
 - Operation-centric incident reports with blast radius and causality
 - Startup recovery report plus WAL-backed replay
 - Rollback-safe metadata and session persistence paths
+- Read-only follower catch-up from committed leader history
+- Cluster status with role, peer health, and replication lag
+- Leader push replication for lower follower lag
+- Optional write-quorum health gating on leaders
 
 ## Current Product Surface
 
@@ -53,6 +57,12 @@ A single-node coordination engine for hierarchical metadata, session-backed leas
 - `GET /api/stream/operations`
 - `GET /api/recovery/last`
 
+### Cluster
+- `GET /api/cluster/status`
+- `GET /internal/replication/operations`
+- `GET /internal/replication/state`
+- `POST /internal/replication/apply`
+
 ### Visualizer
 - `GET /`
 - Live node tree
@@ -67,6 +77,7 @@ A single-node coordination engine for hierarchical metadata, session-backed leas
 ```text
 HTTP API
   -> Coordinator
+      -> ClusterManager
       -> MetadataTree
       -> SessionManager
       -> WatchManager
@@ -91,6 +102,10 @@ Leases are implemented on top of ephemeral ownership. `lease_token` is derived f
 - Watch registration supports `event_types`, so watchers do not fire on unrelated changes.
 - Metadata writes and session mutations roll back cleanly if persistence fails.
 - Session expiry cleanup is rollback-safe.
+- Follower replicas catch up from the leader's committed operation history and can accept pushed replication batches from the leader.
+- Leaders can push committed operations directly to followers to reduce lag.
+- Leaders can optionally reject writes when a quorum of peers is not healthy.
+- Follower replicas are read-only and report replication lag through `/api/cluster/status`.
 - `/api/operations` returns committed operations in sequence order.
 - `/api/operations/tail` blocks until a matching committed operation arrives or times out.
 - `/api/stream/operations` streams committed operations as SSE.
@@ -125,7 +140,7 @@ The API listens on the host and port defined in `config.py`.
 .venv\Scripts\python.exe -m pytest -q
 ```
 
-Latest verified local run: `259 passed in 327.64s`.
+Latest verified local run: `260 passed in 344.64s`.
 
 ## Demos
 
@@ -149,8 +164,10 @@ The `demos/` folder still covers the core scenarios:
 
 ## Honest Limits
 
-- This is still a single-node service.
-- Recovery is stronger than before, but it is still SQLite plus a custom WAL, not distributed consensus.
+- This is not distributed consensus. Replication has quorum-aware health gating, not quorum commit.
+- There is no automatic leader election or failover yet.
+- Follower replicas mirror committed state, but follower watch-fire and incident parity is still partial.
+- Recovery is stronger than before, but it is still SQLite plus a custom WAL underneath.
 - This is not a drop-in ZooKeeper replacement.
 
 ## Roadmap
@@ -161,7 +178,7 @@ If we keep pushing this as a product, the next high-value steps are:
 2. More crash-injection tooling around persistence and recovery boundaries.
 3. Timeline filtering and exportable postmortem snapshots.
 4. More end-to-end examples that show why this is a coordination engine, not a generic key-value store.
-5. Multi-node replication if this ever graduates from single-node serious prototype to system product.
+5. Quorum commits, leader election, and real failover if this graduates into a true distributed system.
 
 ## Project Layout
 

@@ -16,6 +16,7 @@ import inspect
 import json
 import threading
 import time
+from urllib import parse
 from fastapi.testclient import TestClient
 
 # Setup test database path before importing main
@@ -26,6 +27,8 @@ os.environ["COORD_DB_PATH"] = _test_db
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from coordinator import Coordinator
+from cluster import ClusterManager
+from errors import ConflictError
 import main
 
 
@@ -94,7 +97,9 @@ def client():
     # Inject into main module BEFORE creating TestClient
     # This prevents the lifespan from creating its own coordinator
     old_coordinator = main.coordinator
+    old_cluster_manager = main.cluster_manager
     main.coordinator = coord
+    main.cluster_manager = None
     
     try:
         with TestClient(main.app) as test_client:
@@ -102,6 +107,7 @@ def client():
     finally:
         # Cleanup
         main.coordinator = old_coordinator
+        main.cluster_manager = old_cluster_manager
         coord.stop()
         
         try:
@@ -671,6 +677,190 @@ class TestLeaseEndpoints:
         session_detail = client.get("/api/session/detail", params={"session_id": session_id})
         assert session_detail.status_code == 200
         assert session_detail.json()["is_alive"] is True
+
+
+class TestClusterEndpoints:
+    """Tests for cluster visibility and follower catch-up."""
+
+    def test_cluster_status_reports_standalone_defaults(self, client):
+        response = client.get("/api/cluster/status")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["role"] == "standalone"
+        assert data["read_only"] is False
+        assert data["peer_count"] == 0
+        assert data["healthy_peer_count"] == 0
+        assert data["replication_enabled"] is False
+        assert data["write_quorum_ready"] is True
+        assert data["require_write_quorum"] is False
+
+    def test_follower_catches_up_from_committed_history(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as leader_db, tempfile.NamedTemporaryFile(suffix=".db", delete=False) as follower_db:
+            leader_path = leader_db.name
+            follower_path = follower_db.name
+
+        leader = Coordinator(db_path=leader_path)
+        follower = Coordinator(db_path=follower_path)
+        leader.start()
+        follower.start()
+
+        leader_cluster = ClusterManager(leader, node_id="leader-a", role="leader")
+
+        def fake_request_json(url: str, method: str, payload: dict | None):
+            parsed = parse.urlparse(url)
+            if parsed.path == "/internal/replication/operations":
+                query = parse.parse_qs(parsed.query)
+                since_sequence = int(query.get("since_sequence", ["0"])[0])
+                limit = int(query.get("limit", ["128"])[0])
+                return leader_cluster.export_operations(since_sequence=since_sequence, limit=limit)
+            if parsed.path == "/internal/replication/state":
+                return leader_cluster.get_internal_state()
+            raise AssertionError(f"Unexpected replication URL: {url}")
+
+        follower_cluster = ClusterManager(
+            follower,
+            node_id="follower-b",
+            role="follower",
+            leader_url="http://leader.test",
+            request_json=fake_request_json,
+        )
+
+        try:
+            session = leader.open_session(30)
+            leader.create("/cluster", b"root", persistent=True)
+            leader.create("/cluster/lease", b"holder", persistent=False, session_id=session.session_id)
+            leader.set("/cluster", b"mutated")
+            leader.close_session(session.session_id)
+
+            applied = follower_cluster.catch_up_once()
+            while applied:
+                applied = follower_cluster.catch_up_once()
+
+            node = follower.get("/cluster")
+            assert node is not None
+            assert node.data == b"mutated"
+            assert follower.get("/cluster/lease") is None
+
+            replicated_session = follower.get_session_detail(session.session_id)
+            assert replicated_session is not None
+            assert replicated_session["is_alive"] is False
+
+            status = follower_cluster.build_status()
+            assert status["role"] == "follower"
+            assert status["read_only"] is True
+            assert status["leader_id"] == "leader-a"
+            assert status["last_applied"] == leader.get_stats()["last_sequence"]
+
+        finally:
+            leader_cluster.stop()
+            follower_cluster.stop()
+            leader.stop()
+            follower.stop()
+            for db_path in (leader_path, follower_path):
+                try:
+                    os.unlink(db_path)
+                except OSError:
+                    pass
+
+    def test_leader_push_replication_updates_follower_without_polling(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as leader_db, tempfile.NamedTemporaryFile(suffix=".db", delete=False) as follower_db:
+            leader_path = leader_db.name
+            follower_path = follower_db.name
+
+        leader = Coordinator(db_path=leader_path)
+        follower = Coordinator(db_path=follower_path)
+        leader.start()
+        follower.start()
+
+        follower_cluster = ClusterManager(
+            follower,
+            node_id="follower-b",
+            role="follower",
+            leader_url="http://leader.test",
+        )
+
+        def fake_request_json(url: str, method: str, payload: dict | None):
+            parsed = parse.urlparse(url)
+            if parsed.path == "/internal/replication/apply":
+                return follower_cluster.apply_replication_batch(
+                    source_node_id=(payload or {}).get("source_node_id"),
+                    operations_payload=(payload or {}).get("operations", []),
+                )
+            if parsed.path == "/internal/replication/state":
+                return follower_cluster.get_internal_state()
+            raise AssertionError(f"Unexpected replication URL: {url}")
+
+        leader_cluster = ClusterManager(
+            leader,
+            node_id="leader-a",
+            role="leader",
+            peer_urls=["http://follower.test"],
+            request_json=fake_request_json,
+        )
+        leader_cluster.start()
+
+        try:
+            session = leader.open_session(30)
+            leader.create("/push", b"root", persistent=True)
+            leader.create("/push/lease", b"holder", persistent=False, session_id=session.session_id)
+            leader.set("/push", b"after-push")
+
+            follower_node = follower.get("/push")
+            assert follower_node is not None
+            assert follower_node.data == b"after-push"
+            follower_lease = follower.get("/push/lease")
+            assert follower_lease is not None
+
+            status = leader_cluster.build_status()
+            assert status["healthy_peer_count"] == 1
+            assert status["max_replication_lag"] == 0
+            assert any(event["status"] == "acked" for event in status["recent_apply"])
+        finally:
+            leader_cluster.stop()
+            follower_cluster.stop()
+            leader.stop()
+            follower.stop()
+            for db_path in (leader_path, follower_path):
+                try:
+                    os.unlink(db_path)
+                except OSError:
+                    pass
+
+    def test_leader_rejects_writes_when_write_quorum_is_unavailable(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as leader_db:
+            leader_path = leader_db.name
+
+        leader = Coordinator(db_path=leader_path)
+        leader.start()
+
+        def failing_request_json(url: str, method: str, payload: dict | None):
+            raise RuntimeError("peer unreachable")
+
+        leader_cluster = ClusterManager(
+            leader,
+            node_id="leader-a",
+            role="leader",
+            peer_urls=["http://peer-a"],
+            require_write_quorum=True,
+            request_json=failing_request_json,
+        )
+        leader_cluster.start()
+
+        try:
+            with pytest.raises(ConflictError):
+                leader.open_session(30)
+
+            status = leader_cluster.build_status()
+            assert status["require_write_quorum"] is True
+            assert status["write_quorum_ready"] is False
+            assert status["healthy_peer_count"] == 0
+        finally:
+            leader_cluster.stop()
+            leader.stop()
+            try:
+                os.unlink(leader_path)
+            except OSError:
+                pass
 
 
 class TestHealthEndpoint:

@@ -22,6 +22,7 @@ import uvicorn
 import os
 import json
 
+from cluster import ClusterManager, REPLICATION_TOKEN_HEADER
 from coordinator import Coordinator
 from models import EventType, NodeType, Operation, OperationType
 from logger import get_logger
@@ -32,12 +33,13 @@ logger = get_logger("api")
 
 # Global coordinator instance
 coordinator: Optional[Coordinator] = None
+cluster_manager: Optional[ClusterManager] = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager - handles startup and shutdown."""
-    global coordinator
+    global coordinator, cluster_manager
     
     # Startup - only create if not already set (allows testing with custom coordinator)
     if coordinator is None:
@@ -47,11 +49,18 @@ async def lifespan(app: FastAPI):
         logger.info(f"Recovery complete: {recovery_stats}")
     else:
         logger.info("Using pre-configured coordinator")
+
+    if cluster_manager is None and coordinator is not None:
+        cluster_manager = ClusterManager.from_env(coordinator)
+        cluster_manager.start()
     
     yield
     
     # Shutdown
     logger.info("Stopping Coordination Service...")
+    if cluster_manager:
+        cluster_manager.stop()
+        cluster_manager = None
     if coordinator:
         coordinator.stop()
     logger.info("Coordination Service stopped")
@@ -296,6 +305,55 @@ class LeaseDetailResponse(BaseModel):
     recent_operations: List[OperationResponse] = Field(default_factory=list)
 
 
+class ClusterPeerResponse(BaseModel):
+    peer_url: str
+    peer_id: Optional[str] = None
+    role: str
+    reachable: bool
+    healthy: bool
+    last_applied: int = 0
+    replication_lag: Optional[int] = None
+    last_ack_at: Optional[float] = None
+    last_error: Optional[str] = None
+
+
+class ClusterApplyEventResponse(BaseModel):
+    sequence_number: int
+    peer_id: str
+    status: str
+    applied_at: float
+    latency_ms: int
+    applied_count: int = 1
+
+
+class ClusterStatusResponse(BaseModel):
+    node_id: str
+    role: str
+    leader_id: Optional[str] = None
+    leader_url: Optional[str] = None
+    commit_index: int
+    last_applied: int
+    quorum_size: int
+    read_only: bool
+    read_only_reason: str = ""
+    replication_enabled: bool
+    peer_count: int
+    healthy_peer_count: int
+    max_replication_lag: int
+    write_quorum_ready: bool
+    require_write_quorum: bool
+    push_commit_replication: bool
+    last_sync_at: Optional[float] = None
+    last_error: Optional[str] = None
+    peers: List[ClusterPeerResponse] = Field(default_factory=list)
+    recent_apply: List[ClusterApplyEventResponse] = Field(default_factory=list)
+
+
+class InternalReplicationApplyRequest(BaseModel):
+    source_node_id: Optional[str] = None
+    operations: List[Dict[str, Any]] = Field(default_factory=list)
+
+
 class PathNodeResponse(BaseModel):
     path: str
     node_type: Optional[str] = None
@@ -456,6 +514,23 @@ def _model_dump(model: Any) -> Dict[str, Any]:
     if hasattr(model, "model_dump"):
         return model.model_dump()
     return model.dict()
+
+
+def _require_cluster_manager() -> ClusterManager:
+    """Return the initialized cluster manager."""
+    if cluster_manager is None:
+        raise HTTPException(status_code=503, detail="Cluster manager is not initialized")
+    return cluster_manager
+
+
+def _require_replication_auth(request: Request) -> None:
+    """Protect internal replication endpoints when a token is configured."""
+    manager = _require_cluster_manager()
+    token = getattr(manager, "_replication_token", "")
+    if not token:
+        return
+    if request.headers.get(REPLICATION_TOKEN_HEADER) != token:
+        raise HTTPException(status_code=403, detail="Invalid replication token")
 
 
 def _sse_event(
@@ -825,6 +900,56 @@ async def renew_lease(request: RenewLeaseRequest) -> LeaseResponse:
         lease_ttl_seconds=request.lease_ttl_seconds,
     )
     return LeaseResponse(**lease)
+
+
+@app.get("/api/cluster/status", response_model=ClusterStatusResponse)
+async def cluster_status() -> ClusterStatusResponse:
+    """Return current cluster role, lag, and peer health."""
+    status = _require_cluster_manager().build_status()
+    return ClusterStatusResponse(
+        **{
+            **status,
+            "peers": [ClusterPeerResponse(**peer) for peer in status.get("peers", [])],
+            "recent_apply": [
+                ClusterApplyEventResponse(**event)
+                for event in status.get("recent_apply", [])
+            ],
+        }
+    )
+
+
+@app.get("/internal/replication/operations")
+async def internal_replication_operations(
+    request: Request,
+    since_sequence: int = Query(default=0, ge=0),
+    limit: int = Query(default=128, ge=1, le=1000),
+) -> dict:
+    """Expose committed operations for follower catch-up."""
+    _require_replication_auth(request)
+    return _require_cluster_manager().export_operations(
+        since_sequence=since_sequence,
+        limit=limit,
+    )
+
+
+@app.get("/internal/replication/state")
+async def internal_replication_state(request: Request) -> dict:
+    """Expose local replication progress for leader peer monitoring."""
+    _require_replication_auth(request)
+    return _require_cluster_manager().get_internal_state()
+
+
+@app.post("/internal/replication/apply")
+async def internal_replication_apply(
+    request: Request,
+    payload: InternalReplicationApplyRequest,
+) -> dict:
+    """Apply a pushed replication batch on a follower."""
+    _require_replication_auth(request)
+    return _require_cluster_manager().apply_replication_batch(
+        source_node_id=payload.source_node_id,
+        operations_payload=payload.operations,
+    )
 
 
 # ========== Health Endpoints ==========

@@ -1206,6 +1206,18 @@
                 <span class="stat-label">Operations</span>
                 <span class="stat-value" id="statOps">0</span>
             </div>
+            <div class="stat">
+                <span class="stat-label">Cluster Role</span>
+                <span class="stat-value" id="statClusterRole">standalone</span>
+            </div>
+            <div class="stat">
+                <span class="stat-label">Peers</span>
+                <span class="stat-value" id="statClusterPeers">0</span>
+            </div>
+            <div class="stat">
+                <span class="stat-label">Max Lag</span>
+                <span class="stat-value" id="statClusterLag">0</span>
+            </div>
         </div>
     </section>
     
@@ -1274,6 +1286,7 @@
         let recoverySummaryLoaded = false;
         let operationStream = null;
         let sessionStream = null;
+        let clusterStatus = null;
         let pendingTreeRefresh = null;
         let pendingStatsRefresh = null;
         let pendingInspectorRefresh = null;
@@ -1306,7 +1319,8 @@
                     refreshTree(),
                     refreshTimeline(),
                     refreshRecoverySummary(),
-                    refreshSessions()
+                    refreshSessions(),
+                    refreshClusterStatus()
                 ]);
                 bootstrapComplete = true;
                 updateConnectionStatus('connecting', 'Opening live streams...');
@@ -1331,6 +1345,35 @@
             document.getElementById('statOps').textContent = stats.operations;
             return stats;
         }
+
+        async function refreshClusterStatus() {
+            const response = await fetch(`${API_BASE}/cluster/status`);
+            if (!response.ok) {
+                throw new Error(await readErrorDetail(response, 'Failed to load cluster status'));
+            }
+            clusterStatus = await response.json();
+            document.getElementById('statClusterRole').textContent = clusterStatus.role || 'standalone';
+            document.getElementById('statClusterPeers').textContent = String(clusterStatus.peer_count || 0);
+            document.getElementById('statClusterLag').textContent = `${clusterStatus.max_replication_lag || 0} ops`;
+            return clusterStatus;
+        }
+
+        function formatClusterSummary() {
+            if (!clusterStatus) {
+                return 'Cluster status unavailable';
+            }
+            const role = clusterStatus.role || 'standalone';
+            const healthy = clusterStatus.healthy_peer_count || 0;
+            const peers = clusterStatus.peer_count || 0;
+            const lag = clusterStatus.max_replication_lag || 0;
+            if (role === 'standalone') {
+                return 'Standalone node';
+            }
+            const quorum = clusterStatus.require_write_quorum
+                ? (clusterStatus.write_quorum_ready ? 'quorum ready' : 'quorum degraded')
+                : 'async replication';
+            return `${role} \u00b7 ${healthy}/${peers} peers healthy \u00b7 max lag ${lag} ops \u00b7 ${quorum}`;
+        }
         
         // Update connection status
         function updateConnectionStatus(state, detail = '') {
@@ -1340,7 +1383,7 @@
                 connected: {
                     label: 'Connected',
                     className: 'connected',
-                    detail: detail || 'Live streams active',
+                    detail: detail || `Live streams active \u00b7 ${formatClusterSummary()}`,
                 },
                 connecting: {
                     label: 'Connecting',
@@ -2635,7 +2678,7 @@
         function setStreamStatus(kind, connected) {
             streamStates[kind] = connected;
             if (streamStates.operations || streamStates.sessions) {
-                updateConnectionStatus('connected', 'Live streams active');
+                updateConnectionStatus('connected', `Live streams active \u00b7 ${formatClusterSummary()}`);
                 return;
             }
             updateConnectionStatus(

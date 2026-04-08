@@ -156,6 +156,36 @@ class OperationLog:
             except Exception as e:
                 logger.error(f"Commit callback error: {e}")
 
+    def append_external_committed(self, operation: Operation) -> bool:
+        """
+        Record an already-committed external operation without re-emitting callbacks.
+
+        Returns True when the operation was appended, False when it was already
+        present. Raises ValueError on a sequence gap.
+        """
+        with self._condition:
+            existing = self.get_operation(operation.sequence_number)
+            if existing is not None:
+                return False
+
+            if operation.sequence_number > self._sequence_number + 1:
+                raise ValueError(
+                    f"Cannot append external operation with sequence gap: "
+                    f"{operation.sequence_number} > {self._sequence_number + 1}"
+                )
+
+            self._operations.append(operation)
+            if operation.sequence_number > self._sequence_number:
+                self._sequence_number = operation.sequence_number
+            self._condition.notify_all()
+            logger.debug(
+                "Appended external committed op: seq=%s type=%s path=%s",
+                operation.sequence_number,
+                operation.operation_type.value,
+                operation.path,
+            )
+            return True
+
     def wait_for_operations_since(
         self,
         sequence_number: int,
