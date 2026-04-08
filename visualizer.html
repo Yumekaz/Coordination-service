@@ -2110,6 +2110,8 @@
             const labels = {
                 delete: 'Deleted directly',
                 owner_delete: 'Removed by the owning session',
+                lease_released: 'Released by the owner',
+                lease_expired: 'Expired by lease TTL',
                 session_closed_cleanup: 'Removed when the owning session closed',
                 session_timeout_cleanup: 'Removed when the owning session timed out'
             };
@@ -2514,6 +2516,7 @@
                             ${renderInspectorStats({
                                 Holder: lease.holder,
                                 Token: lease.lease_token || 'n/a',
+                                'Lease TTL': lease.lease_ttl_seconds ? `${lease.lease_ttl_seconds}s` : 'session-bound',
                                 Expires: lease.expires_at ? formatDateTime(lease.expires_at) : 'n/a',
                                 Acquired: formatDateTime(lease.acquired_at),
                                 Waiters: data.waiter_count

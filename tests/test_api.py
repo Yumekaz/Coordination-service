@@ -553,6 +553,125 @@ class TestLeaseEndpoints:
         after_close = client.get("/api/lease/get", params={"path": lease_path})
         assert after_close.status_code in [404, 410]
 
+    def test_lease_can_expire_before_session_timeout(self, client):
+        """An independent lease TTL should expire the lease before the owning session dies."""
+        if not _lease_routes_present():
+            pytest.skip("Lease endpoints are not implemented yet")
+
+        session_id = client.post("/api/session/open", json={"timeout_seconds": 30}).json()["session_id"]
+        acquired = client.post("/api/lease/acquire", json={
+            "path": "/leases/ttl",
+            "session_id": session_id,
+            "holder": "ttl-holder",
+            "lease_ttl_seconds": 1,
+        })
+        assert acquired.status_code == 200
+        assert acquired.json()["lease_ttl_seconds"] == 1
+
+        deadline = time.time() + 3
+        status_codes = []
+        while time.time() < deadline:
+            current = client.get("/api/lease/get", params={"path": "/leases/ttl"})
+            status_codes.append(current.status_code)
+            if current.status_code == 404:
+                break
+            time.sleep(0.25)
+
+        assert 404 in status_codes
+
+        session_detail = client.get("/api/session/detail", params={"session_id": session_id})
+        assert session_detail.status_code == 200
+        assert session_detail.json()["is_alive"] is True
+
+    def test_lease_waiters_are_fifo(self, client):
+        """Competing waiters should acquire the lease in arrival order."""
+        if not _lease_routes_present():
+            pytest.skip("Lease endpoints are not implemented yet")
+
+        owner = client.post("/api/session/open", json={"timeout_seconds": 30}).json()["session_id"]
+        waiter_one = client.post("/api/session/open", json={"timeout_seconds": 30}).json()["session_id"]
+        waiter_two = client.post("/api/session/open", json={"timeout_seconds": 30}).json()["session_id"]
+
+        first = client.post("/api/lease/acquire", json={
+            "path": "/leases/fair",
+            "session_id": owner,
+            "holder": "owner",
+        })
+        assert first.status_code == 200
+
+        acquisition_order = []
+
+        def contender(session_id: str, holder: str):
+            lease = main.coordinator.acquire_lease(
+                "/leases/fair",
+                session_id,
+                holder=holder,
+                wait_timeout_seconds=2.0,
+            )
+            acquisition_order.append((session_id, lease["holder"]))
+            time.sleep(0.1)
+            main.coordinator.release_lease("/leases/fair", session_id)
+
+        thread_one = threading.Thread(target=contender, args=(waiter_one, "beta"))
+        thread_two = threading.Thread(target=contender, args=(waiter_two, "gamma"))
+        thread_one.start()
+        time.sleep(0.1)
+        thread_two.start()
+        time.sleep(0.2)
+
+        detail = client.get("/api/lease/detail", params={"path": "/leases/fair"})
+        assert detail.status_code == 200
+        assert detail.json()["waiters"][:2] == [waiter_one, waiter_two]
+
+        released = client.post("/api/lease/release", json={"path": "/leases/fair", "session_id": owner})
+        assert released.status_code == 200
+
+        thread_one.join(timeout=3)
+        thread_two.join(timeout=3)
+        assert acquisition_order == [(waiter_one, "beta"), (waiter_two, "gamma")]
+
+    def test_lease_can_be_renewed_by_owner(self, client):
+        """Lease renewal should extend the independent TTL without closing the session."""
+        if not _lease_routes_present():
+            pytest.skip("Lease endpoints are not implemented yet")
+
+        session_id = client.post("/api/session/open", json={"timeout_seconds": 30}).json()["session_id"]
+        acquired = client.post("/api/lease/acquire", json={
+            "path": "/leases/renew",
+            "session_id": session_id,
+            "holder": "renew-holder",
+            "lease_ttl_seconds": 1,
+        })
+        assert acquired.status_code == 200
+
+        time.sleep(0.6)
+        renewed = client.post("/api/lease/renew", json={
+            "path": "/leases/renew",
+            "session_id": session_id,
+            "lease_ttl_seconds": 2,
+        })
+        assert renewed.status_code == 200
+        assert renewed.json()["lease_ttl_seconds"] == 2
+
+        time.sleep(0.7)
+        still_held = client.get("/api/lease/get", params={"path": "/leases/renew"})
+        assert still_held.status_code == 200
+
+        deadline = time.time() + 3
+        status_codes = []
+        while time.time() < deadline:
+            current = client.get("/api/lease/get", params={"path": "/leases/renew"})
+            status_codes.append(current.status_code)
+            if current.status_code == 404:
+                break
+            time.sleep(0.25)
+
+        assert 404 in status_codes
+
+        session_detail = client.get("/api/session/detail", params={"session_id": session_id})
+        assert session_detail.status_code == 200
+        assert session_detail.json()["is_alive"] is True
+
 
 class TestHealthEndpoint:
     """Tests for health and stats endpoints."""
@@ -850,7 +969,7 @@ class TestInspectorEndpoints:
         assert data["current_node"] is None
         assert data["last_known_node"]["path"] == "/inspect-postmortem"
         assert data["disappearance"]["state"] == "deleted"
-        assert data["disappearance"]["cause_kind"] == "owner_delete"
+        assert data["disappearance"]["cause_kind"] == "lease_released"
         assert data["disappearance"]["delete_operation"]["operation_type"] == "DELETE"
         assert any(record["observed_path"] == "/inspect-postmortem" for record in data["fired_watches"])
         assert any(record["watch_session_id"] == watcher_session for record in data["fired_watches"])

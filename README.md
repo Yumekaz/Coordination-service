@@ -2,7 +2,7 @@
 
 A single-node coordination engine for hierarchical metadata, session-backed leases, one-shot watches, committed operation history, and crash recovery.
 
-`257 tests passing` | `Python + FastAPI + SQLite`
+`259 tests passing` | `Python + FastAPI + SQLite`
 
 ## What It Does
 
@@ -41,6 +41,7 @@ A single-node coordination engine for hierarchical metadata, session-backed leas
 ### Leases
 - `POST /api/lease/acquire`
 - `GET /api/lease/get`
+- `POST /api/lease/renew`
 - `POST /api/lease/release`
 
 ### Operations And Recovery
@@ -85,6 +86,8 @@ Leases are implemented on top of ephemeral ownership. `lease_token` is derived f
 - `expected_version` on `/api/node/set` provides optimistic concurrency control.
 - Stale CAS writes return `409 Conflict`.
 - Lease acquire and release are owner-checked.
+- Lease TTL can be independent from session timeout and can be renewed by the owner.
+- Competing lease waiters are queued in FIFO order instead of racing on delete watches.
 - Watch registration supports `event_types`, so watchers do not fire on unrelated changes.
 - Metadata writes and session mutations roll back cleanly if persistence fails.
 - Session expiry cleanup is rollback-safe.
@@ -122,7 +125,7 @@ The API listens on the host and port defined in `config.py`.
 .venv\Scripts\python.exe -m pytest -q
 ```
 
-Latest verified local run: `257 passed in 225.23s`.
+Latest verified local run: `259 passed in 327.64s`.
 
 ## Demos
 
@@ -147,8 +150,6 @@ The `demos/` folder still covers the core scenarios:
 ## Honest Limits
 
 - This is still a single-node service.
-- Lease TTL is still session timeout, not an independent per-lease TTL.
-- Fair queueing for competing lease waiters is not guaranteed.
 - Recovery is stronger than before, but it is still SQLite plus a custom WAL, not distributed consensus.
 - This is not a drop-in ZooKeeper replacement.
 

@@ -190,6 +190,7 @@ class AcquireLeaseRequest(BaseModel):
     holder: Optional[str] = None
     data: Optional[str] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
+    lease_ttl_seconds: Optional[float] = Field(default=None, gt=0, le=3600)
     wait_timeout_seconds: float = Field(default=0.0, ge=0, le=300)
     create_parents: bool = True
 
@@ -203,12 +204,19 @@ class LeaseResponse(BaseModel):
     acquired_at: float
     modified_at: float
     expires_at: Optional[float] = None
+    lease_ttl_seconds: Optional[float] = None
     lease_token: Optional[int] = None
 
 
 class ReleaseLeaseRequest(BaseModel):
     path: str
     session_id: str
+
+
+class RenewLeaseRequest(BaseModel):
+    path: str
+    session_id: str
+    lease_ttl_seconds: float = Field(..., gt=0, le=3600)
 
 
 class RegisterWatchResponse(BaseModel):
@@ -764,6 +772,7 @@ async def acquire_lease(request: AcquireLeaseRequest) -> LeaseResponse:
         session_id=request.session_id,
         holder=request.holder or request.data,
         metadata=request.metadata,
+        lease_ttl_seconds=request.lease_ttl_seconds,
         wait_timeout_seconds=request.wait_timeout_seconds,
         create_parents=request.create_parents,
     )
@@ -805,6 +814,17 @@ async def release_lease(request: ReleaseLeaseRequest) -> dict:
     """Release a lease if the caller currently owns it."""
     coordinator.release_lease(request.path, request.session_id)
     return {"status": "released", "path": request.path}
+
+
+@app.post("/api/lease/renew", response_model=LeaseResponse)
+async def renew_lease(request: RenewLeaseRequest) -> LeaseResponse:
+    """Renew a lease by resetting its independent TTL."""
+    lease = coordinator.renew_lease(
+        path=request.path,
+        session_id=request.session_id,
+        lease_ttl_seconds=request.lease_ttl_seconds,
+    )
+    return LeaseResponse(**lease)
 
 
 # ========== Health Endpoints ==========

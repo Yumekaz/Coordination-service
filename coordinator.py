@@ -19,7 +19,24 @@ import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 from datetime import datetime
 
-from models import Node, Session, Watch, Event, Operation, NodeType, EventType, OperationType, WatchFireRecord
+from models import (
+    Node,
+    Session,
+    Watch,
+    Event,
+    Operation,
+    NodeType,
+    EventType,
+    OperationType,
+    WatchFireRecord,
+    DELETE_CAUSE_DELETE,
+    DELETE_CAUSE_LEASE_EXPIRED,
+    DELETE_CAUSE_LEASE_RELEASE,
+    DELETE_CAUSE_SESSION_CLOSED,
+    DELETE_CAUSE_SESSION_EXPIRED,
+    encode_delete_operation_payload,
+    decode_delete_operation_payload,
+)
 from metadata_tree import MetadataTree
 from session_manager import SessionManager
 from watch_manager import WatchManager
@@ -54,6 +71,10 @@ class Coordinator:
         self._last_recovery_stats: Dict[str, Any] = {}
         self._session_inventory_version = 0
         self._session_inventory_condition = threading.Condition(self._lock)
+        self._lease_wait_condition = threading.Condition(self._lock)
+        self._lease_waiters: Dict[str, List[str]] = {}
+        self._lease_reaper_running = False
+        self._lease_reaper_thread: Optional[threading.Thread] = None
         
         # Initialize components
         self._persistence = Persistence(db_path)
@@ -95,6 +116,13 @@ class Coordinator:
             
             # Start session timeout checker
             self._session_manager.start()
+            self._lease_reaper_running = True
+            self._lease_reaper_thread = threading.Thread(
+                target=self._lease_reaper_loop,
+                daemon=True,
+                name="lease-expiry-checker",
+            )
+            self._lease_reaper_thread.start()
             
             self._started = True
             self._start_time = datetime.now().timestamp()
@@ -109,7 +137,11 @@ class Coordinator:
             if not self._started:
                 return
             
+            self._lease_reaper_running = False
             self._session_manager.stop()
+            if self._lease_reaper_thread:
+                self._lease_reaper_thread.join(timeout=2.0)
+                self._lease_reaper_thread = None
             self._persistence.close()
             self._started = False
             
@@ -344,11 +376,7 @@ class Coordinator:
                 for watch in self._get_relevant_watches_for_path_locked(normalized_path)
                 if not watch.is_fired
             ]
-            waiters = sorted({
-                watch.session_id
-                for watch in self._watch_manager.get_watches_for_path(normalized_path)
-                if EventType.DELETE in watch.event_types and (current_lease is None or watch.session_id != current_lease["session_id"])
-            })
+            waiters = self._get_lease_waiters_locked(normalized_path)
 
             last_delete = history["last_delete"]
             session_close_operation = self._find_session_close_operation_locked(
@@ -377,8 +405,13 @@ class Coordinator:
                         cause_sequence_number=last_delete.sequence_number,
                     )
                 ]
+                delete_cause = self._decode_delete_cause(last_delete)
 
-                if close_reason == "explicit":
+                if delete_cause == DELETE_CAUSE_LEASE_EXPIRED:
+                    cause_kind = "lease_expired"
+                elif delete_cause == DELETE_CAUSE_LEASE_RELEASE:
+                    cause_kind = "lease_released"
+                elif close_reason == "explicit":
                     cause_kind = "session_closed_cleanup"
                 elif close_reason == "timeout":
                     cause_kind = "session_timeout_cleanup"
@@ -479,6 +512,7 @@ class Coordinator:
             else:
                 if operation.operation_type == OperationType.DELETE:
                     deleted_paths = self._decode_delete_paths(operation)
+                    delete_cause = self._decode_delete_cause(operation)
                     path_changes.extend(
                         (path, "deleted", operation.sequence_number)
                         for path in deleted_paths
@@ -501,6 +535,12 @@ class Coordinator:
                         )
                         if close_reason:
                             notes.append(f"Cleanup reason recorded as {close_reason}.")
+                    elif delete_cause == DELETE_CAUSE_LEASE_EXPIRED:
+                        incident_kind = "lease_expiration"
+                        summary = "Lease TTL expired"
+                    elif delete_cause == DELETE_CAUSE_LEASE_RELEASE:
+                        incident_kind = "lease_release"
+                        summary = "Lease released"
                     else:
                         incident_kind = "recursive_delete" if len(deleted_paths) > 1 else "delete"
                         summary = "Recursive delete committed" if len(deleted_paths) > 1 else "Delete committed"
@@ -678,6 +718,10 @@ class Coordinator:
                     path=",".join(deleted_paths),
                     session_id=session.session_id,
                 )
+                delete_operation.data = encode_delete_operation_payload(
+                    deleted_paths,
+                    cause=DELETE_CAUSE_SESSION_EXPIRED if reason == "timeout" else DELETE_CAUSE_SESSION_CLOSED,
+                )
                 watch_fires = self._collect_watch_fire_records_locked(
                     deleted_paths,
                     event_type=EventType.DELETE,
@@ -720,6 +764,8 @@ class Coordinator:
                 self._operation_log.commit(session_close_operation)
 
             self._watch_manager.clear_session_watches(session.session_id)
+            self._remove_waiter_from_all_lease_queues_locked(session.session_id)
+            self._notify_lease_waiters_locked()
 
             if not deleted_paths:
                 session.ephemeral_nodes.clear()
@@ -864,6 +910,88 @@ class Coordinator:
         with self._session_inventory_condition:
             self._session_inventory_version += 1
             self._session_inventory_condition.notify_all()
+
+    def _notify_lease_waiters_locked(self) -> None:
+        """Wake blocked lease contenders after a lease state change."""
+        with self._lease_wait_condition:
+            self._lease_wait_condition.notify_all()
+
+    def _prune_lease_waiters_locked(self, path: str) -> List[str]:
+        """Drop dead or duplicate waiters from a lease queue and return the queue."""
+        normalized_path = self._normalize_path(path)
+        queue = self._lease_waiters.get(normalized_path, [])
+        cleaned: List[str] = []
+        seen: Set[str] = set()
+        for session_id in queue:
+            if session_id in seen:
+                continue
+            if not self._session_manager.is_alive(session_id):
+                continue
+            cleaned.append(session_id)
+            seen.add(session_id)
+
+        if cleaned:
+            self._lease_waiters[normalized_path] = cleaned
+        else:
+            self._lease_waiters.pop(normalized_path, None)
+        return list(cleaned)
+
+    def _enqueue_lease_waiter_locked(self, path: str, session_id: str) -> List[str]:
+        """Append a waiter to a lease queue if it is not already queued."""
+        normalized_path = self._normalize_path(path)
+        queue = self._prune_lease_waiters_locked(normalized_path)
+        if session_id not in queue:
+            queue.append(session_id)
+            self._lease_waiters[normalized_path] = queue
+        return list(queue)
+
+    def _dequeue_lease_waiter_locked(self, path: str, session_id: str) -> None:
+        """Remove one session from a lease queue."""
+        normalized_path = self._normalize_path(path)
+        queue = [queued for queued in self._lease_waiters.get(normalized_path, []) if queued != session_id]
+        if queue:
+            self._lease_waiters[normalized_path] = queue
+        else:
+            self._lease_waiters.pop(normalized_path, None)
+
+    def _remove_waiter_from_all_lease_queues_locked(self, session_id: str) -> None:
+        """Remove a session from every lease queue when it dies or disconnects."""
+        for path in list(self._lease_waiters.keys()):
+            self._dequeue_lease_waiter_locked(path, session_id)
+
+    def _get_lease_waiters_locked(self, path: str) -> List[str]:
+        """Return the live FIFO waiter queue for a lease path."""
+        return self._prune_lease_waiters_locked(path)
+
+    def _lease_reaper_loop(self) -> None:
+        """Background loop that expires leases with an independent TTL."""
+        while self._lease_reaper_running:
+            try:
+                self._expire_due_leases()
+            except Exception as exc:
+                logger.error(f"Lease expiry error: {exc}")
+            time.sleep(0.5)
+
+    def _expire_due_leases(self) -> None:
+        """Delete expired lease nodes while preserving normal durability semantics."""
+        with self._lock:
+            now = datetime.now().timestamp()
+            due_paths: List[str] = []
+            for node in self._metadata_tree.get_all_nodes():
+                if node.path == "/" or node.node_type != NodeType.EPHEMERAL:
+                    continue
+                _, _, _, lease_expires_at = self._decode_lease_record_data(node.data, node.session_id)
+                if lease_expires_at is not None and lease_expires_at <= now:
+                    due_paths.append(node.path)
+
+        for due_path in due_paths:
+            try:
+                self.delete(due_path, cause=DELETE_CAUSE_LEASE_EXPIRED)
+                logger.info(f"Lease expired independently of session TTL: {due_path}")
+            except KeyError:
+                continue
+            except Exception as exc:
+                logger.error(f"Failed to expire lease {due_path}: {exc}")
 
     def _build_session_views_locked(self, alive_only: bool = False) -> List[Dict[str, Any]]:
         """Build detached session inventory views while holding the coordinator lock."""
@@ -1039,18 +1167,57 @@ class Coordinator:
         self,
         holder: str,
         metadata: Optional[Dict[str, Any]] = None,
+        lease_ttl_seconds: Optional[float] = None,
     ) -> bytes:
         """Serialize lease metadata into the underlying node payload."""
         try:
+            lease_expires_at = None
+            if lease_ttl_seconds is not None:
+                lease_expires_at = datetime.now().timestamp() + lease_ttl_seconds
             return json.dumps(
                 {
                     "holder": holder,
                     "metadata": metadata or {},
+                    "lease_ttl_seconds": lease_ttl_seconds,
+                    "lease_expires_at": lease_expires_at,
                 },
                 sort_keys=True,
             ).encode("utf-8")
         except (TypeError, ValueError) as exc:
             raise ValueError("Lease metadata must be JSON-serializable") from exc
+
+    def _decode_lease_record_data(
+        self,
+        data: bytes,
+        fallback_holder: Optional[str] = None,
+    ) -> Tuple[str, Dict[str, Any], Optional[float], Optional[float]]:
+        """Decode holder, metadata, and optional independent lease TTL fields."""
+        if not data:
+            return fallback_holder or "", {}, None, None
+
+        raw = data.decode("utf-8") if isinstance(data, bytes) else str(data)
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return raw, {}, None, None
+
+        if not isinstance(payload, dict):
+            return raw, {}, None, None
+
+        holder = payload.get("holder") or payload.get("data") or fallback_holder or ""
+        metadata = payload.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        lease_ttl_seconds = payload.get("lease_ttl_seconds")
+        if lease_ttl_seconds is not None:
+            lease_ttl_seconds = float(lease_ttl_seconds)
+
+        lease_expires_at = payload.get("lease_expires_at")
+        if lease_expires_at is not None:
+            lease_expires_at = float(lease_expires_at)
+
+        return holder, metadata, lease_ttl_seconds, lease_expires_at
 
     def _decode_lease_payload_data(
         self,
@@ -1058,23 +1225,7 @@ class Coordinator:
         fallback_holder: Optional[str] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """Decode holder metadata from a raw lease payload."""
-        if not data:
-            return fallback_holder or "", {}
-        
-        raw = data.decode("utf-8") if isinstance(data, bytes) else str(data)
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError:
-            return raw, {}
-        
-        if not isinstance(payload, dict):
-            return raw, {}
-        
-        holder = payload.get("holder") or payload.get("data") or fallback_holder or ""
-        metadata = payload.get("metadata")
-        if not isinstance(metadata, dict):
-            metadata = {}
-        
+        holder, metadata, _, _ = self._decode_lease_record_data(data, fallback_holder)
         return holder, metadata
 
     def _decode_lease_payload(self, node: Node) -> Tuple[str, Dict[str, Any]]:
@@ -1100,18 +1251,21 @@ class Coordinator:
             return [operation.path] if operation.path else []
 
         try:
-            payload = json.loads(operation.data.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
+            payload = decode_delete_operation_payload(operation.data)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
             return [operation.path] if operation.path else []
 
-        if isinstance(payload, list):
-            return [str(path).strip() for path in payload if str(path).strip()]
-        if isinstance(payload, dict):
-            paths = payload.get("paths")
-            if isinstance(paths, list):
-                return [str(path).strip() for path in paths if str(path).strip()]
+        return [str(path).strip() for path in payload.get("paths", []) if str(path).strip()] or ([operation.path] if operation.path else [])
 
-        return [operation.path] if operation.path else []
+    def _decode_delete_cause(self, operation: Optional[Operation]) -> str:
+        """Decode a delete cause token from an operation payload."""
+        if operation is None or operation.operation_type != OperationType.DELETE or not operation.data:
+            return DELETE_CAUSE_DELETE
+        try:
+            payload = decode_delete_operation_payload(operation.data)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            return DELETE_CAUSE_DELETE
+        return str(payload.get("cause") or DELETE_CAUSE_DELETE)
 
     def _get_operations_for_exact_path_locked(
         self,
@@ -1299,7 +1453,11 @@ class Coordinator:
         holder = None
         metadata: Dict[str, Any] = {}
         if node_type == NodeType.EPHEMERAL:
-            holder, metadata = self._decode_lease_payload_data(data, session_id)
+            holder, metadata, lease_ttl_seconds, lease_expires_at = self._decode_lease_record_data(data, session_id)
+            if lease_ttl_seconds is not None:
+                metadata = {**metadata, "lease_ttl_seconds": lease_ttl_seconds}
+            if lease_expires_at is not None:
+                metadata = {**metadata, "lease_expires_at": lease_expires_at}
 
         return {
             "path": path,
@@ -1447,11 +1605,13 @@ class Coordinator:
         if node.node_type != NodeType.EPHEMERAL:
             raise ValueError(f"Node at path is not a lease: {node.path}")
         
-        holder, metadata = self._decode_lease_payload(node)
+        holder, metadata, lease_ttl_seconds, lease_expires_at = self._decode_lease_record_data(node.data, node.session_id)
         session = self._session_manager.get_session(node.session_id) if node.session_id else None
         expires_at = None
         if session is not None:
             expires_at = session.last_heartbeat + session.timeout_seconds
+        if lease_expires_at is not None:
+            expires_at = lease_expires_at if expires_at is None else min(expires_at, lease_expires_at)
         
         return {
             "path": node.path,
@@ -1462,6 +1622,7 @@ class Coordinator:
             "acquired_at": node.created_at,
             "modified_at": node.modified_at,
             "expires_at": expires_at,
+            "lease_ttl_seconds": lease_ttl_seconds,
             "lease_token": lease_token if lease_token is not None else self._get_lease_token(node.path),
         }
 
@@ -1494,11 +1655,7 @@ class Coordinator:
                         ),
                         None,
                     )
-            waiters = sorted({
-                watch.session_id
-                for watch in self._watch_manager.get_watches_for_path(normalized_path)
-                if EventType.DELETE in watch.event_types and (current_lease is None or watch.session_id != current_lease["session_id"])
-            })
+            waiters = self._get_lease_waiters_locked(normalized_path)
             recent_operations = self._get_operations_for_exact_path_locked(
                 normalized_path,
                 limit=operation_limit,
@@ -1538,6 +1695,7 @@ class Coordinator:
         session_id: str,
         holder: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        lease_ttl_seconds: Optional[float] = None,
         wait_timeout_seconds: float = 0.0,
         create_parents: bool = True,
     ) -> Dict[str, Any]:
@@ -1549,6 +1707,8 @@ class Coordinator:
         """
         if wait_timeout_seconds < 0:
             raise ValueError("wait_timeout_seconds must be non-negative")
+        if lease_ttl_seconds is not None and lease_ttl_seconds <= 0:
+            raise ValueError("lease_ttl_seconds must be positive")
         
         normalized_path = self._normalize_path(path)
         holder = holder or session_id
@@ -1557,6 +1717,7 @@ class Coordinator:
         while True:
             with self._lock:
                 if not self._session_manager.is_alive(session_id):
+                    self._dequeue_lease_waiter_locked(normalized_path, session_id)
                     raise ValueError(f"Session is not alive: {session_id}")
 
                 if create_parents:
@@ -1564,12 +1725,18 @@ class Coordinator:
                 
                 existing = self._metadata_tree.get(normalized_path)
                 if existing is None:
+                    self._dequeue_lease_waiter_locked(normalized_path, session_id)
                     node, operation = self._create_node(
                         path=normalized_path,
-                        data=self._encode_lease_payload(holder, metadata),
+                        data=self._encode_lease_payload(
+                            holder,
+                            metadata,
+                            lease_ttl_seconds=lease_ttl_seconds,
+                        ),
                         persistent=False,
                         session_id=session_id,
                     )
+                    self._notify_lease_waiters_locked()
                     logger.info(f"Lease acquired: {normalized_path} (session={session_id})")
                     return self._lease_info_from_node(
                         node,
@@ -1584,6 +1751,7 @@ class Coordinator:
                     )
                 
                 if existing.session_id == session_id:
+                    self._dequeue_lease_waiter_locked(normalized_path, session_id)
                     return self._lease_info_from_node(existing)
                 
                 if wait_timeout_seconds <= 0:
@@ -1592,37 +1760,31 @@ class Coordinator:
                         error="lease_conflict",
                         path=normalized_path,
                     )
-                
-                watch = self._watch_manager.register(
-                    path=normalized_path,
-                    session_id=session_id,
-                    event_types={EventType.DELETE},
-                )
-                
-                # Re-check after watch registration so we do not miss a release.
-                if not self._metadata_tree.exists(normalized_path):
-                    self._watch_manager.unregister(watch.watch_id)
-                    continue
-                
-                watch_id = watch.watch_id
+
+                waiters = self._enqueue_lease_waiter_locked(normalized_path, session_id)
                 remaining = deadline - time.monotonic()
-            
+                if waiters and waiters[0] != session_id:
+                    if remaining <= 0:
+                        self._dequeue_lease_waiter_locked(normalized_path, session_id)
+                        raise ConflictError(
+                            f"Lease already held: {normalized_path}",
+                            error="lease_conflict",
+                            path=normalized_path,
+                        )
+                    self._lease_wait_condition.wait(timeout=remaining)
+                    continue
+
             if remaining <= 0:
-                self.unregister_watch(watch_id)
+                with self._lock:
+                    self._dequeue_lease_waiter_locked(normalized_path, session_id)
                 raise ConflictError(
                     f"Lease already held: {normalized_path}",
                     error="lease_conflict",
                     path=normalized_path,
                 )
-            
-            event = self.wait_watch(watch_id, remaining)
-            self.unregister_watch(watch_id)
-            if event is None:
-                raise ConflictError(
-                    f"Lease already held: {normalized_path}",
-                    error="lease_conflict",
-                    path=normalized_path,
-                )
+
+            with self._lock:
+                self._lease_wait_condition.wait(timeout=remaining)
 
     def release_lease(self, path: str, session_id: str) -> bool:
         """Release a lease, but only if the caller owns it."""
@@ -1640,9 +1802,52 @@ class Coordinator:
                     path=normalized_path,
                     owner_session_id=node.session_id,
                 )
-            self.delete(normalized_path)
+            self.delete(normalized_path, cause=DELETE_CAUSE_LEASE_RELEASE)
             logger.info(f"Lease released: {normalized_path} (session={session_id})")
             return True
+
+    def renew_lease(
+        self,
+        path: str,
+        session_id: str,
+        lease_ttl_seconds: float,
+    ) -> Dict[str, Any]:
+        """Extend or reset the independent TTL for a currently owned lease."""
+        if lease_ttl_seconds <= 0:
+            raise ValueError("lease_ttl_seconds must be positive")
+
+        with self._lock:
+            normalized_path = self._normalize_path(path)
+            if not self._session_manager.is_alive(session_id):
+                raise ValueError(f"Session is not alive: {session_id}")
+
+            node = self._metadata_tree.get(normalized_path)
+            if node is None:
+                raise KeyError(f"Lease does not exist: {normalized_path}")
+            if node.node_type != NodeType.EPHEMERAL:
+                raise ValueError(f"Node at path is not a lease: {normalized_path}")
+            if node.session_id != session_id:
+                raise ForbiddenError(
+                    f"Lease is owned by another session: {normalized_path}",
+                    error="lease_forbidden",
+                    path=normalized_path,
+                    owner_session_id=node.session_id,
+                )
+
+            holder, metadata, _, _ = self._decode_lease_record_data(node.data, node.session_id)
+            updated_node = self.set(
+                normalized_path,
+                self._encode_lease_payload(
+                    holder,
+                    metadata,
+                    lease_ttl_seconds=lease_ttl_seconds,
+                ),
+            )
+
+            logger.info(
+                f"Lease renewed: {normalized_path} (session={session_id}, ttl={lease_ttl_seconds}s)"
+            )
+            return self._lease_info_from_node(updated_node)
     
     def get(self, path: str) -> Optional[Node]:
         """
@@ -1726,7 +1931,7 @@ class Coordinator:
             
             return committed_node
     
-    def delete(self, path: str) -> List[str]:
+    def delete(self, path: str, cause: str = DELETE_CAUSE_DELETE) -> List[str]:
         """
         Delete a node and all its children.
         
@@ -1755,6 +1960,7 @@ class Coordinator:
                 path=path,
                 session_id=node.session_id,
             )
+            operation.data = encode_delete_operation_payload(deleted_paths, cause=cause)
             watch_fires = self._collect_watch_fire_records_locked(
                 deleted_paths,
                 event_type=EventType.DELETE,
@@ -1788,6 +1994,7 @@ class Coordinator:
                     event_type=EventType.DELETE,
                     sequence_number=operation.sequence_number,
                 )
+            self._notify_lease_waiters_locked()
             
             logger.info(f"Deleted node: {path} (and {len(deleted_paths)-1} children)")
             

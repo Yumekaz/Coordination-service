@@ -37,6 +37,7 @@ class OperationType(Enum):
 
 DELETE_CAUSE_DELETE = "delete"
 DELETE_CAUSE_LEASE_RELEASE = "lease_release"
+DELETE_CAUSE_LEASE_EXPIRED = "lease_expired"
 DELETE_CAUSE_SESSION_CLOSED = "session_closed"
 DELETE_CAUSE_SESSION_EXPIRED = "session_expired"
 
