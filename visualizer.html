@@ -1215,7 +1215,7 @@
                 <span class="stat-value" id="statClusterPeers">0</span>
             </div>
             <div class="stat">
-                <span class="stat-label">Max Lag</span>
+                <span class="stat-label">Lag / Quorum</span>
                 <span class="stat-value" id="statClusterLag">0</span>
             </div>
         </div>
@@ -1354,7 +1354,12 @@
             clusterStatus = await response.json();
             document.getElementById('statClusterRole').textContent = clusterStatus.role || 'standalone';
             document.getElementById('statClusterPeers').textContent = String(clusterStatus.peer_count || 0);
-            document.getElementById('statClusterLag').textContent = `${clusterStatus.max_replication_lag || 0} ops`;
+            const quorumCommit = clusterStatus.quorum_commit_index;
+            if (quorumCommit === null || quorumCommit === undefined) {
+                document.getElementById('statClusterLag').textContent = `${clusterStatus.max_replication_lag || 0} ops`;
+            } else {
+                document.getElementById('statClusterLag').textContent = `${clusterStatus.max_replication_lag || 0} ops / q${quorumCommit}`;
+            }
             return clusterStatus;
         }
 
@@ -1367,14 +1372,19 @@
             const peers = clusterStatus.peer_count || 0;
             const lag = clusterStatus.max_replication_lag || 0;
             const term = clusterStatus.current_term || 0;
+            const quorumCommit = clusterStatus.quorum_commit_index;
+            const quorumCommitLag = clusterStatus.quorum_commit_lag;
+            const quorumCommitText = quorumCommit === null || quorumCommit === undefined
+                ? 'quorum seq n/a'
+                : `quorum seq ${quorumCommit}${quorumCommitLag ? ` (${quorumCommitLag} behind)` : ''}`;
             if (role === 'standalone') {
-                return `Standalone node · term ${term}`;
+                return `Standalone node · term ${term} · ${quorumCommitText}`;
             }
             const quorum = clusterStatus.require_write_quorum
                 ? (clusterStatus.write_quorum_ready ? 'quorum ready' : 'quorum degraded')
                 : 'async replication';
             const leaderHealth = role === 'follower' && clusterStatus.leader_contact_stale ? 'leader stale' : 'leader ok';
-            return `${role} · term ${term} · ${healthy}/${peers} peers healthy · max lag ${lag} ops · ${quorum} · ${leaderHealth}`;
+            return `${role} · term ${term} · ${healthy}/${peers} peers healthy · max lag ${lag} ops · ${quorum} · ${quorumCommitText} · ${leaderHealth}`;
         }
         
         // Update connection status

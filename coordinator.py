@@ -169,6 +169,28 @@ class Coordinator:
                 "reason": self._read_only_reason,
             }
 
+    def save_cluster_state(
+        self,
+        *,
+        node_id: str,
+        current_term: int,
+        voted_for: Optional[str] = None,
+        leader_id: Optional[str] = None,
+        leader_url: Optional[str] = None,
+    ) -> None:
+        """Persist cluster-election metadata for the local node."""
+        self._persistence.save_cluster_state(
+            node_id=node_id,
+            current_term=current_term,
+            voted_for=voted_for,
+            leader_id=leader_id,
+            leader_url=leader_url,
+        )
+
+    def load_cluster_state(self, node_id: str) -> Optional[Dict[str, Any]]:
+        """Load persisted cluster-election metadata for the local node."""
+        return self._persistence.load_cluster_state(node_id)
+
     def add_commit_callback(self, callback: Callable[[Operation], None]) -> None:
         """Register a callback for committed operations."""
         self._operation_log.add_commit_callback(callback)

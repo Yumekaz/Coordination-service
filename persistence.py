@@ -432,6 +432,16 @@ class Persistence:
                 CREATE INDEX IF NOT EXISTS idx_watch_fires_observed_path
                 ON watch_fires(observed_path, cause_sequence_number DESC, ordinal ASC)
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS cluster_state (
+                    node_id TEXT PRIMARY KEY,
+                    current_term INTEGER NOT NULL,
+                    voted_for TEXT,
+                    leader_id TEXT,
+                    leader_url TEXT,
+                    updated_at REAL NOT NULL
+                )
+            """)
             
             # Note: DDL statements are auto-committed in isolation_level=None mode
             logger.info("Database schema initialized")
@@ -705,6 +715,62 @@ class Persistence:
                     operation.node_type.value if operation.node_type else None,
                 ))
                 logger.debug(f"Appended operation: seq={operation.sequence_number}")
+
+    def save_cluster_state(
+        self,
+        node_id: str,
+        current_term: int,
+        voted_for: Optional[str] = None,
+        leader_id: Optional[str] = None,
+        leader_url: Optional[str] = None,
+    ) -> None:
+        """Persist cluster election metadata for one local node."""
+        with self._lock:
+            with self._transaction() as conn:
+                conn.execute("""
+                    INSERT OR REPLACE INTO cluster_state
+                    (node_id, current_term, voted_for, leader_id, leader_url, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (
+                    node_id,
+                    int(current_term),
+                    voted_for,
+                    leader_id,
+                    leader_url,
+                    datetime.now().timestamp(),
+                ))
+                logger.debug(
+                    "Saved cluster state: node=%s term=%s voted_for=%s leader=%s",
+                    node_id,
+                    current_term,
+                    voted_for,
+                    leader_id,
+                )
+
+    def load_cluster_state(self, node_id: str) -> Optional[Dict[str, object]]:
+        """Load persisted cluster election metadata for one local node."""
+        with self._lock:
+            conn = self._get_connection()
+            cursor = conn.execute(
+                """
+                SELECT node_id, current_term, voted_for, leader_id, leader_url, updated_at
+                FROM cluster_state
+                WHERE node_id = ?
+                """,
+                (node_id,),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+
+            return {
+                "node_id": row["node_id"],
+                "current_term": int(row["current_term"]),
+                "voted_for": row["voted_for"],
+                "leader_id": row["leader_id"],
+                "leader_url": row["leader_url"],
+                "updated_at": row["updated_at"],
+            }
     
     def load_operations_since(self, sequence_number: int) -> List[Operation]:
         """Load operations after a given sequence number."""
@@ -955,6 +1021,7 @@ class Persistence:
                 conn.execute("DELETE FROM sessions")
                 conn.execute("DELETE FROM operations")
                 conn.execute("DELETE FROM watch_fires")
+                conn.execute("DELETE FROM cluster_state")
             # Also truncate WAL file
             self._wal_writer.truncate()
             logger.info("Database cleared")

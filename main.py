@@ -342,6 +342,8 @@ class ClusterStatusResponse(BaseModel):
     peer_count: int
     healthy_peer_count: int
     max_replication_lag: int
+    quorum_commit_index: Optional[int] = None
+    quorum_commit_lag: Optional[int] = None
     write_quorum_ready: bool
     require_write_quorum: bool
     push_commit_replication: bool

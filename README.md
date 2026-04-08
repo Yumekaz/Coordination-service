@@ -1,8 +1,8 @@
 # Coordination Service
 
-A coordination engine for hierarchical metadata, session-backed leases, one-shot watches, committed operation history, crash recovery, and leader/follower replication with election/failover groundwork and quorum-aware health gating.
+A coordination engine for hierarchical metadata, session-backed leases, one-shot watches, committed operation history, crash recovery, and leader/follower replication with durable election state, failover groundwork, and quorum-aware progress gating.
 
-`266 tests passing` | `Python + FastAPI + SQLite`
+`269 tests passing` | `Python + FastAPI + SQLite`
 
 ## What It Does
 
@@ -20,6 +20,8 @@ A coordination engine for hierarchical metadata, session-backed leases, one-shot
 - Leader push replication for lower follower lag
 - Optional write-quorum health gating on leaders
 - Term-aware heartbeats plus vote requests for leader-election groundwork
+- Durable term/vote persistence across restart
+- Quorum commit index and lag visibility for the leader
 
 ## Current Product Surface
 
@@ -108,6 +110,7 @@ Leases are implemented on top of ephemeral ownership. `lease_token` is derived f
 - Follower replicas catch up from the leader's committed operation history and can accept pushed replication batches from the leader.
 - Leaders can push committed operations directly to followers to reduce lag.
 - Leaders can optionally reject writes when a quorum of peers is not healthy.
+- Leaders also reject new writes when prior committed operations have not reached a majority yet.
 - Followers track leader term/contact health and can trigger election attempts when the leader goes stale.
 - Follower replicas are read-only and report replication lag through `/api/cluster/status`.
 - `/api/operations` returns committed operations in sequence order.
@@ -144,7 +147,7 @@ The API listens on the host and port defined in `config.py`.
 .venv\Scripts\python.exe -m pytest -q
 ```
 
-Latest verified local run: `260 passed in 344.64s`.
+Latest verified local run: `269 passed in 364.97s`.
 
 ## Demos
 
@@ -168,8 +171,8 @@ The `demos/` folder still covers the core scenarios:
 
 ## Honest Limits
 
-- This is still not distributed consensus. Replication has quorum-aware health gating, not quorum commit.
-- Leader election and failover are groundwork only: term tracking, heartbeats, and vote requests exist, but there is no durable voted-state log, quorum commit, or split-brain proof.
+- This is still not distributed consensus. Replication has quorum-aware health gating and quorum-progress gating, not true quorum commit.
+- Leader election and failover are groundwork only: durable term/vote state now exists, but there is still no replicated consensus log, quorum commit, or split-brain proof.
 - Follower replicas mirror committed state, but follower watch-fire and incident parity is still partial.
 - Recovery is stronger than before, but it is still SQLite plus a custom WAL underneath.
 - This is not a drop-in ZooKeeper replacement.

@@ -726,6 +726,8 @@ class TestClusterEndpoints:
         assert data["peer_count"] == 0
         assert data["healthy_peer_count"] == 0
         assert data["replication_enabled"] is False
+        assert data["quorum_commit_index"] == 0
+        assert data["quorum_commit_lag"] == 0
         assert data["write_quorum_ready"] is True
         assert data["require_write_quorum"] is False
         assert data["leader_contact_stale"] is False
@@ -920,6 +922,62 @@ class TestClusterEndpoints:
             except OSError:
                 pass
 
+    def test_vote_persists_across_cluster_manager_restart(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as cluster_db:
+            db_path = cluster_db.name
+
+        coordinator = Coordinator(db_path=db_path)
+        coordinator.start()
+        manager = ClusterManager(coordinator, node_id="node-a", role="follower")
+
+        try:
+            first_vote = manager.request_vote(
+                candidate_id="node-b",
+                term=4,
+                candidate_last_applied=0,
+            )
+            assert first_vote["vote_granted"] is True
+
+            manager.stop()
+            coordinator.stop()
+
+            coordinator = Coordinator(db_path=db_path)
+            coordinator.start()
+            manager = ClusterManager(coordinator, node_id="node-a", role="follower")
+
+            status = manager.build_status()
+            assert status["current_term"] == 4
+            assert status["voted_for"] == "node-b"
+
+            second_vote = manager.request_vote(
+                candidate_id="node-c",
+                term=4,
+                candidate_last_applied=0,
+            )
+            assert second_vote["vote_granted"] is False
+
+            conflicting_heartbeat = manager.receive_heartbeat(
+                leader_id="node-c",
+                term=4,
+                leader_url="http://node-c",
+                commit_index=0,
+            )
+            assert conflicting_heartbeat["accepted"] is False
+
+            higher_term_vote = manager.request_vote(
+                candidate_id="node-c",
+                term=5,
+                candidate_last_applied=0,
+            )
+            assert higher_term_vote["vote_granted"] is True
+        finally:
+            manager.stop()
+            coordinator.stop()
+            try:
+                os.unlink(db_path)
+            except OSError:
+                pass
+
     def test_leader_push_replication_updates_follower_without_polling(self):
         with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as leader_db, tempfile.NamedTemporaryFile(suffix=".db", delete=False) as follower_db:
             leader_path = leader_db.name
@@ -979,6 +1037,8 @@ class TestClusterEndpoints:
             status = leader_cluster.build_status()
             assert status["healthy_peer_count"] == 1
             assert status["max_replication_lag"] == 0
+            assert status["quorum_commit_index"] == leader.get_stats()["last_sequence"]
+            assert status["quorum_commit_lag"] == 0
             assert any(event["status"] == "acked" for event in status["recent_apply"])
         finally:
             leader_cluster.stop()
@@ -1019,6 +1079,74 @@ class TestClusterEndpoints:
             assert status["require_write_quorum"] is True
             assert status["write_quorum_ready"] is False
             assert status["healthy_peer_count"] == 0
+        finally:
+            leader_cluster.stop()
+            leader.stop()
+            try:
+                os.unlink(leader_path)
+            except OSError:
+                pass
+
+    def test_leader_rejects_new_writes_when_prior_commit_is_not_quorum_replicated(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as leader_db:
+            leader_path = leader_db.name
+
+        leader = Coordinator(db_path=leader_path)
+        leader.start()
+
+        peer_state = {
+            "last_applied": 0,
+        }
+
+        def flaky_request_json(url: str, method: str, payload: dict | None):
+            parsed = parse.urlparse(url)
+            if parsed.path == "/internal/cluster/heartbeat":
+                return {
+                    "accepted": True,
+                    "term": int((payload or {}).get("term", 1)),
+                    "node_id": "peer-a",
+                    "last_applied": peer_state["last_applied"],
+                }
+            if parsed.path == "/internal/replication/state":
+                return {
+                    "node_id": "peer-a",
+                    "role": "follower",
+                    "term": 1,
+                    "commit_index": peer_state["last_applied"],
+                    "last_applied": peer_state["last_applied"],
+                    "read_only": True,
+                    "last_sync_at": None,
+                    "last_error": None,
+                    "leader_id": "leader-a",
+                    "leader_url": "http://leader-a",
+                }
+            if parsed.path == "/internal/replication/apply":
+                raise RuntimeError("replication apply failed")
+            raise AssertionError(f"Unexpected replication URL: {url}")
+
+        leader_cluster = ClusterManager(
+            leader,
+            node_id="leader-a",
+            role="leader",
+            peer_urls=["http://peer-a"],
+            advertise_url="http://leader-a",
+            require_write_quorum=True,
+            request_json=flaky_request_json,
+        )
+        leader_cluster.start()
+
+        try:
+            session = leader.open_session(30)
+            assert session is not None
+
+            status = leader_cluster.build_status()
+            assert status["quorum_commit_index"] == 0
+            assert status["quorum_commit_lag"] == leader.get_stats()["last_sequence"]
+
+            with pytest.raises(ConflictError) as exc_info:
+                leader.create("/blocked", b"payload", persistent=True)
+
+            assert exc_info.value.error == "write_quorum_behind"
         finally:
             leader_cluster.stop()
             leader.stop()

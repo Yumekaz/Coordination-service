@@ -77,6 +77,7 @@ class ClusterManager:
         self._current_term = 0
         self._voted_for: Optional[str] = None
         self._last_leader_contact_at: Optional[float] = time.time() if self._role == "leader" else None
+        self._quorum_commit_index = 0
         self._peer_states: Dict[str, Dict[str, Any]] = {
             peer: {
                 "peer_url": peer,
@@ -93,12 +94,22 @@ class ClusterManager:
         }
         self._commit_callback_registered = False
 
+        persisted_state = self._coordinator.load_cluster_state(self._node_id) or {}
+        self._current_term = int(persisted_state.get("current_term", self._current_term))
+        self._voted_for = persisted_state.get("voted_for") or self._voted_for
+        self._leader_id = persisted_state.get("leader_id") or self._leader_id
+        if not self._leader_url:
+            self._leader_url = persisted_state.get("leader_url") or self._leader_url
+
         if self._role == "leader":
-            self._current_term = 1
+            self._current_term = max(1, self._current_term + 1)
+            self._voted_for = self._node_id
             self._leader_id = self._node_id
-            self._leader_url = self._advertise_url
+            self._leader_url = self._advertise_url or self._leader_url
 
         self._apply_replica_mode()
+        with self._lock:
+            self._persist_cluster_state_locked()
 
     @classmethod
     def from_env(cls, coordinator: Coordinator) -> "ClusterManager":
@@ -204,25 +215,27 @@ class ClusterManager:
         started_at = time.time()
         applied = self._coordinator.apply_replicated_operations(operations)
         applied_at = time.time()
-        if source_node_id:
-            self._leader_id = source_node_id
-            self._role = "follower"
-        if operations:
-            self._leader_commit_index = max(self._leader_commit_index, operations[-1].sequence_number)
-        self._last_sync_at = applied_at
-        self._last_error = None
-        self._last_leader_contact_at = applied_at
-        if applied and operations:
-            self._recent_apply_events.appendleft(
-                {
-                    "sequence_number": operations[-1].sequence_number,
-                    "peer_id": source_node_id or self._leader_url or "leader",
-                    "status": "applied",
-                    "applied_at": applied_at,
-                    "latency_ms": int((applied_at - started_at) * 1000),
-                    "applied_count": applied,
-                }
-            )
+        with self._lock:
+            if source_node_id:
+                self._leader_id = source_node_id
+                self._role = "follower"
+            if operations:
+                self._leader_commit_index = max(self._leader_commit_index, operations[-1].sequence_number)
+            self._last_sync_at = applied_at
+            self._last_error = None
+            self._last_leader_contact_at = applied_at
+            self._persist_cluster_state_locked()
+            if applied and operations:
+                self._recent_apply_events.appendleft(
+                    {
+                        "sequence_number": operations[-1].sequence_number,
+                        "peer_id": source_node_id or self._leader_url or "leader",
+                        "status": "applied",
+                        "applied_at": applied_at,
+                        "latency_ms": int((applied_at - started_at) * 1000),
+                        "applied_count": applied,
+                    }
+                )
         return {
             "status": "ok",
             "applied_count": applied,
@@ -247,9 +260,19 @@ class ClusterManager:
                     "last_applied": self._coordinator.get_stats().get("last_sequence", 0),
                 }
 
+            if term == self._current_term and self._voted_for not in {None, leader_id}:
+                return {
+                    "accepted": False,
+                    "term": self._current_term,
+                    "node_id": self._node_id,
+                    "last_applied": self._coordinator.get_stats().get("last_sequence", 0),
+                }
+
             if term > self._current_term:
                 self._current_term = term
-                self._voted_for = None
+                self._voted_for = leader_id
+            elif self._voted_for is None:
+                self._voted_for = leader_id
 
             self._leader_id = leader_id
             self._leader_url = leader_url.rstrip("/") if leader_url else self._leader_url
@@ -259,6 +282,7 @@ class ClusterManager:
                 self._role = "follower"
                 self._apply_replica_mode()
                 self._last_leader_contact_at = time.time()
+            self._persist_cluster_state_locked()
 
             return {
                 "accepted": True,
@@ -298,6 +322,7 @@ class ClusterManager:
             )
             if vote_granted:
                 self._voted_for = candidate_id
+            self._persist_cluster_state_locked()
 
             return {
                 "vote_granted": vote_granted,
@@ -323,6 +348,7 @@ class ClusterManager:
                 if isinstance(peer.get("replication_lag"), int)
             ]
             max_lag = max(lag_values) if lag_values else 0
+            quorum_commit_index = self._compute_quorum_commit_index_locked(current_sequence)
             return {
                 "node_id": self._node_id,
                 "role": self._role,
@@ -339,6 +365,12 @@ class ClusterManager:
                 "peer_count": len(peers),
                 "healthy_peer_count": healthy_peers,
                 "max_replication_lag": max_lag,
+                "quorum_commit_index": quorum_commit_index,
+                "quorum_commit_lag": (
+                    max(0, current_sequence - quorum_commit_index)
+                    if quorum_commit_index is not None
+                    else None
+                ),
                 "write_quorum_ready": (1 + healthy_peers) >= self._quorum_size(),
                 "require_write_quorum": self._require_write_quorum,
                 "push_commit_replication": self._push_commit_replication,
@@ -376,6 +408,7 @@ class ClusterManager:
             self._last_sync_at = applied_at
             self._last_error = None
             self._last_leader_contact_at = applied_at
+            self._persist_cluster_state_locked()
             if applied:
                 last_sequence = operations[-1].sequence_number
                 self._recent_apply_events.appendleft(
@@ -486,12 +519,20 @@ class ClusterManager:
         if self._role != "leader" or not self._require_write_quorum:
             return
         self._poll_peers_once()
-        healthy_peers = sum(1 for peer in self._peer_states.values() if peer.get("healthy"))
-        if (1 + healthy_peers) < self._quorum_size():
-            raise ConflictError(
-                "Write quorum unavailable: not enough healthy peers acknowledged replication health",
-                error="write_quorum_unavailable",
-            )
+        current_sequence = self._coordinator.get_stats().get("last_sequence", 0)
+        with self._lock:
+            healthy_peers = sum(1 for peer in self._peer_states.values() if peer.get("healthy"))
+            if (1 + healthy_peers) < self._quorum_size():
+                raise ConflictError(
+                    "Write quorum unavailable: not enough healthy peers acknowledged replication health",
+                    error="write_quorum_unavailable",
+                )
+            quorum_commit_index = self._compute_quorum_commit_index_locked(current_sequence)
+            if quorum_commit_index is not None and quorum_commit_index < current_sequence:
+                raise ConflictError(
+                    "Write quorum unavailable: prior committed operations have not reached a majority yet",
+                    error="write_quorum_behind",
+                )
 
     def _start_election_once(self, auto: bool = False) -> Dict[str, Any]:
         """Run one election round and become leader on majority votes."""
@@ -512,6 +553,7 @@ class ClusterManager:
             self._leader_url = None
             self._last_error = None
             self._apply_replica_mode()
+            self._persist_cluster_state_locked()
             candidate_last_applied = self._coordinator.get_stats().get("last_sequence", 0)
 
         votes = 1
@@ -544,6 +586,7 @@ class ClusterManager:
                     self._last_leader_contact_at = time.time()
                     self._apply_replica_mode()
                     self._sync_commit_callback_locked()
+                    self._persist_cluster_state_locked()
             self._send_heartbeats_once()
             self._poll_peers_once()
             return {"status": "leader", "term": term, "votes": votes}
@@ -635,6 +678,35 @@ class ClusterManager:
             return True
         return (time.time() - self._last_leader_contact_at) > self._election_timeout_seconds
 
+    def _compute_quorum_commit_index_locked(self, current_sequence: int) -> Optional[int]:
+        """Compute the highest sequence known to be present on a majority."""
+        if self._role == "standalone":
+            self._quorum_commit_index = current_sequence
+            return current_sequence
+        if self._role != "leader":
+            return None
+
+        acked_sequences: List[int] = [current_sequence]
+        for peer in self._peer_urls:
+            peer_state = self._peer_states.get(peer, {})
+            last_applied = peer_state.get("last_applied")
+            acked_sequences.append(int(last_applied) if isinstance(last_applied, int) else 0)
+
+        acked_sequences.sort(reverse=True)
+        quorum_index = acked_sequences[self._quorum_size() - 1] if len(acked_sequences) >= self._quorum_size() else 0
+        self._quorum_commit_index = quorum_index
+        return quorum_index
+
+    def _persist_cluster_state_locked(self) -> None:
+        """Persist durable election metadata for this node."""
+        self._coordinator.save_cluster_state(
+            node_id=self._node_id,
+            current_term=self._current_term,
+            voted_for=self._voted_for,
+            leader_id=self._leader_id,
+            leader_url=self._leader_url,
+        )
+
     def _become_follower(
         self,
         term: int,
@@ -652,6 +724,7 @@ class ClusterManager:
             self._last_leader_contact_at = time.time()
             self._apply_replica_mode()
             self._last_leader_contact_at = time.time()
+            self._persist_cluster_state_locked()
 
     def _quorum_size(self) -> int:
         """Return the majority quorum for the configured node count."""
