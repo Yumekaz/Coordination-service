@@ -357,7 +357,24 @@ class ClusterStatusResponse(BaseModel):
 
 class InternalReplicationApplyRequest(BaseModel):
     source_node_id: Optional[str] = None
+    source_term: Optional[int] = Field(default=None, ge=0)
+    prepared_write: bool = False
     operations: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class InternalReplicationPrepareRequest(BaseModel):
+    leader_id: str
+    leader_url: Optional[str] = None
+    term: int = Field(..., ge=0)
+    start_sequence: int = Field(..., ge=1)
+    count: int = Field(default=1, ge=1)
+
+
+class InternalReplicationCancelPrepareRequest(BaseModel):
+    leader_id: str
+    term: int = Field(..., ge=0)
+    start_sequence: int = Field(..., ge=1)
+    count: int = Field(default=1, ge=1)
 
 
 class InternalHeartbeatRequest(BaseModel):
@@ -967,7 +984,40 @@ async def internal_replication_apply(
     _require_replication_auth(request)
     return _require_cluster_manager().apply_replication_batch(
         source_node_id=payload.source_node_id,
+        source_term=payload.source_term,
+        prepared_write=payload.prepared_write,
         operations_payload=payload.operations,
+    )
+
+
+@app.post("/internal/replication/prepare")
+async def internal_replication_prepare(
+    request: Request,
+    payload: InternalReplicationPrepareRequest,
+) -> dict:
+    """Reserve the exact next operation sequence on a follower."""
+    _require_replication_auth(request)
+    return _require_cluster_manager().receive_prepare(
+        leader_id=payload.leader_id,
+        leader_url=payload.leader_url,
+        term=payload.term,
+        start_sequence=payload.start_sequence,
+        count=payload.count,
+    )
+
+
+@app.post("/internal/replication/cancel-prepare")
+async def internal_replication_cancel_prepare(
+    request: Request,
+    payload: InternalReplicationCancelPrepareRequest,
+) -> dict:
+    """Release a follower-side prepare reservation after a failed quorum attempt."""
+    _require_replication_auth(request)
+    return _require_cluster_manager().receive_cancel_prepare(
+        leader_id=payload.leader_id,
+        term=payload.term,
+        start_sequence=payload.start_sequence,
+        count=payload.count,
     )
 
 

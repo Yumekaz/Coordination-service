@@ -697,7 +697,24 @@ class TestClusterEndpoints:
             if parsed.path == "/internal/replication/apply":
                 return manager.apply_replication_batch(
                     source_node_id=(payload or {}).get("source_node_id"),
+                    source_term=(payload or {}).get("source_term"),
+                    prepared_write=bool((payload or {}).get("prepared_write", False)),
                     operations_payload=(payload or {}).get("operations", []),
+                )
+            if parsed.path == "/internal/replication/prepare":
+                return manager.receive_prepare(
+                    leader_id=(payload or {})["leader_id"],
+                    leader_url=(payload or {}).get("leader_url"),
+                    term=int((payload or {})["term"]),
+                    start_sequence=int((payload or {})["start_sequence"]),
+                    count=int((payload or {}).get("count", 1)),
+                )
+            if parsed.path == "/internal/replication/cancel-prepare":
+                return manager.receive_cancel_prepare(
+                    leader_id=(payload or {})["leader_id"],
+                    term=int((payload or {})["term"]),
+                    start_sequence=int((payload or {})["start_sequence"]),
+                    count=int((payload or {}).get("count", 1)),
                 )
             if parsed.path == "/internal/cluster/request-vote":
                 return manager.request_vote(
@@ -922,6 +939,240 @@ class TestClusterEndpoints:
             except OSError:
                 pass
 
+    def test_prepare_replication_requires_exact_next_sequence(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as follower_db:
+            follower_path = follower_db.name
+
+        follower = Coordinator(db_path=follower_path)
+        follower.start()
+        manager = ClusterManager(follower, node_id="node-b", role="follower")
+
+        try:
+            prepared = manager.receive_prepare(
+                leader_id="node-a",
+                leader_url="http://node-a",
+                term=2,
+                start_sequence=1,
+                count=1,
+            )
+            assert prepared["accepted"] is True
+
+            gap = manager.receive_prepare(
+                leader_id="node-a",
+                leader_url="http://node-a",
+                term=2,
+                start_sequence=2,
+                count=1,
+            )
+            assert gap["accepted"] is False
+            assert gap["reason"] in {"prepare_conflict", "sequence_gap"}
+        finally:
+            manager.stop()
+            follower.stop()
+            try:
+                os.unlink(follower_path)
+            except OSError:
+                pass
+
+    def test_apply_replication_rejects_prepared_batch_without_matching_reservation(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as leader_db, tempfile.NamedTemporaryFile(suffix=".db", delete=False) as follower_db:
+            leader_path = leader_db.name
+            follower_path = follower_db.name
+
+        leader = Coordinator(db_path=leader_path)
+        follower = Coordinator(db_path=follower_path)
+        leader.start()
+        follower.start()
+        follower_cluster = ClusterManager(follower, node_id="node-b", role="follower")
+
+        try:
+            leader.open_session(30)
+            operation = leader.get_operations(limit=1)[0]
+
+            with pytest.raises(ConflictError) as exc_info:
+                follower_cluster.apply_replication_batch(
+                    source_node_id="node-a",
+                    source_term=2,
+                    prepared_write=True,
+                    operations_payload=[operation.to_dict()],
+                )
+
+            assert exc_info.value.error == "replication_prepare_mismatch"
+            assert follower.get_stats()["last_sequence"] == 0
+        finally:
+            follower_cluster.stop()
+            leader.stop()
+            follower.stop()
+            for db_path in (leader_path, follower_path):
+                try:
+                    os.unlink(db_path)
+                except OSError:
+                    pass
+
+    def test_prepare_failure_releases_peer_reservations_for_retry(self):
+        db_paths = []
+        coordinators = []
+        try:
+            for _ in range(2):
+                handle = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+                handle.close()
+                db_paths.append(handle.name)
+                coord = Coordinator(db_path=handle.name)
+                coord.start()
+                coordinators.append(coord)
+
+            leader = coordinators[0]
+            peer = coordinators[1]
+            peer_cluster = ClusterManager(peer, node_id="peer-a", role="follower")
+
+            def request_json(url: str, method: str, payload: dict | None):
+                parsed = parse.urlparse(url)
+                if parsed.path == "/internal/cluster/heartbeat":
+                    peer_id = parsed.netloc
+                    return {
+                        "accepted": True,
+                        "term": int((payload or {}).get("term", 1)),
+                        "node_id": peer_id,
+                        "last_applied": 0,
+                    }
+                if parsed.path == "/internal/replication/state":
+                    peer_id = parsed.netloc
+                    return {
+                        "node_id": peer_id,
+                        "role": "follower",
+                        "term": 1,
+                        "commit_index": 0,
+                        "last_applied": 0,
+                        "read_only": True,
+                        "last_sync_at": None,
+                        "last_error": None,
+                        "leader_id": "leader-a",
+                        "leader_url": "http://leader-a",
+                    }
+                if parsed.path == "/internal/replication/prepare":
+                    if parsed.netloc == "peer-a":
+                        return peer_cluster.receive_prepare(
+                            leader_id=(payload or {})["leader_id"],
+                            leader_url=(payload or {}).get("leader_url"),
+                            term=int((payload or {})["term"]),
+                            start_sequence=int((payload or {})["start_sequence"]),
+                            count=int((payload or {}).get("count", 1)),
+                        )
+                    return {
+                        "accepted": False,
+                        "term": int((payload or {}).get("term", 1)),
+                        "node_id": parsed.netloc,
+                        "last_applied": 0,
+                        "reason": "prepare_rejected",
+                    }
+                if parsed.path == "/internal/replication/cancel-prepare":
+                    if parsed.netloc == "peer-a":
+                        return peer_cluster.receive_cancel_prepare(
+                            leader_id=(payload or {})["leader_id"],
+                            term=int((payload or {})["term"]),
+                            start_sequence=int((payload or {})["start_sequence"]),
+                            count=int((payload or {}).get("count", 1)),
+                        )
+                    return {"cancelled": False, "node_id": parsed.netloc, "term": 1, "last_applied": 0}
+                raise AssertionError(f"Unexpected replication URL: {url}")
+
+            leader_cluster = ClusterManager(
+                leader,
+                node_id="leader-a",
+                role="leader",
+                peer_urls=["http://peer-a", "http://peer-b", "http://peer-c"],
+                advertise_url="http://leader-a",
+                require_write_quorum=True,
+                request_json=request_json,
+            )
+            leader_cluster.start()
+
+            try:
+                with pytest.raises(ConflictError) as exc_info:
+                    leader.open_session(30)
+
+                assert exc_info.value.error == "write_quorum_prepare_failed"
+                retry = peer_cluster.receive_prepare(
+                    leader_id="leader-a",
+                    leader_url="http://leader-a",
+                    term=1,
+                    start_sequence=1,
+                    count=2,
+                )
+                assert retry["accepted"] is True
+            finally:
+                leader_cluster.stop()
+                peer_cluster.stop()
+        finally:
+            for coord in coordinators:
+                coord.stop()
+            for db_path in db_paths:
+                try:
+                    os.unlink(db_path)
+                except OSError:
+                    pass
+
+    def test_batch_prepare_is_consumed_by_session_close_delete_replication(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as leader_db, tempfile.NamedTemporaryFile(suffix=".db", delete=False) as follower_db:
+            leader_path = leader_db.name
+            follower_path = follower_db.name
+
+        leader = Coordinator(db_path=leader_path)
+        follower = Coordinator(db_path=follower_path)
+        leader.start()
+        follower.start()
+        follower_cluster = ClusterManager(follower, node_id="node-b", role="follower")
+
+        try:
+            session = leader.open_session(30)
+            leader.create("/trace", b"root", persistent=True)
+            leader.create("/trace/lease", b"holder", persistent=False, session_id=session.session_id)
+
+            initial_operations = leader.get_operations(limit=3)
+            follower.apply_replicated_operations(initial_operations)
+
+            leader.close_session(session.session_id)
+            batch_operations = leader.get_operations(since_sequence=3, limit=2)
+            assert [operation.operation_type.value for operation in batch_operations] == ["SESSION_CLOSE", "DELETE"]
+
+            prepared = follower_cluster.receive_prepare(
+                leader_id="node-a",
+                leader_url="http://node-a",
+                term=2,
+                start_sequence=4,
+                count=2,
+            )
+            assert prepared["accepted"] is True
+
+            first_apply = follower_cluster.apply_replication_batch(
+                source_node_id="node-a",
+                source_term=2,
+                prepared_write=True,
+                operations_payload=[batch_operations[0].to_dict()],
+            )
+            assert first_apply["applied_count"] == 1
+
+            second_apply = follower_cluster.apply_replication_batch(
+                source_node_id="node-a",
+                source_term=2,
+                prepared_write=True,
+                operations_payload=[batch_operations[1].to_dict()],
+            )
+            assert second_apply["applied_count"] == 1
+            assert follower.get("/trace/lease") is None
+            replicated_session = follower.get_session_detail(session.session_id)
+            assert replicated_session is not None
+            assert replicated_session["is_alive"] is False
+        finally:
+            follower_cluster.stop()
+            leader.stop()
+            follower.stop()
+            for db_path in (leader_path, follower_path):
+                try:
+                    os.unlink(db_path)
+                except OSError:
+                    pass
+
     def test_vote_persists_across_cluster_manager_restart(self):
         with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as cluster_db:
             db_path = cluster_db.name
@@ -1000,7 +1251,24 @@ class TestClusterEndpoints:
             if parsed.path == "/internal/replication/apply":
                 return follower_cluster.apply_replication_batch(
                     source_node_id=(payload or {}).get("source_node_id"),
+                    source_term=(payload or {}).get("source_term"),
+                    prepared_write=bool((payload or {}).get("prepared_write", False)),
                     operations_payload=(payload or {}).get("operations", []),
+                )
+            if parsed.path == "/internal/replication/prepare":
+                return follower_cluster.receive_prepare(
+                    leader_id=(payload or {})["leader_id"],
+                    leader_url=(payload or {}).get("leader_url"),
+                    term=int((payload or {})["term"]),
+                    start_sequence=int((payload or {})["start_sequence"]),
+                    count=int((payload or {}).get("count", 1)),
+                )
+            if parsed.path == "/internal/replication/cancel-prepare":
+                return follower_cluster.receive_cancel_prepare(
+                    leader_id=(payload or {})["leader_id"],
+                    term=int((payload or {})["term"]),
+                    start_sequence=int((payload or {})["start_sequence"]),
+                    count=int((payload or {}).get("count", 1)),
                 )
             if parsed.path == "/internal/replication/state":
                 return follower_cluster.get_internal_state()
@@ -1018,6 +1286,7 @@ class TestClusterEndpoints:
             node_id="leader-a",
             role="leader",
             peer_urls=["http://follower.test"],
+            require_write_quorum=True,
             request_json=fake_request_json,
         )
         leader_cluster.start()
@@ -1120,6 +1389,15 @@ class TestClusterEndpoints:
                     "leader_id": "leader-a",
                     "leader_url": "http://leader-a",
                 }
+            if parsed.path == "/internal/replication/prepare":
+                return {
+                    "accepted": True,
+                    "term": int((payload or {}).get("term", 1)),
+                    "node_id": "peer-a",
+                    "last_applied": peer_state["last_applied"],
+                    "prepared_sequence": int((payload or {}).get("start_sequence", 1)),
+                    "prepared_count": int((payload or {}).get("count", 1)),
+                }
             if parsed.path == "/internal/replication/apply":
                 raise RuntimeError("replication apply failed")
             raise AssertionError(f"Unexpected replication URL: {url}")
@@ -1147,6 +1425,73 @@ class TestClusterEndpoints:
                 leader.create("/blocked", b"payload", persistent=True)
 
             assert exc_info.value.error == "write_quorum_behind"
+        finally:
+            leader_cluster.stop()
+            leader.stop()
+            try:
+                os.unlink(leader_path)
+            except OSError:
+                pass
+
+    def test_leader_rejects_write_when_peer_is_healthy_but_not_ready_for_next_sequence(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as leader_db:
+            leader_path = leader_db.name
+
+        leader = Coordinator(db_path=leader_path)
+        leader.start()
+
+        def prepare_misaligned_request_json(url: str, method: str, payload: dict | None):
+            parsed = parse.urlparse(url)
+            if parsed.path == "/internal/cluster/heartbeat":
+                return {
+                    "accepted": True,
+                    "term": int((payload or {}).get("term", 1)),
+                    "node_id": "peer-a",
+                    "last_applied": 5,
+                }
+            if parsed.path == "/internal/replication/state":
+                return {
+                    "node_id": "peer-a",
+                    "role": "follower",
+                    "term": 1,
+                    "commit_index": 5,
+                    "last_applied": 5,
+                    "read_only": True,
+                    "last_sync_at": None,
+                    "last_error": None,
+                    "leader_id": "leader-a",
+                    "leader_url": "http://leader-a",
+                }
+            if parsed.path == "/internal/replication/prepare":
+                return {
+                    "accepted": False,
+                    "term": int((payload or {}).get("term", 1)),
+                    "node_id": "peer-a",
+                    "last_applied": 5,
+                    "expected_next": 6,
+                    "reason": "sequence_gap",
+                }
+            if parsed.path == "/internal/replication/apply":
+                raise AssertionError("prepare failure should block local commit before apply")
+            raise AssertionError(f"Unexpected replication URL: {url}")
+
+        leader_cluster = ClusterManager(
+            leader,
+            node_id="leader-a",
+            role="leader",
+            peer_urls=["http://peer-a"],
+            advertise_url="http://leader-a",
+            require_write_quorum=True,
+            request_json=prepare_misaligned_request_json,
+        )
+        leader_cluster.start()
+
+        try:
+            with pytest.raises(ConflictError) as exc_info:
+                leader.open_session(30)
+
+            assert exc_info.value.error == "write_quorum_prepare_failed"
+            assert leader.get_stats()["last_sequence"] == 0
         finally:
             leader_cluster.stop()
             leader.stop()

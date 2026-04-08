@@ -46,6 +46,7 @@ class ClusterManager:
         advertise_url: Optional[str] = None,
         heartbeat_interval_seconds: float = 1.0,
         election_timeout_seconds: float = 3.0,
+        prepare_timeout_seconds: float = 5.0,
         request_json: Optional[Callable[[str, str, Optional[Dict[str, Any]]], Dict[str, Any]]] = None,
     ):
         self._coordinator = coordinator
@@ -64,9 +65,11 @@ class ClusterManager:
             self._heartbeat_interval_seconds * 2.0,
             float(election_timeout_seconds),
         )
+        self._prepare_timeout_seconds = max(0.5, float(prepare_timeout_seconds))
         self._request_json = request_json or self._default_request_json
 
         self._lock = threading.RLock()
+        self._prepare_barrier = threading.RLock()
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._last_sync_at: Optional[float] = None
@@ -78,6 +81,11 @@ class ClusterManager:
         self._voted_for: Optional[str] = None
         self._last_leader_contact_at: Optional[float] = time.time() if self._role == "leader" else None
         self._quorum_commit_index = 0
+        self._prepared_sequence: Optional[int] = None
+        self._prepared_count: int = 0
+        self._prepared_term: Optional[int] = None
+        self._prepared_leader_id: Optional[str] = None
+        self._prepared_expires_at: Optional[float] = None
         self._peer_states: Dict[str, Dict[str, Any]] = {
             peer: {
                 "peer_url": peer,
@@ -127,6 +135,7 @@ class ClusterManager:
         advertise_url = os.environ.get("COORD_ADVERTISE_URL")
         heartbeat_interval = float(os.environ.get("COORD_HEARTBEAT_INTERVAL", "1.0"))
         election_timeout = float(os.environ.get("COORD_ELECTION_TIMEOUT", "3.0"))
+        prepare_timeout = float(os.environ.get("COORD_PREPARE_TIMEOUT", "5.0"))
         return cls(
             coordinator,
             node_id=node_id,
@@ -141,6 +150,7 @@ class ClusterManager:
             advertise_url=advertise_url,
             heartbeat_interval_seconds=heartbeat_interval,
             election_timeout_seconds=election_timeout,
+            prepare_timeout_seconds=prepare_timeout,
         )
 
     def start(self) -> None:
@@ -170,6 +180,7 @@ class ClusterManager:
                 self._coordinator.remove_commit_callback(self._on_leader_commit)
                 self._commit_callback_registered = False
             self._coordinator.set_write_guard(None)
+            self._coordinator.set_prepare_guard(None)
         if thread is not None:
             thread.join(timeout=2.0)
 
@@ -208,19 +219,44 @@ class ClusterManager:
     def apply_replication_batch(
         self,
         source_node_id: Optional[str],
+        source_term: Optional[int],
         operations_payload: List[Dict[str, Any]],
+        prepared_write: bool = False,
     ) -> Dict[str, Any]:
         """Apply a pushed replication batch on a follower."""
         operations = [Operation.from_dict(item) for item in operations_payload]
         started_at = time.time()
+        with self._lock:
+            self._clear_expired_prepare_locked()
+            if prepared_write and operations:
+                reason = self._validate_prepare_reservation_locked(
+                    leader_id=source_node_id,
+                    term=source_term,
+                    operations=operations,
+                )
+                if reason is not None:
+                    raise ConflictError(
+                        "Replication apply rejected: follower has no matching prepare reservation",
+                        error="replication_prepare_mismatch",
+                        reason=reason,
+                    )
         applied = self._coordinator.apply_replicated_operations(operations)
         applied_at = time.time()
         with self._lock:
+            self._clear_expired_prepare_locked()
             if source_node_id:
                 self._leader_id = source_node_id
                 self._role = "follower"
+            if source_term is not None and source_term > self._current_term:
+                self._current_term = int(source_term)
+                self._voted_for = source_node_id or self._voted_for
             if operations:
                 self._leader_commit_index = max(self._leader_commit_index, operations[-1].sequence_number)
+                self._advance_prepare_reservation_locked(
+                    leader_id=source_node_id,
+                    term=source_term,
+                    operations=operations,
+                )
             self._last_sync_at = applied_at
             self._last_error = None
             self._last_leader_contact_at = applied_at
@@ -243,6 +279,247 @@ class ClusterManager:
             "node_id": self._node_id,
         }
 
+    def receive_prepare(
+        self,
+        leader_id: str,
+        term: int,
+        leader_url: Optional[str],
+        start_sequence: int,
+        count: int = 1,
+    ) -> Dict[str, Any]:
+        """Reserve the exact next committed sequence range for a leader."""
+        if count < 1:
+            raise ValueError("prepare count must be at least 1")
+
+        with self._lock:
+            self._clear_expired_prepare_locked()
+            local_last_applied = self._coordinator.get_stats().get("last_sequence", 0)
+            expected_next = local_last_applied + 1
+
+            if term < self._current_term:
+                return {
+                    "accepted": False,
+                    "term": self._current_term,
+                    "node_id": self._node_id,
+                    "last_applied": local_last_applied,
+                    "expected_next": expected_next,
+                    "reason": "stale_term",
+                }
+
+            if term == self._current_term and self._voted_for not in {None, leader_id}:
+                return {
+                    "accepted": False,
+                    "term": self._current_term,
+                    "node_id": self._node_id,
+                    "last_applied": local_last_applied,
+                    "expected_next": expected_next,
+                    "reason": "voted_for_other_leader",
+                }
+
+            if start_sequence != expected_next:
+                return {
+                    "accepted": False,
+                    "term": self._current_term,
+                    "node_id": self._node_id,
+                    "last_applied": local_last_applied,
+                    "expected_next": expected_next,
+                    "reason": "sequence_gap",
+                }
+
+            if self._prepared_sequence is not None:
+                same_reservation = (
+                    self._prepared_sequence == start_sequence
+                    and self._prepared_count == count
+                    and self._prepared_term == term
+                    and self._prepared_leader_id == leader_id
+                )
+                if not same_reservation:
+                    return {
+                        "accepted": False,
+                        "term": self._current_term,
+                        "node_id": self._node_id,
+                        "last_applied": local_last_applied,
+                        "expected_next": expected_next,
+                        "reason": "prepare_conflict",
+                    }
+
+            if term > self._current_term:
+                self._current_term = term
+                self._voted_for = leader_id
+                if self._role != "standalone":
+                    self._role = "follower"
+                    self._apply_replica_mode()
+            elif self._voted_for is None:
+                self._voted_for = leader_id
+
+            self._leader_id = leader_id
+            self._leader_url = leader_url.rstrip("/") if leader_url else self._leader_url
+            self._last_leader_contact_at = time.time()
+            self._prepared_sequence = start_sequence
+            self._prepared_count = count
+            self._prepared_term = term
+            self._prepared_leader_id = leader_id
+            self._prepared_expires_at = time.time() + self._prepare_timeout_seconds
+            self._persist_cluster_state_locked()
+
+            return {
+                "accepted": True,
+                "term": self._current_term,
+                "node_id": self._node_id,
+                "last_applied": local_last_applied,
+                "prepared_sequence": start_sequence,
+                "prepared_count": count,
+            }
+
+    def receive_cancel_prepare(
+        self,
+        leader_id: str,
+        term: int,
+        start_sequence: int,
+        count: int = 1,
+    ) -> Dict[str, Any]:
+        """Best-effort release for a follower-side prepare reservation."""
+        with self._lock:
+            cancelled = (
+                self._prepared_sequence == start_sequence
+                and self._prepared_count == count
+                and self._prepared_term == term
+                and self._prepared_leader_id == leader_id
+            )
+            if cancelled:
+                self._clear_prepare_reservation_locked()
+            return {
+                "cancelled": cancelled,
+                "term": self._current_term,
+                "node_id": self._node_id,
+                "last_applied": self._coordinator.get_stats().get("last_sequence", 0),
+            }
+
+    def prepare_write_quorum(
+        self,
+        operations: List[Operation],
+    ) -> Optional[Callable[[], None]]:
+        """Require a majority of peers to reserve the exact next sequence range."""
+        if self._role != "leader" or not self._require_write_quorum or not self._peer_urls:
+            return None
+        if not operations:
+            return None
+
+        ordered = sorted(operations, key=lambda operation: operation.sequence_number)
+        start_sequence = ordered[0].sequence_number
+        for index, operation in enumerate(ordered):
+            expected_sequence = start_sequence + index
+            if operation.sequence_number != expected_sequence:
+                raise ConflictError(
+                    "Prepared write batch must be contiguous",
+                    error="write_quorum_prepare_invalid",
+                )
+
+        barrier = self._prepare_barrier
+        barrier.acquire()
+        released = False
+        prepared_peers: List[str] = []
+
+        def release_prepare() -> None:
+            nonlocal released
+            if not released:
+                released = True
+                barrier.release()
+
+        try:
+            with self._lock:
+                if self._role != "leader":
+                    raise ConflictError(
+                        "Write quorum prepare failed: this node is no longer the leader",
+                        error="write_quorum_stepped_down",
+                    )
+                current_term = self._current_term
+
+            self.assert_write_quorum_available(current_sequence_override=start_sequence - 1)
+
+            reserved_votes = 1
+            for peer in self._peer_urls:
+                started_at = time.time()
+                try:
+                    payload = self._request_json(
+                        f"{peer}/internal/replication/prepare",
+                        "POST",
+                        {
+                            "leader_id": self._node_id,
+                            "leader_url": self._advertise_url,
+                            "term": current_term,
+                            "start_sequence": start_sequence,
+                            "count": len(ordered),
+                        },
+                    )
+                    peer_term = int(payload.get("term", current_term))
+                    if peer_term > current_term:
+                        self._become_follower(peer_term, payload.get("node_id"), peer)
+                        raise ConflictError(
+                            "Write quorum prepare failed: remote node advertises a higher term leader",
+                            error="write_quorum_stepped_down",
+                        )
+
+                    reserved = bool(payload.get("accepted"))
+                    last_applied = int(payload.get("last_applied", 0))
+                    self._peer_states[peer] = {
+                        "peer_url": peer,
+                        "peer_id": payload.get("node_id"),
+                        "role": "follower",
+                        "reachable": True,
+                        "healthy": reserved,
+                        "last_applied": last_applied,
+                        "replication_lag": max(0, self._coordinator.get_stats().get("last_sequence", 0) - last_applied),
+                        "last_ack_at": time.time(),
+                        "last_error": None if reserved else payload.get("reason", "prepare_rejected"),
+                    }
+                    if reserved:
+                        prepared_peers.append(peer)
+                        reserved_votes += 1
+                    self._recent_apply_events.appendleft(
+                        {
+                            "sequence_number": ordered[-1].sequence_number,
+                            "peer_id": payload.get("node_id") or peer,
+                            "status": "prepared" if reserved else "prepare_rejected",
+                            "applied_at": time.time(),
+                            "latency_ms": int((time.time() - started_at) * 1000),
+                            "applied_count": 0,
+                        }
+                    )
+                except ConflictError:
+                    raise
+                except Exception as exc:
+                    self._peer_states[peer] = {
+                        "peer_url": peer,
+                        "peer_id": None,
+                        "role": "unknown",
+                        "reachable": False,
+                        "healthy": False,
+                        "last_applied": 0,
+                        "replication_lag": None,
+                        "last_ack_at": None,
+                        "last_error": str(exc),
+                    }
+
+            if reserved_votes < self._quorum_size():
+                self._cancel_prepare_reservations(
+                    peers=prepared_peers,
+                    term=current_term,
+                    start_sequence=start_sequence,
+                    count=len(ordered),
+                )
+                raise ConflictError(
+                    "Write quorum prepare failed: majority could not reserve the next committed sequence",
+                    error="write_quorum_prepare_failed",
+                    start_sequence=start_sequence,
+                    prepared_votes=reserved_votes,
+                    quorum_size=self._quorum_size(),
+                )
+            return release_prepare
+        except Exception:
+            release_prepare()
+            raise
+
     def receive_heartbeat(
         self,
         leader_id: str,
@@ -251,45 +528,54 @@ class ClusterManager:
         commit_index: int,
     ) -> Dict[str, Any]:
         """Accept or reject a leader heartbeat."""
-        with self._lock:
-            if term < self._current_term:
-                return {
-                    "accepted": False,
-                    "term": self._current_term,
-                    "node_id": self._node_id,
-                    "last_applied": self._coordinator.get_stats().get("last_sequence", 0),
-                }
+        apply_mode = False
+        with self._prepare_barrier:
+            with self._lock:
+                if term < self._current_term:
+                    return {
+                        "accepted": False,
+                        "term": self._current_term,
+                        "node_id": self._node_id,
+                        "last_applied": self._coordinator.get_stats().get("last_sequence", 0),
+                    }
 
-            if term == self._current_term and self._voted_for not in {None, leader_id}:
-                return {
-                    "accepted": False,
-                    "term": self._current_term,
-                    "node_id": self._node_id,
-                    "last_applied": self._coordinator.get_stats().get("last_sequence", 0),
-                }
+                if term == self._current_term and self._voted_for not in {None, leader_id}:
+                    return {
+                        "accepted": False,
+                        "term": self._current_term,
+                        "node_id": self._node_id,
+                        "last_applied": self._coordinator.get_stats().get("last_sequence", 0),
+                    }
 
-            if term > self._current_term:
-                self._current_term = term
-                self._voted_for = leader_id
-            elif self._voted_for is None:
-                self._voted_for = leader_id
+                if term > self._current_term:
+                    self._current_term = term
+                    self._voted_for = leader_id
+                elif self._voted_for is None:
+                    self._voted_for = leader_id
 
-            self._leader_id = leader_id
-            self._leader_url = leader_url.rstrip("/") if leader_url else self._leader_url
-            self._leader_commit_index = max(self._leader_commit_index, commit_index)
-            self._last_leader_contact_at = time.time()
-            if self._role != "standalone":
-                self._role = "follower"
-                self._apply_replica_mode()
+                self._leader_id = leader_id
+                self._leader_url = leader_url.rstrip("/") if leader_url else self._leader_url
+                self._leader_commit_index = max(self._leader_commit_index, commit_index)
                 self._last_leader_contact_at = time.time()
-            self._persist_cluster_state_locked()
+                self._clear_prepare_reservation_locked()
+                if self._role != "standalone":
+                    self._role = "follower"
+                    apply_mode = True
+                    self._last_leader_contact_at = time.time()
+                self._persist_cluster_state_locked()
 
-            return {
-                "accepted": True,
-                "term": self._current_term,
-                "node_id": self._node_id,
-                "last_applied": self._coordinator.get_stats().get("last_sequence", 0),
-            }
+                response = {
+                    "accepted": True,
+                    "term": self._current_term,
+                    "node_id": self._node_id,
+                    "last_applied": self._coordinator.get_stats().get("last_sequence", 0),
+                }
+
+        if apply_mode:
+            self._apply_replica_mode()
+            with self._lock:
+                self._last_leader_contact_at = time.time()
+        return response
 
     def request_vote(
         self,
@@ -298,37 +584,44 @@ class ClusterManager:
         candidate_last_applied: int,
     ) -> Dict[str, Any]:
         """Evaluate a vote request from a candidate."""
-        with self._lock:
-            if term < self._current_term:
-                return {
-                    "vote_granted": False,
+        apply_mode = False
+        with self._prepare_barrier:
+            with self._lock:
+                if term < self._current_term:
+                    return {
+                        "vote_granted": False,
+                        "term": self._current_term,
+                        "node_id": self._node_id,
+                    }
+
+                if term > self._current_term:
+                    self._current_term = term
+                    self._voted_for = None
+                    self._leader_id = None
+                    self._leader_url = None
+                    self._clear_prepare_reservation_locked()
+                    if self._role != "standalone":
+                        self._role = "follower"
+                        apply_mode = True
+
+                local_last_applied = self._coordinator.get_stats().get("last_sequence", 0)
+                vote_granted = (
+                    (self._voted_for is None or self._voted_for == candidate_id)
+                    and candidate_last_applied >= local_last_applied
+                )
+                if vote_granted:
+                    self._voted_for = candidate_id
+                self._persist_cluster_state_locked()
+
+                response = {
+                    "vote_granted": vote_granted,
                     "term": self._current_term,
                     "node_id": self._node_id,
                 }
 
-            if term > self._current_term:
-                self._current_term = term
-                self._voted_for = None
-                self._leader_id = None
-                self._leader_url = None
-                if self._role != "standalone":
-                    self._role = "follower"
-                    self._apply_replica_mode()
-
-            local_last_applied = self._coordinator.get_stats().get("last_sequence", 0)
-            vote_granted = (
-                (self._voted_for is None or self._voted_for == candidate_id)
-                and candidate_last_applied >= local_last_applied
-            )
-            if vote_granted:
-                self._voted_for = candidate_id
-            self._persist_cluster_state_locked()
-
-            return {
-                "vote_granted": vote_granted,
-                "term": self._current_term,
-                "node_id": self._node_id,
-            }
+        if apply_mode:
+            self._apply_replica_mode()
+        return response
 
     def trigger_election(self) -> Dict[str, Any]:
         """Start one leader-election attempt and return the outcome."""
@@ -514,12 +807,16 @@ class ClusterManager:
                     "last_error": str(exc),
                 }
 
-    def assert_write_quorum_available(self) -> None:
+    def assert_write_quorum_available(self, current_sequence_override: Optional[int] = None) -> None:
         """Reject writes when the leader cannot reach a majority of peers."""
         if self._role != "leader" or not self._require_write_quorum:
             return
         self._poll_peers_once()
-        current_sequence = self._coordinator.get_stats().get("last_sequence", 0)
+        current_sequence = (
+            self._coordinator.get_stats().get("last_sequence", 0)
+            if current_sequence_override is None
+            else int(current_sequence_override)
+        )
         with self._lock:
             healthy_peers = sum(1 for peer in self._peer_states.values() if peer.get("healthy"))
             if (1 + healthy_peers) < self._quorum_size():
@@ -552,6 +849,7 @@ class ClusterManager:
             self._leader_id = None
             self._leader_url = None
             self._last_error = None
+            self._clear_prepare_reservation_locked()
             self._apply_replica_mode()
             self._persist_cluster_state_locked()
             candidate_last_applied = self._coordinator.get_stats().get("last_sequence", 0)
@@ -584,6 +882,7 @@ class ClusterManager:
                     self._leader_id = self._node_id
                     self._leader_url = self._advertise_url
                     self._last_leader_contact_at = time.time()
+                    self._clear_prepare_reservation_locked()
                     self._apply_replica_mode()
                     self._sync_commit_callback_locked()
                     self._persist_cluster_state_locked()
@@ -607,6 +906,8 @@ class ClusterManager:
                     "POST",
                     {
                         "source_node_id": self._node_id,
+                        "source_term": self._current_term,
+                        "prepared_write": self._require_write_quorum,
                         "operations": [operation.to_dict()],
                     },
                 )
@@ -654,9 +955,12 @@ class ClusterManager:
                 "This node is not the active leader. Write to the leader instead.",
             )
             self._coordinator.disable_local_maintenance()
+            self._coordinator.set_write_guard(None)
+            self._coordinator.set_prepare_guard(None)
         else:
             self._coordinator.set_read_only(False)
             self._coordinator.set_write_guard(self.assert_write_quorum_available if self._require_write_quorum else None)
+            self._coordinator.set_prepare_guard(self.prepare_write_quorum if self._require_write_quorum else None)
             self._coordinator.enable_local_maintenance()
         self._sync_commit_callback_locked()
 
@@ -677,6 +981,106 @@ class ClusterManager:
         if self._last_leader_contact_at is None:
             return True
         return (time.time() - self._last_leader_contact_at) > self._election_timeout_seconds
+
+    def _clear_expired_prepare_locked(self) -> None:
+        """Drop stale follower-side prepare reservations."""
+        if self._prepared_expires_at is None:
+            return
+        if time.time() >= self._prepared_expires_at:
+            self._clear_prepare_reservation_locked()
+
+    def _clear_prepare_reservation_locked(self) -> None:
+        """Clear any follower-side prepare reservation."""
+        self._prepared_sequence = None
+        self._prepared_count = 0
+        self._prepared_term = None
+        self._prepared_leader_id = None
+        self._prepared_expires_at = None
+
+    def _validate_prepare_reservation_locked(
+        self,
+        leader_id: Optional[str],
+        term: Optional[int],
+        operations: List[Operation],
+    ) -> Optional[str]:
+        """Return a rejection reason when a pushed batch does not match the reservation."""
+        if self._prepared_sequence is None:
+            return "prepare_missing"
+        if leader_id != self._prepared_leader_id:
+            self._clear_prepare_reservation_locked()
+            return "leader_mismatch"
+        if term is not None and self._prepared_term is not None and term != self._prepared_term:
+            self._clear_prepare_reservation_locked()
+            return "term_mismatch"
+
+        next_sequence = self._prepared_sequence
+        remaining = self._prepared_count
+        for operation in sorted(operations, key=lambda item: item.sequence_number):
+            if operation.sequence_number != next_sequence:
+                self._clear_prepare_reservation_locked()
+                return "sequence_mismatch"
+            next_sequence += 1
+            remaining -= 1
+            if remaining < 0:
+                self._clear_prepare_reservation_locked()
+                return "prepared_count_exceeded"
+        return None
+
+    def _advance_prepare_reservation_locked(
+        self,
+        leader_id: Optional[str],
+        term: Optional[int],
+        operations: List[Operation],
+    ) -> None:
+        """Consume or invalidate a reserved sequence range as commits arrive."""
+        self._clear_expired_prepare_locked()
+        if (
+            self._prepared_sequence is None
+            or not operations
+            or leader_id != self._prepared_leader_id
+            or (term is not None and self._prepared_term is not None and term != self._prepared_term)
+        ):
+            return
+
+        next_sequence = self._prepared_sequence
+        remaining = self._prepared_count
+        for operation in sorted(operations, key=lambda item: item.sequence_number):
+            if operation.sequence_number != next_sequence:
+                self._clear_prepare_reservation_locked()
+                return
+            next_sequence += 1
+            remaining -= 1
+            if remaining <= 0:
+                self._clear_prepare_reservation_locked()
+                return
+
+        self._prepared_sequence = next_sequence
+        self._prepared_count = remaining
+        self._prepared_expires_at = time.time() + self._prepare_timeout_seconds
+
+    def _cancel_prepare_reservations(
+        self,
+        *,
+        peers: List[str],
+        term: int,
+        start_sequence: int,
+        count: int,
+    ) -> None:
+        """Best-effort release of follower reservations after a failed prepare quorum."""
+        for peer in peers:
+            try:
+                self._request_json(
+                    f"{peer}/internal/replication/cancel-prepare",
+                    "POST",
+                    {
+                        "leader_id": self._node_id,
+                        "term": term,
+                        "start_sequence": start_sequence,
+                        "count": count,
+                    },
+                )
+            except Exception:
+                continue
 
     def _compute_quorum_commit_index_locked(self, current_sequence: int) -> Optional[int]:
         """Compute the highest sequence known to be present on a majority."""
@@ -714,17 +1118,19 @@ class ClusterManager:
         leader_url: Optional[str],
     ) -> None:
         """Transition into follower mode under a newer term or remote leader."""
-        with self._lock:
-            if term > self._current_term:
-                self._current_term = term
-                self._voted_for = None
-            self._role = "follower"
-            self._leader_id = leader_id
-            self._leader_url = leader_url.rstrip("/") if isinstance(leader_url, str) and leader_url else self._leader_url
-            self._last_leader_contact_at = time.time()
-            self._apply_replica_mode()
-            self._last_leader_contact_at = time.time()
-            self._persist_cluster_state_locked()
+        with self._prepare_barrier:
+            with self._lock:
+                if term > self._current_term:
+                    self._current_term = term
+                    self._voted_for = None
+                self._role = "follower"
+                self._leader_id = leader_id
+                self._leader_url = leader_url.rstrip("/") if isinstance(leader_url, str) and leader_url else self._leader_url
+                self._last_leader_contact_at = time.time()
+                self._clear_prepare_reservation_locked()
+                self._last_leader_contact_at = time.time()
+                self._persist_cluster_state_locked()
+        self._apply_replica_mode()
 
     def _quorum_size(self) -> int:
         """Return the majority quorum for the configured node count."""

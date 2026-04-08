@@ -78,6 +78,7 @@ class Coordinator:
         self._read_only = False
         self._read_only_reason = ""
         self._write_guard: Optional[Callable[[], None]] = None
+        self._prepare_guard: Optional[Callable[[List[Operation]], Optional[Callable[[], None]]]] = None
         
         # Initialize components
         self._persistence = Persistence(db_path)
@@ -161,6 +162,14 @@ class Coordinator:
         with self._lock:
             self._write_guard = guard
 
+    def set_prepare_guard(
+        self,
+        guard: Optional[Callable[[List[Operation]], Optional[Callable[[], None]]]],
+    ) -> None:
+        """Install an optional exact-sequence prepare barrier for one write batch."""
+        with self._lock:
+            self._prepare_guard = guard
+
     def get_read_only_status(self) -> Dict[str, Any]:
         """Return current read-only status metadata."""
         with self._lock:
@@ -230,6 +239,16 @@ class Coordinator:
             )
         if self._write_guard is not None:
             self._write_guard()
+
+    def _prepare_write_batch(self, operations: List[Operation]) -> Optional[Callable[[], None]]:
+        """Run any installed exact-sequence prepare hook before local persistence."""
+        if operations and self._prepare_guard is not None:
+            return self._prepare_guard(list(operations))
+        return None
+
+    def _prepare_operation(self, operation: Operation) -> Optional[Callable[[], None]]:
+        """Run an optional cluster-side prepare step before local persistence."""
+        return self._prepare_write_batch([operation])
     
     # ========== Session Operations ==========
     
@@ -251,12 +270,17 @@ class Coordinator:
                 session_id=session.session_id,
             )
             operation.data = self._encode_session_operation_payload(session)
+            release_prepare = None
             try:
+                release_prepare = self._prepare_operation(operation)
                 self._persistence.atomic_save_session(session, operation)
             except Exception:
                 self._session_manager.remove_session(session.session_id)
                 self._operation_log.discard_last_operation(operation.sequence_number)
                 raise
+            finally:
+                if release_prepare is not None:
+                    release_prepare()
             self._operation_log.commit(operation)
             self._mark_session_inventory_changed()
             
@@ -291,12 +315,17 @@ class Coordinator:
                 session_id=session_id,
             )
             operation.data = self._encode_session_operation_payload(session)
+            release_prepare = None
             try:
+                release_prepare = self._prepare_operation(operation)
                 self._persistence.atomic_save_session(session, operation)
             except Exception:
                 self._session_manager.replace_session(snapshot)
                 self._operation_log.discard_last_operation(operation.sequence_number)
                 raise
+            finally:
+                if release_prepare is not None:
+                    release_prepare()
             self._operation_log.commit(operation)
             self._mark_session_inventory_changed()
             
@@ -820,7 +849,9 @@ class Coordinator:
                     sequence_number=delete_operation.sequence_number,
                     timestamp=delete_operation.timestamp,
                 )
+                release_prepare = None
                 try:
+                    release_prepare = self._prepare_write_batch([session_close_operation, delete_operation])
                     self._persistence.atomic_delete_node(
                         deleted_paths,
                         delete_operation,
@@ -832,6 +863,9 @@ class Coordinator:
                     self._operation_log.discard_last_operation(delete_operation.sequence_number)
                     self._operation_log.discard_last_operation(session_close_operation.sequence_number)
                     raise
+                finally:
+                    if release_prepare is not None:
+                        release_prepare()
 
                 self._metadata_tree.apply_delete_paths(deleted_paths)
                 session.ephemeral_nodes.clear()
@@ -845,7 +879,9 @@ class Coordinator:
                         sequence_number=delete_operation.sequence_number,
                     )
             else:
+                release_prepare = None
                 try:
+                    release_prepare = self._prepare_write_batch([session_close_operation])
                     self._persistence.atomic_save_session(
                         persisted_session,
                         operation=session_close_operation,
@@ -853,6 +889,9 @@ class Coordinator:
                 except Exception:
                     self._operation_log.discard_last_operation(session_close_operation.sequence_number)
                     raise
+                finally:
+                    if release_prepare is not None:
+                        release_prepare()
                 self._operation_log.commit(session_close_operation)
 
             self._watch_manager.clear_session_watches(session.session_id)
@@ -953,7 +992,9 @@ class Coordinator:
             timestamp=operation.timestamp,
         )
         
+        release_prepare = None
         try:
+            release_prepare = self._prepare_operation(operation)
             self._persistence.atomic_create_node(
                 node,
                 operation,
@@ -963,6 +1004,9 @@ class Coordinator:
         except Exception:
             self._operation_log.discard_last_operation(operation.sequence_number)
             raise
+        finally:
+            if release_prepare is not None:
+                release_prepare()
 
         committed_node = self._metadata_tree.commit_create(node)
         if node_type == NodeType.EPHEMERAL:
@@ -2184,7 +2228,9 @@ class Coordinator:
                 timestamp=operation.timestamp,
             )
             
+            release_prepare = None
             try:
+                release_prepare = self._prepare_operation(operation)
                 self._persistence.atomic_update_node(
                     node,
                     operation,
@@ -2193,6 +2239,9 @@ class Coordinator:
             except Exception:
                 self._operation_log.discard_last_operation(operation.sequence_number)
                 raise
+            finally:
+                if release_prepare is not None:
+                    release_prepare()
 
             committed_node = self._metadata_tree.commit_set(node)
             self._operation_log.commit(operation)
@@ -2247,7 +2296,9 @@ class Coordinator:
                 timestamp=operation.timestamp,
             )
             
+            release_prepare = None
             try:
+                release_prepare = self._prepare_operation(operation)
                 self._persistence.atomic_delete_node(
                     deleted_paths,
                     operation,
@@ -2257,6 +2308,9 @@ class Coordinator:
             except Exception:
                 self._operation_log.discard_last_operation(operation.sequence_number)
                 raise
+            finally:
+                if release_prepare is not None:
+                    release_prepare()
 
             self._metadata_tree.apply_delete_paths(deleted_paths)
             for _, (live_session, snapshot) in session_updates.items():
