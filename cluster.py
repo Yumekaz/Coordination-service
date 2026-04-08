@@ -43,6 +43,9 @@ class ClusterManager:
         batch_size: int = 128,
         require_write_quorum: bool = False,
         push_commit_replication: bool = True,
+        advertise_url: Optional[str] = None,
+        heartbeat_interval_seconds: float = 1.0,
+        election_timeout_seconds: float = 3.0,
         request_json: Optional[Callable[[str, str, Optional[Dict[str, Any]]], Dict[str, Any]]] = None,
     ):
         self._coordinator = coordinator
@@ -55,6 +58,12 @@ class ClusterManager:
         self._batch_size = max(1, int(batch_size))
         self._require_write_quorum = require_write_quorum
         self._push_commit_replication = push_commit_replication
+        self._advertise_url = advertise_url.rstrip("/") if advertise_url else None
+        self._heartbeat_interval_seconds = max(0.2, float(heartbeat_interval_seconds))
+        self._election_timeout_seconds = max(
+            self._heartbeat_interval_seconds * 2.0,
+            float(election_timeout_seconds),
+        )
         self._request_json = request_json or self._default_request_json
 
         self._lock = threading.RLock()
@@ -65,6 +74,9 @@ class ClusterManager:
         self._leader_id: Optional[str] = None
         self._leader_commit_index = coordinator.get_stats().get("last_sequence", 0)
         self._recent_apply_events: Deque[Dict[str, Any]] = deque(maxlen=20)
+        self._current_term = 0
+        self._voted_for: Optional[str] = None
+        self._last_leader_contact_at: Optional[float] = time.time() if self._role == "leader" else None
         self._peer_states: Dict[str, Dict[str, Any]] = {
             peer: {
                 "peer_url": peer,
@@ -81,6 +93,11 @@ class ClusterManager:
         }
         self._commit_callback_registered = False
 
+        if self._role == "leader":
+            self._current_term = 1
+            self._leader_id = self._node_id
+            self._leader_url = self._advertise_url
+
         self._apply_replica_mode()
 
     @classmethod
@@ -96,6 +113,9 @@ class ClusterManager:
         batch_size = int(os.environ.get("COORD_REPLICATION_BATCH_SIZE", "128"))
         require_write_quorum = os.environ.get("COORD_REQUIRE_WRITE_QUORUM", "").lower() in {"1", "true", "yes", "on"}
         push_commit_replication = os.environ.get("COORD_PUSH_REPLICATION", "1").lower() in {"1", "true", "yes", "on"}
+        advertise_url = os.environ.get("COORD_ADVERTISE_URL")
+        heartbeat_interval = float(os.environ.get("COORD_HEARTBEAT_INTERVAL", "1.0"))
+        election_timeout = float(os.environ.get("COORD_ELECTION_TIMEOUT", "3.0"))
         return cls(
             coordinator,
             node_id=node_id,
@@ -107,6 +127,9 @@ class ClusterManager:
             batch_size=batch_size,
             require_write_quorum=require_write_quorum,
             push_commit_replication=push_commit_replication,
+            advertise_url=advertise_url,
+            heartbeat_interval_seconds=heartbeat_interval,
+            election_timeout_seconds=election_timeout,
         )
 
     def start(self) -> None:
@@ -117,9 +140,7 @@ class ClusterManager:
             if self._role == "standalone" and not self._peer_urls and not self._leader_url:
                 return
             self._running = True
-            if self._role == "leader" and self._push_commit_replication and not self._commit_callback_registered:
-                self._coordinator.add_commit_callback(self._on_leader_commit)
-                self._commit_callback_registered = True
+            self._sync_commit_callback_locked()
             self._thread = threading.Thread(
                 target=self._loop,
                 daemon=True,
@@ -137,8 +158,7 @@ class ClusterManager:
             if self._commit_callback_registered:
                 self._coordinator.remove_commit_callback(self._on_leader_commit)
                 self._commit_callback_registered = False
-            if self._role == "leader":
-                self._coordinator.set_write_guard(None)
+            self._coordinator.set_write_guard(None)
         if thread is not None:
             thread.join(timeout=2.0)
 
@@ -150,6 +170,7 @@ class ClusterManager:
         return {
             "node_id": self._node_id,
             "role": self._role,
+            "term": self._current_term,
             "since_sequence": since_sequence,
             "commit_index": commit_index,
             "operations": [operation.to_dict() for operation in operations],
@@ -163,6 +184,7 @@ class ClusterManager:
         return {
             "node_id": self._node_id,
             "role": self._role,
+            "term": self._current_term,
             "commit_index": stats.get("last_sequence", 0),
             "last_applied": stats.get("last_sequence", 0),
             "read_only": read_only["read_only"],
@@ -184,10 +206,12 @@ class ClusterManager:
         applied_at = time.time()
         if source_node_id:
             self._leader_id = source_node_id
+            self._role = "follower"
         if operations:
             self._leader_commit_index = max(self._leader_commit_index, operations[-1].sequence_number)
         self._last_sync_at = applied_at
         self._last_error = None
+        self._last_leader_contact_at = applied_at
         if applied and operations:
             self._recent_apply_events.appendleft(
                 {
@@ -205,6 +229,85 @@ class ClusterManager:
             "last_applied": self._coordinator.get_stats().get("last_sequence", 0),
             "node_id": self._node_id,
         }
+
+    def receive_heartbeat(
+        self,
+        leader_id: str,
+        term: int,
+        leader_url: Optional[str],
+        commit_index: int,
+    ) -> Dict[str, Any]:
+        """Accept or reject a leader heartbeat."""
+        with self._lock:
+            if term < self._current_term:
+                return {
+                    "accepted": False,
+                    "term": self._current_term,
+                    "node_id": self._node_id,
+                    "last_applied": self._coordinator.get_stats().get("last_sequence", 0),
+                }
+
+            if term > self._current_term:
+                self._current_term = term
+                self._voted_for = None
+
+            self._leader_id = leader_id
+            self._leader_url = leader_url.rstrip("/") if leader_url else self._leader_url
+            self._leader_commit_index = max(self._leader_commit_index, commit_index)
+            self._last_leader_contact_at = time.time()
+            if self._role != "standalone":
+                self._role = "follower"
+                self._apply_replica_mode()
+                self._last_leader_contact_at = time.time()
+
+            return {
+                "accepted": True,
+                "term": self._current_term,
+                "node_id": self._node_id,
+                "last_applied": self._coordinator.get_stats().get("last_sequence", 0),
+            }
+
+    def request_vote(
+        self,
+        candidate_id: str,
+        term: int,
+        candidate_last_applied: int,
+    ) -> Dict[str, Any]:
+        """Evaluate a vote request from a candidate."""
+        with self._lock:
+            if term < self._current_term:
+                return {
+                    "vote_granted": False,
+                    "term": self._current_term,
+                    "node_id": self._node_id,
+                }
+
+            if term > self._current_term:
+                self._current_term = term
+                self._voted_for = None
+                self._leader_id = None
+                self._leader_url = None
+                if self._role != "standalone":
+                    self._role = "follower"
+                    self._apply_replica_mode()
+
+            local_last_applied = self._coordinator.get_stats().get("last_sequence", 0)
+            vote_granted = (
+                (self._voted_for is None or self._voted_for == candidate_id)
+                and candidate_last_applied >= local_last_applied
+            )
+            if vote_granted:
+                self._voted_for = candidate_id
+
+            return {
+                "vote_granted": vote_granted,
+                "term": self._current_term,
+                "node_id": self._node_id,
+            }
+
+    def trigger_election(self) -> Dict[str, Any]:
+        """Start one leader-election attempt and return the outcome."""
+        return self._start_election_once(auto=False)
 
     def build_status(self) -> Dict[str, Any]:
         """Return user-facing cluster status."""
@@ -225,6 +328,8 @@ class ClusterManager:
                 "role": self._role,
                 "leader_id": self._leader_id,
                 "leader_url": self._leader_url,
+                "current_term": self._current_term,
+                "voted_for": self._voted_for,
                 "commit_index": current_sequence if self._role != "follower" else self._leader_commit_index,
                 "last_applied": current_sequence,
                 "quorum_size": self._quorum_size(),
@@ -237,6 +342,8 @@ class ClusterManager:
                 "write_quorum_ready": (1 + healthy_peers) >= self._quorum_size(),
                 "require_write_quorum": self._require_write_quorum,
                 "push_commit_replication": self._push_commit_replication,
+                "last_leader_contact_at": self._last_leader_contact_at,
+                "leader_contact_stale": self._leader_contact_stale_locked(),
                 "last_sync_at": self._last_sync_at,
                 "last_error": self._last_error,
                 "peers": peers,
@@ -262,9 +369,13 @@ class ClusterManager:
 
         with self._lock:
             self._leader_id = payload.get("node_id") or self._leader_id
+            payload_term = payload.get("term")
+            if payload_term is not None:
+                self._current_term = max(self._current_term, int(payload_term))
             self._leader_commit_index = int(payload.get("commit_index", self._leader_commit_index))
             self._last_sync_at = applied_at
             self._last_error = None
+            self._last_leader_contact_at = applied_at
             if applied:
                 last_sequence = operations[-1].sequence_number
                 self._recent_apply_events.appendleft(
@@ -287,8 +398,17 @@ class ClusterManager:
                     return
             try:
                 if self._role == "follower":
-                    self.catch_up_once()
+                    if self._leader_url:
+                        self.catch_up_once()
+                    should_auto_elect = False
+                    with self._lock:
+                        should_auto_elect = self._role == "follower" and self._leader_contact_stale_locked()
+                    if should_auto_elect:
+                        self._start_election_once(auto=True)
+                elif self._role == "candidate":
+                    self._start_election_once(auto=False)
                 elif self._role == "leader":
+                    self._send_heartbeats_once()
                     self._poll_peers_once()
             except Exception as exc:
                 with self._lock:
@@ -327,6 +447,40 @@ class ClusterManager:
                     "last_error": str(exc),
                 }
 
+    def _send_heartbeats_once(self) -> None:
+        """Send heartbeats from the leader to all peers."""
+        if self._role != "leader":
+            return
+        current_sequence = self._coordinator.get_stats().get("last_sequence", 0)
+        for peer in self._peer_urls:
+            try:
+                payload = self._request_json(
+                    f"{peer}/internal/cluster/heartbeat",
+                    "POST",
+                    {
+                        "leader_id": self._node_id,
+                        "leader_url": self._advertise_url,
+                        "term": self._current_term,
+                        "commit_index": current_sequence,
+                    },
+                )
+                peer_term = int(payload.get("term", self._current_term))
+                if peer_term > self._current_term:
+                    self._become_follower(peer_term, payload.get("node_id"), peer)
+                    return
+            except Exception as exc:
+                self._peer_states[peer] = {
+                    "peer_url": peer,
+                    "peer_id": None,
+                    "role": "unknown",
+                    "reachable": False,
+                    "healthy": False,
+                    "last_applied": 0,
+                    "replication_lag": None,
+                    "last_ack_at": None,
+                    "last_error": str(exc),
+                }
+
     def assert_write_quorum_available(self) -> None:
         """Reject writes when the leader cannot reach a majority of peers."""
         if self._role != "leader" or not self._require_write_quorum:
@@ -338,6 +492,65 @@ class ClusterManager:
                 "Write quorum unavailable: not enough healthy peers acknowledged replication health",
                 error="write_quorum_unavailable",
             )
+
+    def _start_election_once(self, auto: bool = False) -> Dict[str, Any]:
+        """Run one election round and become leader on majority votes."""
+        if self._role == "standalone":
+            return {"status": "standalone", "term": self._current_term, "votes": 1}
+
+        with self._lock:
+            if auto:
+                if self._role != "follower":
+                    return {"status": self._role, "term": self._current_term, "votes": 0}
+                if not self._leader_contact_stale_locked():
+                    return {"status": "follower", "term": self._current_term, "votes": 0}
+            self._role = "candidate"
+            self._current_term += 1
+            term = self._current_term
+            self._voted_for = self._node_id
+            self._leader_id = None
+            self._leader_url = None
+            self._last_error = None
+            self._apply_replica_mode()
+            candidate_last_applied = self._coordinator.get_stats().get("last_sequence", 0)
+
+        votes = 1
+        for peer in self._peer_urls:
+            try:
+                payload = self._request_json(
+                    f"{peer}/internal/cluster/request-vote",
+                    "POST",
+                    {
+                        "candidate_id": self._node_id,
+                        "term": term,
+                        "candidate_last_applied": candidate_last_applied,
+                    },
+                )
+                peer_term = int(payload.get("term", term))
+                if peer_term > term:
+                    self._become_follower(peer_term, payload.get("node_id"), peer)
+                    return {"status": "stepped_down", "term": peer_term, "votes": votes}
+                if payload.get("vote_granted"):
+                    votes += 1
+            except Exception:
+                continue
+
+        if votes >= self._quorum_size():
+            with self._lock:
+                if self._current_term == term:
+                    self._role = "leader"
+                    self._leader_id = self._node_id
+                    self._leader_url = self._advertise_url
+                    self._last_leader_contact_at = time.time()
+                    self._apply_replica_mode()
+                    self._sync_commit_callback_locked()
+            self._send_heartbeats_once()
+            self._poll_peers_once()
+            return {"status": "leader", "term": term, "votes": votes}
+
+        with self._lock:
+            self._last_error = f"Election failed in term {term}: {votes}/{self._quorum_size()} votes"
+        return {"status": "candidate", "term": term, "votes": votes}
 
     def _on_leader_commit(self, operation: Operation) -> None:
         """Push newly committed operations to followers for lower replication lag."""
@@ -392,16 +605,53 @@ class ClusterManager:
 
     def _apply_replica_mode(self) -> None:
         """Align coordinator runtime behavior with cluster role."""
-        if self._role == "follower":
+        if self._role in {"follower", "candidate"}:
             self._coordinator.set_read_only(
                 True,
-                "This node is a follower replica. Write to the leader instead.",
+                "This node is not the active leader. Write to the leader instead.",
             )
             self._coordinator.disable_local_maintenance()
         else:
             self._coordinator.set_read_only(False)
             self._coordinator.set_write_guard(self.assert_write_quorum_available if self._require_write_quorum else None)
             self._coordinator.enable_local_maintenance()
+        self._sync_commit_callback_locked()
+
+    def _sync_commit_callback_locked(self) -> None:
+        """Ensure leader-only commit callbacks track current role."""
+        should_register = self._role == "leader" and self._push_commit_replication
+        if should_register and not self._commit_callback_registered:
+            self._coordinator.add_commit_callback(self._on_leader_commit)
+            self._commit_callback_registered = True
+        elif not should_register and self._commit_callback_registered:
+            self._coordinator.remove_commit_callback(self._on_leader_commit)
+            self._commit_callback_registered = False
+
+    def _leader_contact_stale_locked(self) -> bool:
+        """Return whether the follower has lost contact with its leader."""
+        if self._role == "leader" or self._role == "standalone":
+            return False
+        if self._last_leader_contact_at is None:
+            return True
+        return (time.time() - self._last_leader_contact_at) > self._election_timeout_seconds
+
+    def _become_follower(
+        self,
+        term: int,
+        leader_id: Optional[str],
+        leader_url: Optional[str],
+    ) -> None:
+        """Transition into follower mode under a newer term or remote leader."""
+        with self._lock:
+            if term > self._current_term:
+                self._current_term = term
+                self._voted_for = None
+            self._role = "follower"
+            self._leader_id = leader_id
+            self._leader_url = leader_url.rstrip("/") if isinstance(leader_url, str) and leader_url else self._leader_url
+            self._last_leader_contact_at = time.time()
+            self._apply_replica_mode()
+            self._last_leader_contact_at = time.time()
 
     def _quorum_size(self) -> int:
         """Return the majority quorum for the configured node count."""

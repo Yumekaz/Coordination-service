@@ -682,17 +682,53 @@ class TestLeaseEndpoints:
 class TestClusterEndpoints:
     """Tests for cluster visibility and follower catch-up."""
 
+    @staticmethod
+    def _make_cluster_router(managers: dict[str, ClusterManager]):
+        def fake_request_json(url: str, method: str, payload: dict | None):
+            parsed = parse.urlparse(url)
+            manager = managers[f"{parsed.scheme}://{parsed.netloc}"]
+            if parsed.path == "/internal/replication/operations":
+                query = parse.parse_qs(parsed.query)
+                since_sequence = int(query.get("since_sequence", ["0"])[0])
+                limit = int(query.get("limit", ["128"])[0])
+                return manager.export_operations(since_sequence=since_sequence, limit=limit)
+            if parsed.path == "/internal/replication/state":
+                return manager.get_internal_state()
+            if parsed.path == "/internal/replication/apply":
+                return manager.apply_replication_batch(
+                    source_node_id=(payload or {}).get("source_node_id"),
+                    operations_payload=(payload or {}).get("operations", []),
+                )
+            if parsed.path == "/internal/cluster/request-vote":
+                return manager.request_vote(
+                    candidate_id=(payload or {})["candidate_id"],
+                    term=int((payload or {})["term"]),
+                    candidate_last_applied=int((payload or {}).get("candidate_last_applied", 0)),
+                )
+            if parsed.path == "/internal/cluster/heartbeat":
+                return manager.receive_heartbeat(
+                    leader_id=(payload or {})["leader_id"],
+                    term=int((payload or {})["term"]),
+                    leader_url=(payload or {}).get("leader_url"),
+                    commit_index=int((payload or {}).get("commit_index", 0)),
+                )
+            raise AssertionError(f"Unexpected cluster URL: {url}")
+
+        return fake_request_json
+
     def test_cluster_status_reports_standalone_defaults(self, client):
         response = client.get("/api/cluster/status")
         assert response.status_code == 200
         data = response.json()
         assert data["role"] == "standalone"
+        assert data["current_term"] == 0
         assert data["read_only"] is False
         assert data["peer_count"] == 0
         assert data["healthy_peer_count"] == 0
         assert data["replication_enabled"] is False
         assert data["write_quorum_ready"] is True
         assert data["require_write_quorum"] is False
+        assert data["leader_contact_stale"] is False
 
     def test_follower_catches_up_from_committed_history(self):
         with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as leader_db, tempfile.NamedTemporaryFile(suffix=".db", delete=False) as follower_db:
@@ -762,6 +798,128 @@ class TestClusterEndpoints:
                 except OSError:
                     pass
 
+    def test_candidate_wins_majority_and_becomes_leader(self):
+        db_paths = []
+        coordinators = []
+        managers = {}
+        try:
+            for _ in range(3):
+                handle = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+                handle.close()
+                db_paths.append(handle.name)
+                coord = Coordinator(db_path=handle.name)
+                coord.start()
+                coordinators.append(coord)
+
+            manager_a = ClusterManager(coordinators[0], node_id="node-a", role="follower", peer_urls=["http://node-b", "http://node-c"], advertise_url="http://node-a")
+            manager_b = ClusterManager(coordinators[1], node_id="node-b", role="follower", peer_urls=["http://node-a", "http://node-c"], advertise_url="http://node-b")
+            manager_c = ClusterManager(coordinators[2], node_id="node-c", role="follower", peer_urls=["http://node-a", "http://node-b"], advertise_url="http://node-c")
+            managers = {
+                "http://node-a": manager_a,
+                "http://node-b": manager_b,
+                "http://node-c": manager_c,
+            }
+            router = self._make_cluster_router(managers)
+            for manager in managers.values():
+                manager._request_json = router
+
+            result = manager_a.trigger_election()
+            assert result["status"] == "leader"
+            assert result["votes"] >= 2
+
+            leader_status = manager_a.build_status()
+            assert leader_status["role"] == "leader"
+            assert leader_status["current_term"] == 1
+            assert leader_status["read_only"] is False
+
+            follower_status = manager_b.build_status()
+            assert follower_status["role"] == "follower"
+            assert follower_status["leader_id"] == "node-a"
+            assert follower_status["current_term"] == 1
+            assert follower_status["read_only"] is True
+
+            follower_status_c = manager_c.build_status()
+            assert follower_status_c["leader_id"] == "node-a"
+            assert follower_status_c["current_term"] == 1
+        finally:
+            for manager in managers.values():
+                manager.stop()
+            for coord in coordinators:
+                coord.stop()
+            for db_path in db_paths:
+                try:
+                    os.unlink(db_path)
+                except OSError:
+                    pass
+
+    def test_leader_steps_down_on_higher_term_heartbeat(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as leader_db:
+            leader_path = leader_db.name
+
+        leader = Coordinator(db_path=leader_path)
+        leader.start()
+        manager = ClusterManager(leader, node_id="node-a", role="leader", advertise_url="http://node-a")
+
+        try:
+            response = manager.receive_heartbeat(
+                leader_id="node-b",
+                term=2,
+                leader_url="http://node-b",
+                commit_index=0,
+            )
+            assert response["accepted"] is True
+
+            status = manager.build_status()
+            assert status["role"] == "follower"
+            assert status["leader_id"] == "node-b"
+            assert status["current_term"] == 2
+            assert status["read_only"] is True
+            assert status["leader_contact_stale"] is False
+        finally:
+            manager.stop()
+            leader.stop()
+            try:
+                os.unlink(leader_path)
+            except OSError:
+                pass
+
+    def test_auto_election_respects_fresh_leader_contact(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as follower_db:
+            follower_path = follower_db.name
+
+        follower = Coordinator(db_path=follower_path)
+        follower.start()
+        manager = ClusterManager(
+            follower,
+            node_id="node-b",
+            role="follower",
+            leader_url="http://node-a",
+            peer_urls=["http://node-a"],
+            advertise_url="http://node-b",
+        )
+
+        try:
+            manager.receive_heartbeat(
+                leader_id="node-a",
+                term=3,
+                leader_url="http://node-a",
+                commit_index=0,
+            )
+            result = manager._start_election_once(auto=True)
+
+            assert result["status"] == "follower"
+            status = manager.build_status()
+            assert status["role"] == "follower"
+            assert status["current_term"] == 3
+            assert status["leader_id"] == "node-a"
+        finally:
+            manager.stop()
+            follower.stop()
+            try:
+                os.unlink(follower_path)
+            except OSError:
+                pass
+
     def test_leader_push_replication_updates_follower_without_polling(self):
         with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as leader_db, tempfile.NamedTemporaryFile(suffix=".db", delete=False) as follower_db:
             leader_path = leader_db.name
@@ -788,6 +946,13 @@ class TestClusterEndpoints:
                 )
             if parsed.path == "/internal/replication/state":
                 return follower_cluster.get_internal_state()
+            if parsed.path == "/internal/cluster/heartbeat":
+                return follower_cluster.receive_heartbeat(
+                    leader_id=(payload or {})["leader_id"],
+                    term=int((payload or {})["term"]),
+                    leader_url=(payload or {}).get("leader_url"),
+                    commit_index=int((payload or {}).get("commit_index", 0)),
+                )
             raise AssertionError(f"Unexpected replication URL: {url}")
 
         leader_cluster = ClusterManager(

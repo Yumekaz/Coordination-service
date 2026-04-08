@@ -331,6 +331,8 @@ class ClusterStatusResponse(BaseModel):
     role: str
     leader_id: Optional[str] = None
     leader_url: Optional[str] = None
+    current_term: int
+    voted_for: Optional[str] = None
     commit_index: int
     last_applied: int
     quorum_size: int
@@ -343,6 +345,8 @@ class ClusterStatusResponse(BaseModel):
     write_quorum_ready: bool
     require_write_quorum: bool
     push_commit_replication: bool
+    last_leader_contact_at: Optional[float] = None
+    leader_contact_stale: bool
     last_sync_at: Optional[float] = None
     last_error: Optional[str] = None
     peers: List[ClusterPeerResponse] = Field(default_factory=list)
@@ -352,6 +356,19 @@ class ClusterStatusResponse(BaseModel):
 class InternalReplicationApplyRequest(BaseModel):
     source_node_id: Optional[str] = None
     operations: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class InternalHeartbeatRequest(BaseModel):
+    leader_id: str
+    leader_url: Optional[str] = None
+    term: int = Field(..., ge=0)
+    commit_index: int = Field(default=0, ge=0)
+
+
+class InternalVoteRequest(BaseModel):
+    candidate_id: str
+    term: int = Field(..., ge=0)
+    candidate_last_applied: int = Field(default=0, ge=0)
 
 
 class PathNodeResponse(BaseModel):
@@ -949,6 +966,35 @@ async def internal_replication_apply(
     return _require_cluster_manager().apply_replication_batch(
         source_node_id=payload.source_node_id,
         operations_payload=payload.operations,
+    )
+
+
+@app.post("/internal/cluster/heartbeat")
+async def internal_cluster_heartbeat(
+    request: Request,
+    payload: InternalHeartbeatRequest,
+) -> dict:
+    """Accept a leader heartbeat for election/failover groundwork."""
+    _require_replication_auth(request)
+    return _require_cluster_manager().receive_heartbeat(
+        leader_id=payload.leader_id,
+        term=payload.term,
+        leader_url=payload.leader_url,
+        commit_index=payload.commit_index,
+    )
+
+
+@app.post("/internal/cluster/request-vote")
+async def internal_cluster_request_vote(
+    request: Request,
+    payload: InternalVoteRequest,
+) -> dict:
+    """Evaluate a vote request from a candidate."""
+    _require_replication_auth(request)
+    return _require_cluster_manager().request_vote(
+        candidate_id=payload.candidate_id,
+        term=payload.term,
+        candidate_last_applied=payload.candidate_last_applied,
     )
 
 

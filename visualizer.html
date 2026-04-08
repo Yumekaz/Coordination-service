@@ -1366,13 +1366,15 @@
             const healthy = clusterStatus.healthy_peer_count || 0;
             const peers = clusterStatus.peer_count || 0;
             const lag = clusterStatus.max_replication_lag || 0;
+            const term = clusterStatus.current_term || 0;
             if (role === 'standalone') {
-                return 'Standalone node';
+                return `Standalone node · term ${term}`;
             }
             const quorum = clusterStatus.require_write_quorum
                 ? (clusterStatus.write_quorum_ready ? 'quorum ready' : 'quorum degraded')
                 : 'async replication';
-            return `${role} \u00b7 ${healthy}/${peers} peers healthy \u00b7 max lag ${lag} ops \u00b7 ${quorum}`;
+            const leaderHealth = role === 'follower' && clusterStatus.leader_contact_stale ? 'leader stale' : 'leader ok';
+            return `${role} · term ${term} · ${healthy}/${peers} peers healthy · max lag ${lag} ops · ${quorum} · ${leaderHealth}`;
         }
         
         // Update connection status
