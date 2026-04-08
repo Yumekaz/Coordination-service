@@ -200,6 +200,75 @@ class Coordinator:
         """Load persisted cluster-election metadata for the local node."""
         return self._persistence.load_cluster_state(node_id)
 
+    def reset_replica_state(self) -> None:
+        """Clear local replicated runtime state so a follower can resync from a leader."""
+        with self._lock:
+            self._metadata_tree.clear()
+            self._session_manager.clear()
+            self._watch_manager.clear()
+            self._operation_log.clear()
+            self._operation_log.restore_sequence(0)
+            self._lease_waiters.clear()
+            self._persistence.clear_replica_runtime_state()
+            self._mark_session_inventory_changed()
+
+    def export_replica_snapshot(self) -> Dict[str, Any]:
+        """Export committed state for follower bootstrap/rejoin."""
+        with self._lock:
+            return {
+                "nodes": [
+                    node.to_dict()
+                    for node in self._metadata_tree.get_all_nodes()
+                    if node.path != "/"
+                ],
+                "sessions": [
+                    session.to_dict()
+                    for session in self._session_manager.get_all_sessions()
+                ],
+                "operations": [
+                    operation.to_dict()
+                    for operation in self._operation_log.get_all_operations()
+                ],
+                "watch_fires": [
+                    record.to_dict()
+                    for record in self._persistence.load_all_watch_fires()
+                ],
+                "last_sequence": self._operation_log.current_sequence,
+            }
+
+    def restore_replica_snapshot(self, snapshot: Dict[str, Any]) -> Dict[str, int]:
+        """Atomically replace local replicated state from a leader snapshot."""
+        with self._lock:
+            nodes = [Node.from_dict(item) for item in snapshot.get("nodes", [])]
+            sessions = [Session.from_dict(item) for item in snapshot.get("sessions", [])]
+            operations = [Operation.from_dict(item) for item in snapshot.get("operations", [])]
+            watch_fires = [
+                WatchFireRecord.from_dict(item)
+                for item in snapshot.get("watch_fires", [])
+            ]
+
+            self._persistence.replace_replica_state(
+                nodes=nodes,
+                sessions=sessions,
+                operations=operations,
+                watch_fires=watch_fires,
+            )
+            self._metadata_tree.restore_nodes(nodes)
+            self._session_manager.clear()
+            for session in sessions:
+                self._session_manager.replace_session(session)
+            self._operation_log.restore_operations(operations)
+            self._lease_waiters.clear()
+            self._mark_session_inventory_changed()
+
+            return {
+                "nodes": len(nodes),
+                "sessions": len(sessions),
+                "operations": len(operations),
+                "watch_fires": len(watch_fires),
+                "last_sequence": self._operation_log.current_sequence,
+            }
+
     def add_commit_callback(self, callback: Callable[[Operation], None]) -> None:
         """Register a callback for committed operations."""
         self._operation_log.add_commit_callback(callback)
@@ -2038,7 +2107,12 @@ class Coordinator:
         Returns True when applied, False when already present locally.
         """
         with self._lock:
-            if self._operation_log.get_operation(operation.sequence_number) is not None:
+            existing = self._operation_log.get_operation(operation.sequence_number)
+            if existing is not None:
+                if existing != operation:
+                    raise ValueError(
+                        f"Replicated operation conflict at sequence {operation.sequence_number}"
+                    )
                 return False
 
             next_sequence = self._operation_log.current_sequence + 1

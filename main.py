@@ -975,6 +975,13 @@ async def internal_replication_state(request: Request) -> dict:
     return _require_cluster_manager().get_internal_state()
 
 
+@app.get("/internal/replication/snapshot")
+async def internal_replication_snapshot(request: Request) -> dict:
+    """Expose a committed full-state snapshot for follower bootstrap/rejoin."""
+    _require_replication_auth(request)
+    return _require_cluster_manager().export_snapshot()
+
+
 @app.post("/internal/replication/apply")
 async def internal_replication_apply(
     request: Request,

@@ -692,6 +692,8 @@ class TestClusterEndpoints:
                 since_sequence = int(query.get("since_sequence", ["0"])[0])
                 limit = int(query.get("limit", ["128"])[0])
                 return manager.export_operations(since_sequence=since_sequence, limit=limit)
+            if parsed.path == "/internal/replication/snapshot":
+                return manager.export_snapshot()
             if parsed.path == "/internal/replication/state":
                 return manager.get_internal_state()
             if parsed.path == "/internal/replication/apply":
@@ -768,6 +770,8 @@ class TestClusterEndpoints:
                 since_sequence = int(query.get("since_sequence", ["0"])[0])
                 limit = int(query.get("limit", ["128"])[0])
                 return leader_cluster.export_operations(since_sequence=since_sequence, limit=limit)
+            if parsed.path == "/internal/replication/snapshot":
+                return leader_cluster.export_snapshot()
             if parsed.path == "/internal/replication/state":
                 return leader_cluster.get_internal_state()
             raise AssertionError(f"Unexpected replication URL: {url}")
@@ -806,6 +810,73 @@ class TestClusterEndpoints:
             assert status["leader_id"] == "leader-a"
             assert status["last_applied"] == leader.get_stats()["last_sequence"]
 
+        finally:
+            leader_cluster.stop()
+            follower_cluster.stop()
+            leader.stop()
+            follower.stop()
+            for db_path in (leader_path, follower_path):
+                try:
+                    os.unlink(db_path)
+                except OSError:
+                    pass
+
+    def test_follower_resyncs_when_local_history_diverges_from_leader(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as leader_db, tempfile.NamedTemporaryFile(suffix=".db", delete=False) as follower_db:
+            leader_path = leader_db.name
+            follower_path = follower_db.name
+
+        leader = Coordinator(db_path=leader_path)
+        follower = Coordinator(db_path=follower_path)
+        leader.start()
+        follower.start()
+
+        leader_cluster = ClusterManager(leader, node_id="leader-a", role="leader")
+
+        def fake_request_json(url: str, method: str, payload: dict | None):
+            parsed = parse.urlparse(url)
+            if parsed.path == "/internal/replication/operations":
+                query = parse.parse_qs(parsed.query)
+                since_sequence = int(query.get("since_sequence", ["0"])[0])
+                limit = int(query.get("limit", ["128"])[0])
+                return leader_cluster.export_operations(since_sequence=since_sequence, limit=limit)
+            if parsed.path == "/internal/replication/snapshot":
+                return leader_cluster.export_snapshot()
+            if parsed.path == "/internal/replication/state":
+                return leader_cluster.get_internal_state()
+            raise AssertionError(f"Unexpected replication URL: {url}")
+
+        follower_session = follower.open_session(30)
+        follower.create("/follower-only", b"follower", persistent=True)
+
+        follower_cluster = ClusterManager(
+            follower,
+            node_id="follower-b",
+            role="follower",
+            leader_url="http://leader.test",
+            request_json=fake_request_json,
+        )
+
+        try:
+            leader_session = leader.open_session(30)
+            watcher_session = leader.open_session(30)
+            leader.register_watch("/leader-only", watcher_session.session_id)
+            leader.create("/leader-only", b"leader", persistent=True)
+            leader_create_operation = leader.get_operations(path_prefix="/leader-only", limit=5)[0]
+
+            applied = follower_cluster.catch_up_once()
+            assert applied == leader.get_stats()["last_sequence"]
+
+            assert follower.get("/leader-only") is not None
+            assert follower.get("/leader-only").data == b"leader"
+            assert follower.get("/follower-only") is None
+            assert follower.get_stats()["last_sequence"] == leader.get_stats()["last_sequence"]
+            assert follower.get_session_detail(leader_session.session_id) is not None
+            assert follower.get_session_detail(follower_session.session_id) is None
+            assert len(follower._persistence.load_watch_fires_for_operation(leader_create_operation.sequence_number)) == 1
+
+            status = follower_cluster.build_status()
+            assert any(event["status"] == "snapshotted" for event in status["recent_apply"])
         finally:
             leader_cluster.stop()
             follower_cluster.stop()

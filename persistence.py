@@ -1025,6 +1025,17 @@ class Persistence:
             # Also truncate WAL file
             self._wal_writer.truncate()
             logger.info("Database cleared")
+
+    def clear_replica_runtime_state(self) -> None:
+        """Clear replicated runtime state without deleting local cluster-election metadata."""
+        with self._lock:
+            with self._transaction() as conn:
+                conn.execute("DELETE FROM nodes")
+                conn.execute("DELETE FROM sessions")
+                conn.execute("DELETE FROM operations")
+                conn.execute("DELETE FROM watch_fires")
+            self._wal_writer.truncate()
+            logger.info("Replica runtime state cleared")
     
     def close(self) -> None:
         """Close the database connection and WAL file."""
@@ -1218,6 +1229,93 @@ class Persistence:
                 )
                 for row in cursor
             ]
+
+    def load_all_watch_fires(self) -> List[WatchFireRecord]:
+        """Load all persisted watch-fire records in causal order."""
+        with self._lock:
+            conn = self._get_connection()
+            cursor = conn.execute("""
+                SELECT cause_sequence_number, ordinal, watch_id, watch_session_id, watch_path, observed_path, event_type, timestamp
+                FROM watch_fires
+                ORDER BY cause_sequence_number ASC, ordinal ASC
+            """)
+            return [
+                WatchFireRecord(
+                    cause_sequence_number=row["cause_sequence_number"],
+                    ordinal=row["ordinal"],
+                    watch_id=row["watch_id"],
+                    watch_session_id=row["watch_session_id"],
+                    watch_path=row["watch_path"],
+                    observed_path=row["observed_path"],
+                    event_type=EventType(row["event_type"]),
+                    timestamp=row["timestamp"],
+                )
+                for row in cursor
+            ]
+
+    def replace_replica_state(
+        self,
+        *,
+        nodes: List[Node],
+        sessions: List[Session],
+        operations: List[Operation],
+        watch_fires: Optional[List[WatchFireRecord]] = None,
+    ) -> None:
+        """Atomically replace replicated state without disturbing local cluster metadata."""
+        with self._lock:
+            with self._transaction() as conn:
+                conn.execute("DELETE FROM nodes")
+                conn.execute("DELETE FROM sessions")
+                conn.execute("DELETE FROM operations")
+                conn.execute("DELETE FROM watch_fires")
+
+                if nodes:
+                    conn.executemany("""
+                        INSERT OR REPLACE INTO nodes
+                        (path, data, version, node_type, session_id, created_at, modified_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, [
+                        (
+                            node.path,
+                            node.data,
+                            node.version,
+                            node.node_type.value,
+                            node.session_id,
+                            node.created_at,
+                            node.modified_at,
+                        )
+                        for node in nodes
+                    ])
+
+                if sessions:
+                    conn.executemany("""
+                        INSERT OR REPLACE INTO sessions
+                        (session_id, created_at, last_heartbeat, timeout_seconds, ephemeral_nodes, is_alive)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, [
+                        (
+                            session.session_id,
+                            session.created_at,
+                            session.last_heartbeat,
+                            session.timeout_seconds,
+                            json.dumps(list(session.ephemeral_nodes)),
+                            1 if session.is_alive else 0,
+                        )
+                        for session in sessions
+                    ])
+
+                for operation in operations:
+                    self._insert_operation(conn, operation)
+                self._insert_watch_fires(conn, watch_fires)
+
+            self._wal_writer.truncate()
+            logger.info(
+                "Replica state replaced: %s nodes, %s sessions, %s operations, %s watch fires",
+                len(nodes),
+                len(sessions),
+                len(operations),
+                len(watch_fires or []),
+            )
     
     def save_operation(self, operation: Operation) -> None:
         """

@@ -199,6 +199,18 @@ class ClusterManager:
             "count": len(operations),
         }
 
+    def export_snapshot(self) -> Dict[str, Any]:
+        """Expose a committed full-state snapshot for follower bootstrap/rejoin."""
+        commit_index = self._coordinator.get_stats().get("last_sequence", 0)
+        snapshot = self._coordinator.export_replica_snapshot()
+        return {
+            "node_id": self._node_id,
+            "role": self._role,
+            "term": self._current_term,
+            "commit_index": commit_index,
+            **snapshot,
+        }
+
     def get_internal_state(self) -> Dict[str, Any]:
         """Return local replication state for leader peer monitoring."""
         stats = self._coordinator.get_stats()
@@ -681,15 +693,39 @@ class ClusterManager:
             return 0
 
         current_sequence = self._coordinator.get_stats().get("last_sequence", 0)
+        request_since = max(0, current_sequence - 1) if current_sequence > 0 else 0
+        request_limit = self._batch_size + (1 if current_sequence > 0 else 0)
         started_at = time.time()
         payload = self._request_json(
             f"{self._leader_url}/internal/replication/operations"
-            f"?{parse.urlencode({'since_sequence': current_sequence, 'limit': self._batch_size})}",
+            f"?{parse.urlencode({'since_sequence': request_since, 'limit': request_limit})}",
             "GET",
             None,
         )
         operations = [Operation.from_dict(item) for item in payload.get("operations", [])]
-        applied = self._coordinator.apply_replicated_operations(operations)
+        leader_commit_index = int(payload.get("commit_index", 0))
+        if current_sequence > leader_commit_index:
+            return self._resync_from_leader_snapshot(reason="local_ahead_of_leader")
+
+        operations_to_apply = list(operations)
+        if current_sequence > 0:
+            local_operation = self._coordinator.get_operation(current_sequence)
+            overlap_operation = next(
+                (operation for operation in operations if operation.sequence_number == current_sequence),
+                None,
+            )
+            if local_operation is None or overlap_operation is None or local_operation != overlap_operation:
+                return self._resync_from_leader_snapshot(reason="history_mismatch")
+            operations_to_apply = [
+                operation
+                for operation in operations
+                if operation.sequence_number > current_sequence
+            ]
+
+        try:
+            applied = self._coordinator.apply_replicated_operations(operations_to_apply)
+        except (KeyError, ValueError):
+            return self._resync_from_leader_snapshot(reason="apply_conflict")
         applied_at = time.time()
 
         with self._lock:
@@ -697,13 +733,13 @@ class ClusterManager:
             payload_term = payload.get("term")
             if payload_term is not None:
                 self._current_term = max(self._current_term, int(payload_term))
-            self._leader_commit_index = int(payload.get("commit_index", self._leader_commit_index))
+            self._leader_commit_index = leader_commit_index or self._leader_commit_index
             self._last_sync_at = applied_at
             self._last_error = None
             self._last_leader_contact_at = applied_at
             self._persist_cluster_state_locked()
-            if applied:
-                last_sequence = operations[-1].sequence_number
+            if applied and operations_to_apply:
+                last_sequence = operations_to_apply[-1].sequence_number
                 self._recent_apply_events.appendleft(
                     {
                         "sequence_number": last_sequence,
@@ -715,6 +751,47 @@ class ClusterManager:
                     }
                 )
         return applied
+
+    def _resync_from_leader_snapshot(self, reason: str) -> int:
+        """Clear a divergent follower and rebuild it from a leader snapshot."""
+        if self._role != "follower" or not self._leader_url:
+            return 0
+
+        started_at = time.time()
+        payload = self._request_json(
+            f"{self._leader_url}/internal/replication/snapshot",
+            "GET",
+            None,
+        )
+        summary = self._coordinator.restore_replica_snapshot(payload)
+        leader_id = payload.get("node_id")
+        payload_term = payload.get("term")
+        leader_term = int(payload_term) if payload_term is not None else None
+        leader_commit_index = int(payload.get("commit_index", summary["last_sequence"]))
+        total_applied = summary["operations"]
+
+        applied_at = time.time()
+        with self._lock:
+            self._leader_id = leader_id or self._leader_id
+            if leader_term is not None:
+                self._current_term = max(self._current_term, leader_term)
+            self._leader_commit_index = leader_commit_index
+            self._last_sync_at = applied_at
+            self._last_error = None
+            self._last_leader_contact_at = applied_at
+            self._persist_cluster_state_locked()
+            self._recent_apply_events.appendleft(
+                {
+                    "sequence_number": summary["last_sequence"],
+                    "peer_id": self._leader_id or self._leader_url,
+                    "status": "snapshotted",
+                    "applied_at": applied_at,
+                    "latency_ms": int((applied_at - started_at) * 1000),
+                    "applied_count": total_applied,
+                    "reason": reason,
+                }
+            )
+        return total_applied
 
     def _loop(self) -> None:
         """Background loop for follower catch-up and leader peer monitoring."""

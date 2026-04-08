@@ -2,7 +2,7 @@
 
 A coordination engine for hierarchical metadata, session-backed leases, one-shot watches, committed operation history, crash recovery, and leader/follower replication with durable election state, failover groundwork, and quorum-aware progress gating.
 
-`269 tests passing` | `Python + FastAPI + SQLite`
+`275 tests passing` | `Python + FastAPI + SQLite`
 
 ## What It Does
 
@@ -16,6 +16,7 @@ A coordination engine for hierarchical metadata, session-backed leases, one-shot
 - Startup recovery report plus WAL-backed replay
 - Rollback-safe metadata and session persistence paths
 - Read-only follower catch-up from committed leader history
+- Follower divergence detection plus snapshot-based rebuild from the leader
 - Cluster status with role, peer health, and replication lag
 - Leader push replication for lower follower lag
 - Optional write-quorum health gating on leaders
@@ -63,7 +64,10 @@ A coordination engine for hierarchical metadata, session-backed leases, one-shot
 ### Cluster
 - `GET /api/cluster/status`
 - `GET /internal/replication/operations`
+- `GET /internal/replication/snapshot`
 - `GET /internal/replication/state`
+- `POST /internal/replication/prepare`
+- `POST /internal/replication/cancel-prepare`
 - `POST /internal/replication/apply`
 - `POST /internal/cluster/heartbeat`
 - `POST /internal/cluster/request-vote`
@@ -108,6 +112,8 @@ Leases are implemented on top of ephemeral ownership. `lease_token` is derived f
 - Metadata writes and session mutations roll back cleanly if persistence fails.
 - Session expiry cleanup is rollback-safe.
 - Follower replicas catch up from the leader's committed operation history and can accept pushed replication batches from the leader.
+- Followers detect divergent local history and can rebuild atomically from a leader snapshot instead of staying silently wrong.
+- Snapshot-based follower rebuild preserves persisted watch-fire history for operation incidents after rejoin.
 - Leaders can push committed operations directly to followers to reduce lag.
 - Leaders can optionally reject writes when a quorum of peers is not healthy.
 - Leaders also reject new writes when prior committed operations have not reached a majority yet.
@@ -147,7 +153,7 @@ The API listens on the host and port defined in `config.py`.
 .venv\Scripts\python.exe -m pytest -q
 ```
 
-Latest verified local run: `269 passed in 364.97s`.
+Latest verified local run: `275 passed in 394.95s`.
 
 ## Demos
 
@@ -166,13 +172,14 @@ The `demos/` folder still covers the core scenarios:
 
 - Recovery coverage includes WAL-only replay cases for `SET`, recursive delete, and ephemeral create behavior.
 - Atomicity coverage includes metadata writes, session lifecycle failures, and rollback behavior.
-- API coverage includes CAS, lease behavior, watch filtering, operation timeline, incident reporting, recovery reporting, session inventory, and SSE stream snapshots.
+- API coverage includes CAS, lease behavior, watch filtering, operation timeline, incident reporting, recovery reporting, session inventory, replica snapshot rebuilds, and SSE stream snapshots.
 - Integration coverage includes concurrent behavior and recovery scenarios.
+- Cluster coverage includes prepare reservations, quorum gating, failover groundwork, and follower divergence snapshot rebuilds.
 
 ## Honest Limits
 
 - This is still not distributed consensus. Replication has quorum-aware health gating and quorum-progress gating, not true quorum commit.
-- Leader election and failover are groundwork only: durable term/vote state now exists, but there is still no replicated consensus log, quorum commit, or split-brain proof.
+- Leader election and failover are groundwork only: durable term/vote state now exists, followers can repair divergent local history, but there is still no replicated consensus log, quorum commit, or split-brain proof.
 - Follower replicas mirror committed state, but follower watch-fire and incident parity is still partial.
 - Recovery is stronger than before, but it is still SQLite plus a custom WAL underneath.
 - This is not a drop-in ZooKeeper replacement.
@@ -185,7 +192,7 @@ If we keep pushing this as a product, the next high-value steps are:
 2. More crash-injection tooling around persistence and recovery boundaries.
 3. Timeline filtering and exportable postmortem snapshots.
 4. More end-to-end examples that show why this is a coordination engine, not a generic key-value store.
-5. Quorum commits, durable election state, and split-brain-resistant failover if this graduates into a true distributed system.
+5. Quorum commits and split-brain-resistant failover if this graduates into a true distributed system.
 
 ## Project Layout
 
