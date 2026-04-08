@@ -344,6 +344,7 @@ class Operation:
     session_id: Optional[str] = None
     timestamp: float = field(default_factory=lambda: datetime.now().timestamp())
     node_type: Optional[NodeType] = None
+    term: Optional[int] = None
     
     def to_dict(self) -> dict:
         """Convert operation to dictionary for persistence."""
@@ -355,6 +356,7 @@ class Operation:
             "session_id": self.session_id,
             "timestamp": self.timestamp,
             "node_type": self.node_type.value if self.node_type else None,
+            "term": self.term,
         }
     
     @classmethod
@@ -371,4 +373,5 @@ class Operation:
             session_id=data.get("session_id"),
             timestamp=data.get("timestamp", datetime.now().timestamp()),
             node_type=NodeType(data["node_type"]) if data.get("node_type") else None,
+            term=data.get("term"),
         )

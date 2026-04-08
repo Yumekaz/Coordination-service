@@ -402,6 +402,19 @@ class Persistence:
                     data BLOB,
                     session_id TEXT,
                     timestamp REAL NOT NULL,
+                    node_type TEXT,
+                    term INTEGER
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS replication_log (
+                    sequence_number INTEGER PRIMARY KEY,
+                    term INTEGER NOT NULL,
+                    operation_type TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    data BLOB,
+                    session_id TEXT,
+                    timestamp REAL NOT NULL,
                     node_type TEXT
                 )
             """)
@@ -439,9 +452,32 @@ class Persistence:
                     voted_for TEXT,
                     leader_id TEXT,
                     leader_url TEXT,
+                    commit_index INTEGER NOT NULL DEFAULT 0,
+                    last_applied INTEGER NOT NULL DEFAULT 0,
                     updated_at REAL NOT NULL
                 )
             """)
+
+            existing_cluster_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(cluster_state)")
+            }
+            existing_operation_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(operations)")
+            }
+            if "term" not in existing_operation_columns:
+                conn.execute(
+                    "ALTER TABLE operations ADD COLUMN term INTEGER"
+                )
+            if "commit_index" not in existing_cluster_columns:
+                conn.execute(
+                    "ALTER TABLE cluster_state ADD COLUMN commit_index INTEGER NOT NULL DEFAULT 0"
+                )
+            if "last_applied" not in existing_cluster_columns:
+                conn.execute(
+                    "ALTER TABLE cluster_state ADD COLUMN last_applied INTEGER NOT NULL DEFAULT 0"
+                )
             
             # Note: DDL statements are auto-committed in isolation_level=None mode
             logger.info("Database schema initialized")
@@ -723,28 +759,34 @@ class Persistence:
         voted_for: Optional[str] = None,
         leader_id: Optional[str] = None,
         leader_url: Optional[str] = None,
+        commit_index: int = 0,
+        last_applied: int = 0,
     ) -> None:
         """Persist cluster election metadata for one local node."""
         with self._lock:
             with self._transaction() as conn:
                 conn.execute("""
                     INSERT OR REPLACE INTO cluster_state
-                    (node_id, current_term, voted_for, leader_id, leader_url, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    (node_id, current_term, voted_for, leader_id, leader_url, commit_index, last_applied, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     node_id,
                     int(current_term),
                     voted_for,
                     leader_id,
                     leader_url,
+                    int(commit_index),
+                    int(last_applied),
                     datetime.now().timestamp(),
                 ))
                 logger.debug(
-                    "Saved cluster state: node=%s term=%s voted_for=%s leader=%s",
+                    "Saved cluster state: node=%s term=%s voted_for=%s leader=%s commit_index=%s last_applied=%s",
                     node_id,
                     current_term,
                     voted_for,
                     leader_id,
+                    commit_index,
+                    last_applied,
                 )
 
     def load_cluster_state(self, node_id: str) -> Optional[Dict[str, object]]:
@@ -753,7 +795,7 @@ class Persistence:
             conn = self._get_connection()
             cursor = conn.execute(
                 """
-                SELECT node_id, current_term, voted_for, leader_id, leader_url, updated_at
+                SELECT node_id, current_term, voted_for, leader_id, leader_url, commit_index, last_applied, updated_at
                 FROM cluster_state
                 WHERE node_id = ?
                 """,
@@ -769,8 +811,214 @@ class Persistence:
                 "voted_for": row["voted_for"],
                 "leader_id": row["leader_id"],
                 "leader_url": row["leader_url"],
+                "commit_index": int(row["commit_index"] or 0),
+                "last_applied": int(row["last_applied"] or 0),
                 "updated_at": row["updated_at"],
             }
+
+    def append_replication_entries(
+        self,
+        term: int,
+        operations: List[Operation],
+    ) -> None:
+        """Durably append one contiguous batch into the replicated log."""
+        if not operations:
+            return
+
+        ordered = sorted(operations, key=lambda item: item.sequence_number)
+        with self._lock:
+            with self._transaction() as conn:
+                for operation in ordered:
+                    if operation.term is None:
+                        operation.term = int(term)
+                    existing = conn.execute(
+                        """
+                        SELECT term, operation_type, path, data, session_id, timestamp, node_type
+                        FROM replication_log
+                        WHERE sequence_number = ?
+                        """,
+                        (operation.sequence_number,),
+                    ).fetchone()
+                    if existing is not None:
+                        if (
+                            int(existing["term"]) != int(term)
+                            or existing["operation_type"] != operation.operation_type.value
+                            or existing["path"] != operation.path
+                            or (existing["data"] or b"") != operation.data
+                            or existing["session_id"] != operation.session_id
+                            or float(existing["timestamp"]) != float(operation.timestamp)
+                            or existing["node_type"] != (operation.node_type.value if operation.node_type else None)
+                        ):
+                            raise ValueError(
+                                f"Replication log conflict at sequence {operation.sequence_number}"
+                            )
+                        continue
+                    self._insert_replication_entry(conn, term, operation)
+
+    def load_replication_entries_since(
+        self,
+        sequence_number: int,
+        limit: Optional[int] = None,
+    ) -> List[Tuple[int, Operation]]:
+        """Load replicated log entries after one sequence number."""
+        with self._lock:
+            conn = self._get_connection()
+            query = """
+                SELECT sequence_number, term, operation_type, path, data, session_id, timestamp, node_type
+                FROM replication_log
+                WHERE sequence_number > ?
+                ORDER BY sequence_number
+            """
+            params: List[object] = [sequence_number]
+            if limit is not None:
+                query += " LIMIT ?"
+                params.append(max(1, int(limit)))
+
+            cursor = conn.execute(query, params)
+            return [
+                (
+                    int(row["term"]),
+                    Operation(
+                        sequence_number=row["sequence_number"],
+                        operation_type=OperationType(row["operation_type"]),
+                        path=row["path"],
+                        data=row["data"] or b"",
+                        session_id=row["session_id"],
+                        timestamp=row["timestamp"],
+                        node_type=NodeType(row["node_type"]) if row["node_type"] else None,
+                        term=int(row["term"]),
+                    ),
+                )
+                for row in cursor
+            ]
+
+    def load_replication_operations_between(
+        self,
+        start_sequence: int,
+        end_sequence: int,
+    ) -> List[Operation]:
+        """Load a closed inclusive range from the replicated log."""
+        if end_sequence < start_sequence:
+            return []
+        with self._lock:
+            conn = self._get_connection()
+            cursor = conn.execute(
+                """
+                SELECT sequence_number, term, operation_type, path, data, session_id, timestamp, node_type
+                FROM replication_log
+                WHERE sequence_number BETWEEN ? AND ?
+                ORDER BY sequence_number
+                """,
+                (start_sequence, end_sequence),
+            )
+            return [
+                Operation(
+                    sequence_number=row["sequence_number"],
+                    operation_type=OperationType(row["operation_type"]),
+                    path=row["path"],
+                    data=row["data"] or b"",
+                    session_id=row["session_id"],
+                    timestamp=row["timestamp"],
+                    node_type=NodeType(row["node_type"]) if row["node_type"] else None,
+                    term=int(row["term"]),
+                )
+                for row in cursor
+            ]
+
+    def get_last_replication_position(self) -> Tuple[int, int]:
+        """Return the highest replicated sequence number and its term."""
+        with self._lock:
+            conn = self._get_connection()
+            row = conn.execute(
+                """
+                SELECT sequence_number, term
+                FROM replication_log
+                ORDER BY sequence_number DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            if row is None:
+                return 0, 0
+            return int(row["sequence_number"]), int(row["term"])
+
+    def truncate_replication_entries_after(self, sequence_number: int) -> int:
+        """Remove replicated log entries after one committed prefix."""
+        with self._lock:
+            with self._transaction() as conn:
+                cursor = conn.execute(
+                    "DELETE FROM replication_log WHERE sequence_number > ?",
+                    (sequence_number,),
+                )
+                return cursor.rowcount
+
+    def advance_cluster_cursors(
+        self,
+        node_id: str,
+        *,
+        commit_index: Optional[int] = None,
+        last_applied: Optional[int] = None,
+    ) -> Dict[str, int]:
+        """Monotonically advance durable commit/apply cursors for one node."""
+        with self._lock:
+            with self._transaction() as conn:
+                row = conn.execute(
+                    """
+                    SELECT current_term, voted_for, leader_id, leader_url, commit_index, last_applied
+                    FROM cluster_state
+                    WHERE node_id = ?
+                    """,
+                    (node_id,),
+                ).fetchone()
+
+                if row is None:
+                    current_commit = 0
+                    current_applied = 0
+                    conn.execute(
+                        """
+                        INSERT INTO cluster_state
+                        (node_id, current_term, voted_for, leader_id, leader_url, commit_index, last_applied, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            node_id,
+                            0,
+                            None,
+                            None,
+                            None,
+                            max(0, int(commit_index or 0)),
+                            max(0, int(last_applied or 0)),
+                            datetime.now().timestamp(),
+                        ),
+                    )
+                    return {
+                        "commit_index": max(0, int(commit_index or 0)),
+                        "last_applied": max(0, int(last_applied or 0)),
+                    }
+
+                current_commit = int(row["commit_index"] or 0)
+                current_applied = int(row["last_applied"] or 0)
+                next_commit = current_commit if commit_index is None else max(current_commit, int(commit_index))
+                next_applied = current_applied if last_applied is None else max(current_applied, int(last_applied))
+                if next_applied > next_commit:
+                    next_commit = next_applied
+
+                conn.execute(
+                    """
+                    UPDATE cluster_state
+                    SET commit_index = ?, last_applied = ?, updated_at = ?
+                    WHERE node_id = ?
+                    """,
+                    (
+                        next_commit,
+                        next_applied,
+                        datetime.now().timestamp(),
+                        node_id,
+                    ),
+                )
+                return {
+                    "commit_index": next_commit,
+                    "last_applied": next_applied,
+                }
     
     def load_operations_since(self, sequence_number: int) -> List[Operation]:
         """Load operations after a given sequence number."""
@@ -791,6 +1039,7 @@ class Persistence:
                     session_id=row["session_id"],
                     timestamp=row["timestamp"],
                     node_type=NodeType(row["node_type"]) if row["node_type"] else None,
+                    term=int(row["term"]) if row["term"] is not None else None,
                 ))
             
             return operations
@@ -842,10 +1091,33 @@ class Persistence:
         """Insert one committed operation row."""
         conn.execute("""
             INSERT INTO operations
-            (sequence_number, operation_type, path, data, session_id, timestamp, node_type)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            (sequence_number, operation_type, path, data, session_id, timestamp, node_type, term)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             operation.sequence_number,
+            operation.operation_type.value,
+            operation.path,
+            operation.data,
+            operation.session_id,
+            operation.timestamp,
+            operation.node_type.value if operation.node_type else None,
+            operation.term,
+        ))
+
+    def _insert_replication_entry(
+        self,
+        conn: sqlite3.Connection,
+        term: int,
+        operation: Operation,
+    ) -> None:
+        """Insert one durable replicated-log entry."""
+        conn.execute("""
+            INSERT INTO replication_log
+            (sequence_number, term, operation_type, path, data, session_id, timestamp, node_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            operation.sequence_number,
+            int(operation.term if operation.term is not None else term),
             operation.operation_type.value,
             operation.path,
             operation.data,
@@ -880,6 +1152,14 @@ class Persistence:
             )
             for record in watch_fires
         ])
+
+    def save_watch_fires(self, watch_fires: List[WatchFireRecord]) -> None:
+        """Persist replicated fired-watch records outside a node mutation transaction."""
+        if not watch_fires:
+            return
+        with self._lock:
+            with self._transaction() as conn:
+                self._insert_watch_fires(conn, watch_fires)
     
     # ========== Atomic Multi-Operation ==========
     
@@ -1033,7 +1313,12 @@ class Persistence:
                 conn.execute("DELETE FROM nodes")
                 conn.execute("DELETE FROM sessions")
                 conn.execute("DELETE FROM operations")
+                conn.execute("DELETE FROM replication_log")
                 conn.execute("DELETE FROM watch_fires")
+                conn.execute(
+                    "UPDATE cluster_state SET commit_index = 0, last_applied = 0, updated_at = ?",
+                    (datetime.now().timestamp(),),
+                )
             self._wal_writer.truncate()
             logger.info("Replica runtime state cleared")
     
@@ -1114,13 +1399,14 @@ class Persistence:
             
             if row:
                 return Operation(
-                    sequence_number=row[0],
-                    operation_type=OperationType(row[1]),
-                    path=row[2],
-                    data=row[3] if row[3] else b'',
-                    session_id=row[4],
-                    timestamp=row[5],
-                    node_type=NodeType(row[6]) if row[6] else None,
+                    sequence_number=row["sequence_number"],
+                    operation_type=OperationType(row["operation_type"]),
+                    path=row["path"],
+                    data=row["data"] if row["data"] else b'',
+                    session_id=row["session_id"],
+                    timestamp=row["timestamp"],
+                    node_type=NodeType(row["node_type"]) if row["node_type"] else None,
+                    term=int(row["term"]) if "term" in row.keys() and row["term"] is not None else None,
                 )
             return None
 
@@ -1267,6 +1553,7 @@ class Persistence:
                 conn.execute("DELETE FROM nodes")
                 conn.execute("DELETE FROM sessions")
                 conn.execute("DELETE FROM operations")
+                conn.execute("DELETE FROM replication_log")
                 conn.execute("DELETE FROM watch_fires")
 
                 if nodes:
@@ -1305,8 +1592,17 @@ class Persistence:
                     ])
 
                 for operation in operations:
+                    self._insert_replication_entry(conn, operation.term or 0, operation)
                     self._insert_operation(conn, operation)
                 self._insert_watch_fires(conn, watch_fires)
+                conn.execute(
+                    "UPDATE cluster_state SET commit_index = ?, last_applied = ?, updated_at = ?",
+                    (
+                        operations[-1].sequence_number if operations else 0,
+                        operations[-1].sequence_number if operations else 0,
+                        datetime.now().timestamp(),
+                    ),
+                )
 
             self._wal_writer.truncate()
             logger.info(
@@ -1330,8 +1626,8 @@ class Persistence:
             with self._transaction() as conn:
                 conn.execute("""
                     INSERT OR REPLACE INTO operations
-                    (sequence_number, operation_type, path, data, session_id, timestamp, node_type)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (sequence_number, operation_type, path, data, session_id, timestamp, node_type, term)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     operation.sequence_number,
                     operation.operation_type.value,
@@ -1340,6 +1636,7 @@ class Persistence:
                     operation.session_id,
                     operation.timestamp,
                     operation.node_type.value if operation.node_type else None,
+                    operation.term,
                 ))
     
     def checkpoint(self) -> None:

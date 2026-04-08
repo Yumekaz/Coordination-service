@@ -78,7 +78,7 @@ class Coordinator:
         self._read_only = False
         self._read_only_reason = ""
         self._write_guard: Optional[Callable[[], None]] = None
-        self._prepare_guard: Optional[Callable[[List[Operation]], Optional[Callable[[], None]]]] = None
+        self._prepare_guard: Optional[Callable[[List[Operation]], Optional[Callable[[bool], None]]]] = None
         
         # Initialize components
         self._persistence = Persistence(db_path)
@@ -164,7 +164,7 @@ class Coordinator:
 
     def set_prepare_guard(
         self,
-        guard: Optional[Callable[[List[Operation]], Optional[Callable[[], None]]]],
+        guard: Optional[Callable[[List[Operation]], Optional[Callable[[bool], None]]]],
     ) -> None:
         """Install an optional exact-sequence prepare barrier for one write batch."""
         with self._lock:
@@ -186,6 +186,8 @@ class Coordinator:
         voted_for: Optional[str] = None,
         leader_id: Optional[str] = None,
         leader_url: Optional[str] = None,
+        commit_index: int = 0,
+        last_applied: int = 0,
     ) -> None:
         """Persist cluster-election metadata for the local node."""
         self._persistence.save_cluster_state(
@@ -194,11 +196,87 @@ class Coordinator:
             voted_for=voted_for,
             leader_id=leader_id,
             leader_url=leader_url,
+            commit_index=commit_index,
+            last_applied=last_applied,
         )
 
     def load_cluster_state(self, node_id: str) -> Optional[Dict[str, Any]]:
         """Load persisted cluster-election metadata for the local node."""
         return self._persistence.load_cluster_state(node_id)
+
+    def append_replication_entries(self, term: int, operations: List[Operation]) -> None:
+        """Durably append a batch into the replicated log."""
+        self._persistence.append_replication_entries(term, operations)
+
+    def load_replication_operations_between(
+        self,
+        start_sequence: int,
+        end_sequence: int,
+    ) -> List[Operation]:
+        """Load a contiguous range from the durable replicated log."""
+        return self._persistence.load_replication_operations_between(start_sequence, end_sequence)
+
+    def get_last_replication_position(self) -> Tuple[int, int]:
+        """Return the latest durable replicated-log sequence and term."""
+        return self._persistence.get_last_replication_position()
+
+    def truncate_replication_entries_after(self, sequence_number: int) -> int:
+        """Discard uncommitted tail entries from the durable replicated log."""
+        return self._persistence.truncate_replication_entries_after(sequence_number)
+
+    def advance_cluster_cursors(
+        self,
+        *,
+        node_id: str,
+        commit_index: Optional[int] = None,
+        last_applied: Optional[int] = None,
+    ) -> Dict[str, int]:
+        """Advance durable cluster commit/apply cursors."""
+        return self._persistence.advance_cluster_cursors(
+            node_id,
+            commit_index=commit_index,
+            last_applied=last_applied,
+        )
+
+    def export_active_watches(self) -> List[Dict[str, Any]]:
+        """Export leader-side active watches for follower parity sync."""
+        return [
+            watch.to_dict()
+            for watch in self._watch_manager.get_all_watches()
+            if not watch.is_fired
+        ]
+
+    def restore_active_watches(self, watches_payload: List[Dict[str, Any]]) -> int:
+        """Replace in-memory active watches from a leader mirror payload."""
+        watches = [Watch.from_dict(item) for item in watches_payload]
+        self._watch_manager.restore_watches(watches)
+        self._mark_session_inventory_changed()
+        return len(watches)
+
+    def load_watch_fires_for_operations(
+        self,
+        sequence_numbers: List[int],
+    ) -> List[WatchFireRecord]:
+        """Load persisted fired-watch records for a committed batch."""
+        records: List[WatchFireRecord] = []
+        for sequence_number in sequence_numbers:
+            records.extend(
+                self._persistence.load_watch_fires_for_operation(sequence_number)
+            )
+        return records
+
+    def record_replicated_watch_fires(
+        self,
+        records: List[WatchFireRecord],
+    ) -> int:
+        """Persist and mirror leader-authored watch-fire records on a follower."""
+        if not records:
+            return 0
+        with self._lock:
+            self._persistence.save_watch_fires(records)
+            self._watch_manager.record_remote_watch_fires(records)
+            self._mark_session_inventory_changed()
+            return len(records)
 
     def reset_replica_state(self) -> None:
         """Clear local replicated runtime state so a follower can resync from a leader."""
@@ -225,6 +303,11 @@ class Coordinator:
                     session.to_dict()
                     for session in self._session_manager.get_all_sessions()
                 ],
+                "watches": [
+                    watch.to_dict()
+                    for watch in self._watch_manager.get_all_watches()
+                    if not watch.is_fired
+                ],
                 "operations": [
                     operation.to_dict()
                     for operation in self._operation_log.get_all_operations()
@@ -241,6 +324,7 @@ class Coordinator:
         with self._lock:
             nodes = [Node.from_dict(item) for item in snapshot.get("nodes", [])]
             sessions = [Session.from_dict(item) for item in snapshot.get("sessions", [])]
+            watches = [Watch.from_dict(item) for item in snapshot.get("watches", [])]
             operations = [Operation.from_dict(item) for item in snapshot.get("operations", [])]
             watch_fires = [
                 WatchFireRecord.from_dict(item)
@@ -257,6 +341,7 @@ class Coordinator:
             self._session_manager.clear()
             for session in sessions:
                 self._session_manager.replace_session(session)
+            self._watch_manager.restore_watches(watches)
             self._operation_log.restore_operations(operations)
             self._lease_waiters.clear()
             self._mark_session_inventory_changed()
@@ -264,6 +349,7 @@ class Coordinator:
             return {
                 "nodes": len(nodes),
                 "sessions": len(sessions),
+                "watches": len(watches),
                 "operations": len(operations),
                 "watch_fires": len(watch_fires),
                 "last_sequence": self._operation_log.current_sequence,
@@ -309,15 +395,25 @@ class Coordinator:
         if self._write_guard is not None:
             self._write_guard()
 
-    def _prepare_write_batch(self, operations: List[Operation]) -> Optional[Callable[[], None]]:
+    def _prepare_write_batch(self, operations: List[Operation]) -> Optional[Callable[[bool], None]]:
         """Run any installed exact-sequence prepare hook before local persistence."""
         if operations and self._prepare_guard is not None:
             return self._prepare_guard(list(operations))
         return None
 
-    def _prepare_operation(self, operation: Operation) -> Optional[Callable[[], None]]:
+    def _prepare_operation(self, operation: Operation) -> Optional[Callable[[bool], None]]:
         """Run an optional cluster-side prepare step before local persistence."""
         return self._prepare_write_batch([operation])
+
+    def _finish_prepared_write(
+        self,
+        finalize_prepare: Optional[Callable[[bool], None]],
+        *,
+        committed: bool,
+    ) -> None:
+        """Release or finalize an installed cluster-side write barrier."""
+        if finalize_prepare is not None:
+            finalize_prepare(committed)
     
     # ========== Session Operations ==========
     
@@ -339,17 +435,18 @@ class Coordinator:
                 session_id=session.session_id,
             )
             operation.data = self._encode_session_operation_payload(session)
-            release_prepare = None
+            finalize_prepare = None
+            committed = False
             try:
-                release_prepare = self._prepare_operation(operation)
+                finalize_prepare = self._prepare_operation(operation)
                 self._persistence.atomic_save_session(session, operation)
+                committed = True
             except Exception:
                 self._session_manager.remove_session(session.session_id)
                 self._operation_log.discard_last_operation(operation.sequence_number)
                 raise
             finally:
-                if release_prepare is not None:
-                    release_prepare()
+                self._finish_prepared_write(finalize_prepare, committed=committed)
             self._operation_log.commit(operation)
             self._mark_session_inventory_changed()
             
@@ -384,17 +481,18 @@ class Coordinator:
                 session_id=session_id,
             )
             operation.data = self._encode_session_operation_payload(session)
-            release_prepare = None
+            finalize_prepare = None
+            committed = False
             try:
-                release_prepare = self._prepare_operation(operation)
+                finalize_prepare = self._prepare_operation(operation)
                 self._persistence.atomic_save_session(session, operation)
+                committed = True
             except Exception:
                 self._session_manager.replace_session(snapshot)
                 self._operation_log.discard_last_operation(operation.sequence_number)
                 raise
             finally:
-                if release_prepare is not None:
-                    release_prepare()
+                self._finish_prepared_write(finalize_prepare, committed=committed)
             self._operation_log.commit(operation)
             self._mark_session_inventory_changed()
             
@@ -918,9 +1016,10 @@ class Coordinator:
                     sequence_number=delete_operation.sequence_number,
                     timestamp=delete_operation.timestamp,
                 )
-                release_prepare = None
+                finalize_prepare = None
+                committed = False
                 try:
-                    release_prepare = self._prepare_write_batch([session_close_operation, delete_operation])
+                    finalize_prepare = self._prepare_write_batch([session_close_operation, delete_operation])
                     self._persistence.atomic_delete_node(
                         deleted_paths,
                         delete_operation,
@@ -928,13 +1027,13 @@ class Coordinator:
                         watch_fires=watch_fires,
                         extra_operations=[session_close_operation],
                     )
+                    committed = True
                 except Exception:
                     self._operation_log.discard_last_operation(delete_operation.sequence_number)
                     self._operation_log.discard_last_operation(session_close_operation.sequence_number)
                     raise
                 finally:
-                    if release_prepare is not None:
-                        release_prepare()
+                    self._finish_prepared_write(finalize_prepare, committed=committed)
 
                 self._metadata_tree.apply_delete_paths(deleted_paths)
                 session.ephemeral_nodes.clear()
@@ -948,19 +1047,20 @@ class Coordinator:
                         sequence_number=delete_operation.sequence_number,
                     )
             else:
-                release_prepare = None
+                finalize_prepare = None
+                committed = False
                 try:
-                    release_prepare = self._prepare_write_batch([session_close_operation])
+                    finalize_prepare = self._prepare_write_batch([session_close_operation])
                     self._persistence.atomic_save_session(
                         persisted_session,
                         operation=session_close_operation,
                     )
+                    committed = True
                 except Exception:
                     self._operation_log.discard_last_operation(session_close_operation.sequence_number)
                     raise
                 finally:
-                    if release_prepare is not None:
-                        release_prepare()
+                    self._finish_prepared_write(finalize_prepare, committed=committed)
                 self._operation_log.commit(session_close_operation)
 
             self._watch_manager.clear_session_watches(session.session_id)
@@ -1061,21 +1161,22 @@ class Coordinator:
             timestamp=operation.timestamp,
         )
         
-        release_prepare = None
+        finalize_prepare = None
+        committed = False
         try:
-            release_prepare = self._prepare_operation(operation)
+            finalize_prepare = self._prepare_operation(operation)
             self._persistence.atomic_create_node(
                 node,
                 operation,
                 persisted_session,
                 watch_fires=watch_fires,
             )
+            committed = True
         except Exception:
             self._operation_log.discard_last_operation(operation.sequence_number)
             raise
         finally:
-            if release_prepare is not None:
-                release_prepare()
+            self._finish_prepared_write(finalize_prepare, committed=committed)
 
         committed_node = self._metadata_tree.commit_create(node)
         if node_type == NodeType.EPHEMERAL:
@@ -2302,20 +2403,21 @@ class Coordinator:
                 timestamp=operation.timestamp,
             )
             
-            release_prepare = None
+            finalize_prepare = None
+            committed = False
             try:
-                release_prepare = self._prepare_operation(operation)
+                finalize_prepare = self._prepare_operation(operation)
                 self._persistence.atomic_update_node(
                     node,
                     operation,
                     watch_fires=watch_fires,
                 )
+                committed = True
             except Exception:
                 self._operation_log.discard_last_operation(operation.sequence_number)
                 raise
             finally:
-                if release_prepare is not None:
-                    release_prepare()
+                self._finish_prepared_write(finalize_prepare, committed=committed)
 
             committed_node = self._metadata_tree.commit_set(node)
             self._operation_log.commit(operation)
@@ -2370,21 +2472,22 @@ class Coordinator:
                 timestamp=operation.timestamp,
             )
             
-            release_prepare = None
+            finalize_prepare = None
+            committed = False
             try:
-                release_prepare = self._prepare_operation(operation)
+                finalize_prepare = self._prepare_operation(operation)
                 self._persistence.atomic_delete_node(
                     deleted_paths,
                     operation,
                     sessions=[snapshot for _, snapshot in session_updates.values()],
                     watch_fires=watch_fires,
                 )
+                committed = True
             except Exception:
                 self._operation_log.discard_last_operation(operation.sequence_number)
                 raise
             finally:
-                if release_prepare is not None:
-                    release_prepare()
+                self._finish_prepared_write(finalize_prepare, committed=committed)
 
             self._metadata_tree.apply_delete_paths(deleted_paths)
             for _, (live_session, snapshot) in session_updates.items():

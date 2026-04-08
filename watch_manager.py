@@ -454,6 +454,61 @@ class WatchManager:
             self._wait_conditions.clear()
             self._event_history.clear()
             logger.info("WatchManager cleared")
+
+    def restore_watches(self, watches: List[Watch]) -> None:
+        """Restore active watches from a replicated snapshot."""
+        with self._lock:
+            self._watches_by_path.clear()
+            self._watches_by_id.clear()
+            self._watches_by_session.clear()
+            self._pending_events.clear()
+            self._wait_conditions.clear()
+
+            for watch in watches:
+                if watch.is_fired:
+                    continue
+                self._watches_by_id[watch.watch_id] = watch
+                self._watches_by_path.setdefault(watch.path, []).append(watch)
+                self._watches_by_session.setdefault(watch.session_id, set()).add(watch.watch_id)
+                self._wait_conditions[watch.watch_id] = threading.Condition(self._lock)
+
+            logger.info(f"Restored {len(self._watches_by_id)} active watches")
+
+    def record_remote_watch_fires(self, records: List[WatchFireRecord]) -> None:
+        """Mirror leader-fired watch records on a follower without re-deriving them locally."""
+        if not records:
+            return
+
+        with self._lock:
+            existing_keys = {
+                (record.cause_sequence_number, record.ordinal)
+                for record in self._event_history
+            }
+            for record in records:
+                dedupe_key = (record.cause_sequence_number, record.ordinal)
+                if dedupe_key in existing_keys:
+                    continue
+
+                watch = self._watches_by_id.get(record.watch_id)
+                if watch is not None and not watch.is_fired:
+                    try:
+                        watch.fire()
+                    except RuntimeError:
+                        pass
+                    self._pending_events[watch.watch_id] = Event(
+                        watch_id=watch.watch_id,
+                        path=record.observed_path,
+                        event_type=record.event_type,
+                        data=b"",
+                        sequence_number=record.cause_sequence_number,
+                        timestamp=record.timestamp,
+                    )
+                    condition = self._wait_conditions.get(watch.watch_id)
+                    if condition is not None:
+                        condition.notify_all()
+
+                self._event_history.append(record)
+                existing_keys.add(dedupe_key)
     
     def restore_sequence(self, sequence_number: int) -> None:
         """Restore the sequence counter during recovery."""

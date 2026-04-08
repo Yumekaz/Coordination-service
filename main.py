@@ -348,6 +348,8 @@ class ClusterStatusResponse(BaseModel):
     require_write_quorum: bool
     push_commit_replication: bool
     last_leader_contact_at: Optional[float] = None
+    leader_lease_until: Optional[float] = None
+    leader_lease_expired: bool = False
     leader_contact_stale: bool
     last_sync_at: Optional[float] = None
     last_error: Optional[str] = None
@@ -359,6 +361,13 @@ class InternalReplicationApplyRequest(BaseModel):
     source_node_id: Optional[str] = None
     source_term: Optional[int] = Field(default=None, ge=0)
     prepared_write: bool = False
+    operations: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class InternalReplicationAppendRequest(BaseModel):
+    leader_id: str
+    leader_url: Optional[str] = None
+    term: int = Field(..., ge=0)
     operations: List[Dict[str, Any]] = Field(default_factory=list)
 
 
@@ -384,10 +393,26 @@ class InternalHeartbeatRequest(BaseModel):
     commit_index: int = Field(default=0, ge=0)
 
 
+class InternalReplicationCommitRequest(BaseModel):
+    leader_id: str
+    leader_url: Optional[str] = None
+    term: int = Field(..., ge=0)
+    commit_index: int = Field(default=0, ge=0)
+    watch_fires: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class InternalReplicationTruncateRequest(BaseModel):
+    leader_id: str
+    term: int = Field(..., ge=0)
+    truncate_after: int = Field(default=0, ge=0)
+
+
 class InternalVoteRequest(BaseModel):
     candidate_id: str
     term: int = Field(..., ge=0)
     candidate_last_applied: int = Field(default=0, ge=0)
+    candidate_last_log_index: int = Field(default=0, ge=0)
+    candidate_last_log_term: int = Field(default=0, ge=0)
 
 
 class PathNodeResponse(BaseModel):
@@ -982,6 +1007,13 @@ async def internal_replication_snapshot(request: Request) -> dict:
     return _require_cluster_manager().export_snapshot()
 
 
+@app.get("/internal/replication/watches")
+async def internal_replication_watches(request: Request) -> dict:
+    """Expose active watches so followers can mirror leader watch state."""
+    _require_replication_auth(request)
+    return _require_cluster_manager().export_active_watches()
+
+
 @app.post("/internal/replication/apply")
 async def internal_replication_apply(
     request: Request,
@@ -993,6 +1025,21 @@ async def internal_replication_apply(
         source_node_id=payload.source_node_id,
         source_term=payload.source_term,
         prepared_write=payload.prepared_write,
+        operations_payload=payload.operations,
+    )
+
+
+@app.post("/internal/replication/append")
+async def internal_replication_append(
+    request: Request,
+    payload: InternalReplicationAppendRequest,
+) -> dict:
+    """Durably append a leader batch on a follower without applying it yet."""
+    _require_replication_auth(request)
+    return _require_cluster_manager().receive_append(
+        leader_id=payload.leader_id,
+        leader_url=payload.leader_url,
+        term=payload.term,
         operations_payload=payload.operations,
     )
 
@@ -1028,6 +1075,36 @@ async def internal_replication_cancel_prepare(
     )
 
 
+@app.post("/internal/replication/commit")
+async def internal_replication_commit(
+    request: Request,
+    payload: InternalReplicationCommitRequest,
+) -> dict:
+    """Advance follower commit index and apply durable log entries."""
+    _require_replication_auth(request)
+    return _require_cluster_manager().receive_commit(
+        leader_id=payload.leader_id,
+        leader_url=payload.leader_url,
+        term=payload.term,
+        commit_index=payload.commit_index,
+        watch_fires_payload=payload.watch_fires,
+    )
+
+
+@app.post("/internal/replication/truncate")
+async def internal_replication_truncate(
+    request: Request,
+    payload: InternalReplicationTruncateRequest,
+) -> dict:
+    """Best-effort rollback for uncommitted replicated-log tail entries."""
+    _require_replication_auth(request)
+    return _require_cluster_manager().receive_truncate(
+        leader_id=payload.leader_id,
+        term=payload.term,
+        truncate_after=payload.truncate_after,
+    )
+
+
 @app.post("/internal/cluster/heartbeat")
 async def internal_cluster_heartbeat(
     request: Request,
@@ -1054,6 +1131,8 @@ async def internal_cluster_request_vote(
         candidate_id=payload.candidate_id,
         term=payload.term,
         candidate_last_applied=payload.candidate_last_applied,
+        candidate_last_log_index=payload.candidate_last_log_index,
+        candidate_last_log_term=payload.candidate_last_log_term,
     )
 
 
