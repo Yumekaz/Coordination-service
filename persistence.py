@@ -454,6 +454,8 @@ class Persistence:
                     leader_url TEXT,
                     config_version INTEGER NOT NULL DEFAULT 1,
                     peer_urls_json TEXT,
+                    previous_config_version INTEGER,
+                    previous_peer_urls_json TEXT,
                     pending_config_version INTEGER,
                     pending_peer_urls_json TEXT,
                     reconfig_in_progress INTEGER NOT NULL DEFAULT 0,
@@ -490,6 +492,14 @@ class Persistence:
             if "peer_urls_json" not in existing_cluster_columns:
                 conn.execute(
                     "ALTER TABLE cluster_state ADD COLUMN peer_urls_json TEXT"
+                )
+            if "previous_config_version" not in existing_cluster_columns:
+                conn.execute(
+                    "ALTER TABLE cluster_state ADD COLUMN previous_config_version INTEGER"
+                )
+            if "previous_peer_urls_json" not in existing_cluster_columns:
+                conn.execute(
+                    "ALTER TABLE cluster_state ADD COLUMN previous_peer_urls_json TEXT"
                 )
             if "pending_config_version" not in existing_cluster_columns:
                 conn.execute(
@@ -786,6 +796,8 @@ class Persistence:
         leader_url: Optional[str] = None,
         config_version: int = 1,
         peer_urls: Optional[List[str]] = None,
+        previous_config_version: Optional[int] = None,
+        previous_peer_urls: Optional[List[str]] = None,
         pending_config_version: Optional[int] = None,
         pending_peer_urls: Optional[List[str]] = None,
         reconfig_in_progress: bool = False,
@@ -805,6 +817,8 @@ class Persistence:
                         leader_url,
                         config_version,
                         peer_urls_json,
+                        previous_config_version,
+                        previous_peer_urls_json,
                         pending_config_version,
                         pending_peer_urls_json,
                         reconfig_in_progress,
@@ -812,7 +826,7 @@ class Persistence:
                         last_applied,
                         updated_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     node_id,
                     int(current_term),
@@ -821,6 +835,8 @@ class Persistence:
                     leader_url,
                     int(config_version),
                     json.dumps(list(peer_urls or [])),
+                    (None if previous_config_version is None else int(previous_config_version)),
+                    json.dumps(list(previous_peer_urls or [])),
                     (None if pending_config_version is None else int(pending_config_version)),
                     json.dumps(list(pending_peer_urls or [])),
                     1 if reconfig_in_progress else 0,
@@ -853,6 +869,8 @@ class Persistence:
                     leader_url,
                     config_version,
                     peer_urls_json,
+                    previous_config_version,
+                    previous_peer_urls_json,
                     pending_config_version,
                     pending_peer_urls_json,
                     reconfig_in_progress,
@@ -876,6 +894,12 @@ class Persistence:
                 "leader_url": row["leader_url"],
                 "config_version": int(row["config_version"] or 1),
                 "peer_urls": json.loads(row["peer_urls_json"] or "[]"),
+                "previous_config_version": (
+                    None
+                    if row["previous_config_version"] is None
+                    else int(row["previous_config_version"])
+                ),
+                "previous_peer_urls": json.loads(row["previous_peer_urls_json"] or "[]"),
                 "pending_config_version": (
                     None
                     if row["pending_config_version"] is None

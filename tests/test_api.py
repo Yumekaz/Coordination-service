@@ -28,7 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from coordinator import Coordinator
 from cluster import ClusterManager
-from errors import ConflictError
+from errors import ConflictError, ForbiddenError
 from models import NodeType, Operation, OperationType
 import main
 
@@ -705,6 +705,9 @@ class TestClusterEndpoints:
                     source_term=(payload or {}).get("source_term"),
                     prepared_write=bool((payload or {}).get("prepared_write", False)),
                     operations_payload=(payload or {}).get("operations", []),
+                    watch_fires_payload=(payload or {}).get("watch_fires", []),
+                    active_watch_commit_index=(payload or {}).get("active_watch_commit_index"),
+                    active_watches_payload=(payload or {}).get("active_watches", []),
                 )
             if parsed.path == "/internal/replication/append":
                 return manager.receive_append(
@@ -740,6 +743,8 @@ class TestClusterEndpoints:
                     prev_log_term=int((payload or {}).get("prev_log_term", 0)),
                     commit_term=(None if (payload or {}).get("commit_term") is None else int((payload or {}).get("commit_term", 0))),
                     watch_fires_payload=(payload or {}).get("watch_fires", []),
+                    active_watch_commit_index=(payload or {}).get("active_watch_commit_index"),
+                    active_watches_payload=(payload or {}).get("active_watches", []),
                 )
             if parsed.path == "/internal/replication/truncate":
                 return manager.receive_truncate(
@@ -934,6 +939,92 @@ class TestClusterEndpoints:
 
             status = follower_cluster.build_status()
             assert any(event["status"] == "snapshotted" for event in status["recent_apply"])
+        finally:
+            leader_cluster.stop()
+            follower_cluster.stop()
+            leader.stop()
+            follower.stop()
+            for db_path in (leader_path, follower_path):
+                try:
+                    os.unlink(db_path)
+                except OSError:
+                    pass
+
+    def test_follower_partial_catch_up_waits_for_aligned_active_watch_snapshot(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as leader_db, tempfile.NamedTemporaryFile(suffix=".db", delete=False) as follower_db:
+            leader_path = leader_db.name
+            follower_path = follower_db.name
+
+        leader = Coordinator(db_path=leader_path)
+        follower = Coordinator(db_path=follower_path)
+        leader.start()
+        follower.start()
+
+        leader_cluster = ClusterManager(leader, node_id="leader-a", role="leader")
+
+        def fake_request_json(url: str, method: str, payload: dict | None):
+            parsed = parse.urlparse(url)
+            if parsed.path == "/internal/replication/operations":
+                query = parse.parse_qs(parsed.query)
+                since_sequence = int(query.get("since_sequence", ["0"])[0])
+                limit = int(query.get("limit", ["128"])[0])
+                return leader_cluster.export_operations(since_sequence=since_sequence, limit=limit)
+            if parsed.path == "/internal/replication/snapshot":
+                return leader_cluster.export_snapshot()
+            if parsed.path == "/internal/replication/watches":
+                return leader_cluster.export_active_watches()
+            if parsed.path == "/internal/replication/state":
+                return leader_cluster.get_internal_state()
+            raise AssertionError(f"Unexpected replication URL: {url}")
+
+        follower_cluster = ClusterManager(
+            follower,
+            node_id="follower-b",
+            role="follower",
+            leader_url="http://leader.test",
+            request_json=fake_request_json,
+            batch_size=4,
+        )
+
+        try:
+            leader.open_session(30)
+            fired_watch_session = leader.open_session(30)
+            active_watch_session = leader.open_session(30)
+            leader.create("/watch-gap", b"root", persistent=True)
+            leader.register_watch("/watch-gap", fired_watch_session.session_id)
+            leader.set("/watch-gap", b"mutated")
+            leader.register_watch("/watch-gap", active_watch_session.session_id)
+
+            applied = follower_cluster.catch_up_once()
+            assert applied == 4
+            assert follower.get_stats()["last_sequence"] == 4
+
+            partial_watch_session = follower.get_session_detail(active_watch_session.session_id)
+            assert partial_watch_session is not None
+            assert partial_watch_session["watches"] == []
+            partial_path_detail = follower.get_path_detail("/watch-gap")
+            assert partial_path_detail is not None
+            assert partial_path_detail["active_watches"] == []
+
+            final_payload = leader_cluster.export_operations(since_sequence=3, limit=5)
+            assert final_payload["active_watch_commit_index"] == leader.get_stats()["last_sequence"]
+            assert any(
+                watch["path"] == "/watch-gap"
+                for watch in final_payload["active_watches"]
+            )
+
+            while follower.get_stats()["last_sequence"] < leader.get_stats()["last_sequence"]:
+                follower_cluster.catch_up_once()
+
+            active_watch_detail = follower.get_session_detail(active_watch_session.session_id)
+            assert active_watch_detail is not None
+            assert any(watch["path"] == "/watch-gap" for watch in active_watch_detail["watches"])
+            fired_watch_detail = follower.get_session_detail(fired_watch_session.session_id)
+            assert fired_watch_detail is not None
+            assert any(record["observed_path"] == "/watch-gap" for record in fired_watch_detail["recent_watch_fires"])
+            full_path_detail = follower.get_path_detail("/watch-gap")
+            assert full_path_detail is not None
+            assert any(watch["session_id"] == active_watch_session.session_id for watch in full_path_detail["active_watches"])
         finally:
             leader_cluster.stop()
             follower_cluster.stop()
@@ -1432,6 +1523,55 @@ class TestClusterEndpoints:
             except OSError:
                 pass
 
+    def test_leader_restart_with_persisted_cluster_state_requires_fresh_election(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as cluster_db:
+            db_path = cluster_db.name
+
+        coordinator = Coordinator(db_path=db_path)
+        coordinator.start()
+        manager = ClusterManager(
+            coordinator,
+            node_id="node-a",
+            role="leader",
+            peer_urls=["http://peer-b"],
+            advertise_url="http://node-a",
+        )
+
+        try:
+            initial_status = manager.build_status()
+            assert initial_status["role"] == "leader"
+
+            manager.stop()
+            coordinator.stop()
+
+            coordinator = Coordinator(db_path=db_path)
+            coordinator.start()
+            manager = ClusterManager(
+                coordinator,
+                node_id="node-a",
+                role="leader",
+                peer_urls=["http://peer-b"],
+                advertise_url="http://node-a",
+            )
+
+            status = manager.build_status()
+            assert status["role"] == "follower"
+            assert status["read_only"] is True
+            assert status["leader_id"] is None
+            assert status["current_term"] == initial_status["current_term"]
+
+            with pytest.raises(ForbiddenError) as exc_info:
+                coordinator.open_session(30)
+
+            assert exc_info.value.error == "read_only_replica"
+        finally:
+            manager.stop()
+            coordinator.stop()
+            try:
+                os.unlink(db_path)
+            except OSError:
+                pass
+
     def test_leader_push_replication_updates_follower_without_polling(self):
         with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as leader_db, tempfile.NamedTemporaryFile(suffix=".db", delete=False) as follower_db:
             leader_path = leader_db.name
@@ -1470,6 +1610,8 @@ class TestClusterEndpoints:
                     prev_log_term=int((payload or {}).get("prev_log_term", 0)),
                     commit_term=(None if (payload or {}).get("commit_term") is None else int((payload or {}).get("commit_term", 0))),
                     watch_fires_payload=(payload or {}).get("watch_fires", []),
+                    active_watch_commit_index=(payload or {}).get("active_watch_commit_index"),
+                    active_watches_payload=(payload or {}).get("active_watches", []),
                 )
             if parsed.path == "/internal/replication/watches":
                 return leader_cluster.export_active_watches()
@@ -2028,6 +2170,70 @@ class TestClusterEndpoints:
                 except OSError:
                     pass
 
+    def test_follower_rejects_commit_when_watch_fire_payload_is_out_of_range(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as follower_db:
+            follower_path = follower_db.name
+
+        follower = Coordinator(db_path=follower_path)
+        follower.start()
+        follower_cluster = ClusterManager(follower, node_id="node-b", role="follower")
+
+        try:
+            operation = Operation(
+                sequence_number=1,
+                operation_type=OperationType.CREATE,
+                path="/watch-range",
+                data=b"payload",
+                session_id=None,
+                timestamp=time.time(),
+                node_type=NodeType.PERSISTENT,
+                term=3,
+            )
+            appended = follower_cluster.receive_append(
+                leader_id="leader-a",
+                leader_url="http://leader-a",
+                term=3,
+                prev_log_index=0,
+                prev_log_term=0,
+                operations_payload=[operation.to_dict()],
+            )
+            assert appended["accepted"] is True
+
+            rejected = follower_cluster.receive_commit(
+                leader_id="leader-a",
+                leader_url="http://leader-a",
+                term=3,
+                commit_index=1,
+                prev_log_index=0,
+                prev_log_term=0,
+                commit_term=3,
+                watch_fires_payload=[
+                    {
+                        "cause_sequence_number": 99,
+                        "ordinal": 0,
+                        "watch_id": "watch-1",
+                        "watch_session_id": "session-1",
+                        "watch_path": "/watch-range",
+                        "observed_path": "/watch-range",
+                        "event_type": "CREATE",
+                        "registered_event_types": ["CREATE"],
+                        "watch_created_at": time.time(),
+                        "timestamp": time.time(),
+                        "data_preview": "payload",
+                    }
+                ],
+            )
+            assert rejected["accepted"] is False
+            assert rejected["reason"] == "watch_fire_range_mismatch"
+            assert follower.get_stats()["last_sequence"] == 0
+        finally:
+            follower_cluster.stop()
+            follower.stop()
+            try:
+                os.unlink(follower_path)
+            except OSError:
+                pass
+
     def test_reconfigure_rejects_remove_or_replace_requests(self):
         with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as leader_db, tempfile.NamedTemporaryFile(suffix=".db", delete=False) as follower_db:
             leader_path = leader_db.name
@@ -2087,6 +2293,199 @@ class TestClusterEndpoints:
                 except OSError:
                     pass
 
+    def test_reconfigure_activation_failure_rolls_back_peers_and_keeps_leadership(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as leader_db, tempfile.NamedTemporaryFile(suffix=".db", delete=False) as follower_db, tempfile.NamedTemporaryFile(suffix=".db", delete=False) as new_peer_db:
+            leader_path = leader_db.name
+            follower_path = follower_db.name
+            new_peer_path = new_peer_db.name
+
+        leader = Coordinator(db_path=leader_path)
+        follower = Coordinator(db_path=follower_path)
+        new_peer = Coordinator(db_path=new_peer_path)
+        leader.start()
+        follower.start()
+        new_peer.start()
+
+        managers: dict[str, ClusterManager] = {}
+        base_router = self._make_cluster_router(managers)
+
+        def router(url: str, method: str, payload: dict | None):
+            parsed = parse.urlparse(url)
+            if (
+                parsed.netloc == "peer-c"
+                and parsed.path == "/internal/cluster/configure"
+                and (payload or {}).get("phase") == "activate"
+            ):
+                raise RuntimeError("peer-c activate failed")
+            return base_router(url, method, payload)
+
+        follower_cluster = ClusterManager(
+            follower,
+            node_id="node-b",
+            role="follower",
+            leader_url="http://leader-a",
+            advertise_url="http://peer-b",
+            request_json=router,
+        )
+        new_peer_cluster = ClusterManager(
+            new_peer,
+            node_id="node-c",
+            role="standalone",
+            advertise_url="http://peer-c",
+            request_json=router,
+        )
+        leader_cluster = ClusterManager(
+            leader,
+            node_id="leader-a",
+            role="leader",
+            peer_urls=["http://peer-b"],
+            advertise_url="http://leader-a",
+            require_write_quorum=True,
+            request_json=router,
+        )
+        managers.update(
+            {
+                "http://leader-a": leader_cluster,
+                "http://peer-b": follower_cluster,
+                "http://peer-c": new_peer_cluster,
+            }
+        )
+        leader_cluster.start()
+        follower_cluster.start()
+
+        try:
+            leader.open_session(30)
+            leader_cluster._send_heartbeats_once()
+            leader_cluster._poll_peers_once()
+
+            with pytest.raises(ConflictError) as exc_info:
+                leader_cluster.reconfigure_cluster(
+                    expected_version=1,
+                    peer_urls=["http://peer-b", "http://peer-c"],
+                )
+
+            assert exc_info.value.error == "cluster_reconfig_activation_rolled_back"
+            status = leader_cluster.build_status()
+            assert status["role"] == "leader"
+            assert status["config_version"] == 1
+            assert status["peer_count"] == 1
+            assert status["reconfig_in_progress"] is False
+            follower_status = follower_cluster.build_status()
+            assert follower_status["config_version"] == 1
+            assert follower_status["pending_config_version"] is None
+            assert follower_status["peer_count"] == 0
+            new_peer_status = new_peer_cluster.build_status()
+            assert new_peer_status["role"] == "standalone"
+            assert new_peer_status["config_version"] == 1
+            assert new_peer_status["pending_config_version"] is None
+        finally:
+            leader_cluster.stop()
+            follower_cluster.stop()
+            new_peer_cluster.stop()
+            leader.stop()
+            follower.stop()
+            new_peer.stop()
+            for db_path in (leader_path, follower_path, new_peer_path):
+                try:
+                    os.unlink(db_path)
+                except OSError:
+                    pass
+
+    def test_reconfigure_activation_rollback_failure_revokes_leadership_and_freezes_cluster(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as leader_db, tempfile.NamedTemporaryFile(suffix=".db", delete=False) as follower_db, tempfile.NamedTemporaryFile(suffix=".db", delete=False) as new_peer_db:
+            leader_path = leader_db.name
+            follower_path = follower_db.name
+            new_peer_path = new_peer_db.name
+
+        leader = Coordinator(db_path=leader_path)
+        follower = Coordinator(db_path=follower_path)
+        new_peer = Coordinator(db_path=new_peer_path)
+        leader.start()
+        follower.start()
+        new_peer.start()
+
+        managers: dict[str, ClusterManager] = {}
+        base_router = self._make_cluster_router(managers)
+
+        def router(url: str, method: str, payload: dict | None):
+            parsed = parse.urlparse(url)
+            if (
+                parsed.netloc == "peer-c"
+                and parsed.path == "/internal/cluster/configure"
+                and (payload or {}).get("phase") == "activate"
+            ):
+                raise RuntimeError("peer-c activate failed")
+            if (
+                parsed.netloc == "peer-b"
+                and parsed.path == "/internal/cluster/configure"
+                and (payload or {}).get("phase") == "rollback"
+            ):
+                raise RuntimeError("peer-b rollback failed")
+            return base_router(url, method, payload)
+
+        follower_cluster = ClusterManager(
+            follower,
+            node_id="node-b",
+            role="follower",
+            leader_url="http://leader-a",
+            advertise_url="http://peer-b",
+            request_json=router,
+        )
+        new_peer_cluster = ClusterManager(
+            new_peer,
+            node_id="node-c",
+            role="standalone",
+            advertise_url="http://peer-c",
+            request_json=router,
+        )
+        leader_cluster = ClusterManager(
+            leader,
+            node_id="leader-a",
+            role="leader",
+            peer_urls=["http://peer-b"],
+            advertise_url="http://leader-a",
+            require_write_quorum=True,
+            request_json=router,
+        )
+        managers.update(
+            {
+                "http://leader-a": leader_cluster,
+                "http://peer-b": follower_cluster,
+                "http://peer-c": new_peer_cluster,
+            }
+        )
+        leader_cluster.start()
+        follower_cluster.start()
+
+        try:
+            leader.open_session(30)
+            leader_cluster._send_heartbeats_once()
+            leader_cluster._poll_peers_once()
+
+            with pytest.raises(ConflictError) as exc_info:
+                leader_cluster.reconfigure_cluster(
+                    expected_version=1,
+                    peer_urls=["http://peer-b", "http://peer-c"],
+                )
+
+            assert exc_info.value.error == "cluster_reconfig_activation_failed"
+            status = leader_cluster.build_status()
+            assert status["role"] == "candidate"
+            assert status["reconfig_in_progress"] is True
+            assert status["read_only"] is True
+        finally:
+            leader_cluster.stop()
+            follower_cluster.stop()
+            new_peer_cluster.stop()
+            leader.stop()
+            follower.stop()
+            new_peer.stop()
+            for db_path in (leader_path, follower_path, new_peer_path):
+                try:
+                    os.unlink(db_path)
+                except OSError:
+                    pass
+
     def test_follower_rejects_stale_replication_after_higher_term_failover(self):
         with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as follower_db:
             follower_path = follower_db.name
@@ -2138,6 +2537,218 @@ class TestClusterEndpoints:
             follower.stop()
             try:
                 os.unlink(follower_path)
+            except OSError:
+                pass
+
+    def test_reconfigure_rollback_failure_persists_restart_fence_and_stale_config_rejection(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as leader_db, tempfile.NamedTemporaryFile(suffix=".db", delete=False) as follower_db, tempfile.NamedTemporaryFile(suffix=".db", delete=False) as new_peer_db:
+            leader_path = leader_db.name
+            follower_path = follower_db.name
+            new_peer_path = new_peer_db.name
+
+        leader = Coordinator(db_path=leader_path)
+        follower = Coordinator(db_path=follower_path)
+        new_peer = Coordinator(db_path=new_peer_path)
+        leader.start()
+        follower.start()
+        new_peer.start()
+
+        managers: dict[str, ClusterManager] = {}
+        base_router = self._make_cluster_router(managers)
+
+        def router(url: str, method: str, payload: dict | None):
+            parsed = parse.urlparse(url)
+            if (
+                parsed.netloc == "peer-c"
+                and parsed.path == "/internal/cluster/configure"
+                and (payload or {}).get("phase") == "activate"
+            ):
+                raise RuntimeError("peer-c activate failed")
+            if (
+                parsed.netloc == "peer-b"
+                and parsed.path == "/internal/cluster/configure"
+                and (payload or {}).get("phase") == "rollback"
+            ):
+                raise RuntimeError("peer-b rollback failed")
+            return base_router(url, method, payload)
+
+        follower_cluster = ClusterManager(
+            follower,
+            node_id="node-b",
+            role="follower",
+            leader_url="http://leader-a",
+            advertise_url="http://peer-b",
+            request_json=router,
+        )
+        new_peer_cluster = ClusterManager(
+            new_peer,
+            node_id="node-c",
+            role="standalone",
+            advertise_url="http://peer-c",
+            request_json=router,
+        )
+        leader_cluster = ClusterManager(
+            leader,
+            node_id="leader-a",
+            role="leader",
+            peer_urls=["http://peer-b"],
+            advertise_url="http://leader-a",
+            require_write_quorum=True,
+            request_json=router,
+        )
+        managers.update(
+            {
+                "http://leader-a": leader_cluster,
+                "http://peer-b": follower_cluster,
+                "http://peer-c": new_peer_cluster,
+            }
+        )
+        leader_cluster.start()
+        follower_cluster.start()
+
+        restarted_leader_cluster = None
+        restarted_follower_cluster = None
+        restarted_leader = None
+        restarted_follower = None
+
+        try:
+            leader.open_session(30)
+            leader_cluster._send_heartbeats_once()
+            leader_cluster._poll_peers_once()
+
+            with pytest.raises(ConflictError) as exc_info:
+                leader_cluster.reconfigure_cluster(
+                    expected_version=1,
+                    peer_urls=["http://peer-b", "http://peer-c"],
+                )
+
+            assert exc_info.value.error == "cluster_reconfig_activation_failed"
+
+            leader_cluster.stop()
+            follower_cluster.stop()
+            new_peer_cluster.stop()
+            leader.stop()
+            follower.stop()
+            new_peer.stop()
+
+            restarted_leader = Coordinator(db_path=leader_path)
+            restarted_follower = Coordinator(db_path=follower_path)
+            restarted_leader.start()
+            restarted_follower.start()
+
+            restarted_managers: dict[str, ClusterManager] = {}
+            restarted_base_router = self._make_cluster_router(restarted_managers)
+
+            def restarted_router(url: str, method: str, payload: dict | None):
+                return restarted_base_router(url, method, payload)
+
+            restarted_leader_cluster = ClusterManager(
+                restarted_leader,
+                node_id="leader-a",
+                role="leader",
+                peer_urls=["http://peer-b"],
+                advertise_url="http://leader-a",
+                require_write_quorum=True,
+                request_json=restarted_router,
+            )
+            restarted_follower_cluster = ClusterManager(
+                restarted_follower,
+                node_id="node-b",
+                role="follower",
+                leader_url="http://leader-a",
+                advertise_url="http://peer-b",
+                request_json=restarted_router,
+            )
+            restarted_managers.update(
+                {
+                    "http://leader-a": restarted_leader_cluster,
+                    "http://peer-b": restarted_follower_cluster,
+                }
+            )
+
+            leader_status = restarted_leader_cluster.build_status()
+            assert leader_status["role"] == "follower"
+            assert leader_status["read_only"] is True
+            assert leader_status["reconfig_in_progress"] is True
+            assert leader_status["pending_config_version"] == 2
+            persisted_leader_state = restarted_leader.load_cluster_state("leader-a")
+            assert persisted_leader_state is not None
+            assert persisted_leader_state["previous_config_version"] is None
+
+            with pytest.raises(ForbiddenError) as write_exc:
+                restarted_leader.open_session(30)
+
+            assert write_exc.value.error == "read_only_replica"
+
+            follower_status = restarted_follower_cluster.build_status()
+            assert follower_status["config_version"] == 2
+            persisted_follower_state = restarted_follower.load_cluster_state("node-b")
+            assert persisted_follower_state is not None
+            assert persisted_follower_state["previous_config_version"] == 1
+
+            stale_heartbeat = restarted_follower_cluster.receive_heartbeat(
+                leader_id="leader-a",
+                term=leader_status["current_term"],
+                leader_url="http://leader-a",
+                commit_index=0,
+                config_version=1,
+            )
+            assert stale_heartbeat["accepted"] is False
+            assert stale_heartbeat["reason"] == "stale_config_version"
+        finally:
+            if restarted_leader_cluster is not None:
+                restarted_leader_cluster.stop()
+            if restarted_follower_cluster is not None:
+                restarted_follower_cluster.stop()
+            if restarted_leader is not None:
+                restarted_leader.stop()
+            if restarted_follower is not None:
+                restarted_follower.stop()
+            else:
+                leader_cluster.stop()
+                follower_cluster.stop()
+                new_peer_cluster.stop()
+                leader.stop()
+                follower.stop()
+                new_peer.stop()
+            for db_path in (leader_path, follower_path, new_peer_path):
+                try:
+                    os.unlink(db_path)
+                except OSError:
+                    pass
+
+    def test_reconfig_in_progress_blocks_leader_writes_without_write_quorum_mode(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as cluster_db:
+            db_path = cluster_db.name
+
+        coordinator = Coordinator(db_path=db_path)
+        coordinator.start()
+        manager = ClusterManager(
+            coordinator,
+            node_id="node-a",
+            role="leader",
+            peer_urls=["http://peer-b"],
+            advertise_url="http://node-a",
+            require_write_quorum=False,
+        )
+
+        try:
+            with manager._lock:
+                manager._pending_config_version = manager._config_version + 1
+                manager._pending_peer_urls = ["http://peer-b", "http://peer-c"]
+                manager._reconfig_in_progress = True
+                manager._persist_cluster_state_locked()
+            manager._apply_replica_mode()
+
+            with pytest.raises(ConflictError) as exc_info:
+                coordinator.open_session(30)
+
+            assert exc_info.value.error == "cluster_reconfig_in_progress"
+        finally:
+            manager.stop()
+            coordinator.stop()
+            try:
+                os.unlink(db_path)
             except OSError:
                 pass
 

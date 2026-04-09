@@ -18,7 +18,7 @@ from typing import Any, Callable, Deque, Dict, List, Optional
 from urllib import error, parse, request
 
 from coordinator import Coordinator
-from models import Operation, WatchFireRecord
+from models import Operation, OperationType, WatchFireRecord
 from errors import ConflictError
 from logger import get_logger
 
@@ -82,6 +82,8 @@ class ClusterManager:
         self._last_leader_contact_at: Optional[float] = time.time() if self._role == "leader" else None
         self._leader_lease_until: Optional[float] = None
         self._config_version = 1
+        self._previous_config_version: Optional[int] = None
+        self._previous_peer_urls: List[str] = []
         self._pending_config_version: Optional[int] = None
         self._pending_peer_urls: List[str] = []
         self._reconfig_in_progress = False
@@ -113,10 +115,18 @@ class ClusterManager:
         self._commit_callback_registered = False
 
         persisted_state = self._coordinator.load_cluster_state(self._node_id) or {}
+        loaded_persisted_state = bool(persisted_state)
         self._current_term = int(persisted_state.get("current_term", self._current_term))
         self._voted_for = persisted_state.get("voted_for") or self._voted_for
         self._leader_id = persisted_state.get("leader_id") or self._leader_id
         self._config_version = int(persisted_state.get("config_version", self._config_version))
+        previous_config_version = persisted_state.get("previous_config_version")
+        self._previous_config_version = (
+            None if previous_config_version is None else int(previous_config_version)
+        )
+        self._previous_peer_urls = self._normalize_peer_urls(
+            persisted_state.get("previous_peer_urls", [])
+        )
         self._pending_config_version = persisted_state.get("pending_config_version")
         self._pending_peer_urls = self._normalize_peer_urls(persisted_state.get("pending_peer_urls", []))
         self._reconfig_in_progress = bool(persisted_state.get("reconfig_in_progress", False))
@@ -133,7 +143,18 @@ class ClusterManager:
             self._peer_urls = self._normalize_peer_urls(persisted_peer_urls)
             self._peer_states = self._rebuild_peer_states(self._peer_urls, self._peer_states)
 
-        if self._role == "leader":
+        should_bootstrap_leader = self._role == "leader" and not (
+            loaded_persisted_state and self._peer_urls
+        )
+
+        if self._role == "leader" and not should_bootstrap_leader:
+            self._role = "follower"
+            self._leader_id = None
+            self._leader_url = None
+            self._leader_lease_until = None
+            self._last_leader_contact_at = None
+
+        if should_bootstrap_leader:
             self._current_term = max(1, self._current_term + 1)
             self._voted_for = self._node_id
             self._leader_id = self._node_id
@@ -212,20 +233,21 @@ class ClusterManager:
     def export_operations(self, since_sequence: int = 0, limit: Optional[int] = None) -> Dict[str, Any]:
         """Expose committed operations for follower catch-up."""
         limit = self._batch_size if limit is None else max(1, int(limit))
-        operations = self._coordinator.get_operations(since_sequence=since_sequence, limit=limit)
-        commit_index = self._coordinator.get_stats().get("last_sequence", 0)
-        watch_fires = self._coordinator.load_watch_fires_for_operations(
-            [operation.sequence_number for operation in operations]
+        batch = self._coordinator.export_replication_batch(
+            since_sequence=since_sequence,
+            limit=limit,
         )
         return {
             "node_id": self._node_id,
             "role": self._role,
             "term": self._current_term,
             "since_sequence": since_sequence,
-            "commit_index": commit_index,
-            "operations": [operation.to_dict() for operation in operations],
-            "watch_fires": [record.to_dict() for record in watch_fires],
-            "count": len(operations),
+            "commit_index": batch["commit_index"],
+            "operations": batch["operations"],
+            "watch_fires": batch["watch_fires"],
+            "active_watch_commit_index": batch["active_watch_commit_index"],
+            "active_watches": batch["active_watches"],
+            "count": len(batch["operations"]),
         }
 
     def export_snapshot(self) -> Dict[str, Any]:
@@ -246,6 +268,7 @@ class ClusterManager:
             "node_id": self._node_id,
             "role": self._role,
             "term": self._current_term,
+            "commit_index": self._coordinator.get_stats().get("last_sequence", 0),
             "watches": self._coordinator.export_active_watches(),
         }
 
@@ -279,9 +302,16 @@ class ClusterManager:
         source_term: Optional[int],
         operations_payload: List[Dict[str, Any]],
         prepared_write: bool = False,
+        watch_fires_payload: Optional[List[Dict[str, Any]]] = None,
+        active_watch_commit_index: Optional[int] = None,
+        active_watches_payload: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """Apply a pushed replication batch on a follower."""
         operations = [Operation.from_dict(item) for item in operations_payload]
+        watch_fires = [
+            WatchFireRecord.from_dict(item)
+            for item in (watch_fires_payload or [])
+        ]
         started_at = time.time()
         with self._lock:
             self._clear_expired_prepare_locked()
@@ -313,6 +343,14 @@ class ClusterManager:
                         reason=reason,
                     )
         applied = self._coordinator.apply_replicated_operations(operations)
+        if watch_fires:
+            self._coordinator.record_replicated_watch_fires(watch_fires)
+        current_applied = self._coordinator.get_stats().get("last_sequence", 0)
+        if (
+            active_watch_commit_index is not None
+            and int(active_watch_commit_index) == current_applied
+        ):
+            self._coordinator.restore_active_watches(active_watches_payload or [])
         applied_at = time.time()
         with self._lock:
             self._clear_expired_prepare_locked()
@@ -347,7 +385,7 @@ class ClusterManager:
         return {
             "status": "ok",
             "applied_count": applied,
-            "last_applied": self._coordinator.get_stats().get("last_sequence", 0),
+            "last_applied": current_applied,
             "node_id": self._node_id,
         }
 
@@ -547,6 +585,8 @@ class ClusterManager:
         prev_log_term: int = 0,
         commit_term: Optional[int] = None,
         watch_fires_payload: Optional[List[Dict[str, Any]]] = None,
+        active_watch_commit_index: Optional[int] = None,
+        active_watches_payload: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """Advance a follower commit index and apply durable log entries."""
         apply_mode = False
@@ -628,6 +668,24 @@ class ClusterManager:
                     "reason": "commit_log_mismatch",
                 }
 
+        watch_fires = [
+            WatchFireRecord.from_dict(item)
+            for item in (watch_fires_payload or [])
+        ]
+        if watch_fires and any(
+            record.cause_sequence_number < (current_applied + 1)
+            or record.cause_sequence_number > target_commit
+            for record in watch_fires
+        ):
+            return {
+                "accepted": False,
+                "term": self._current_term,
+                "node_id": self._node_id,
+                "last_applied": current_applied,
+                "last_log_index": last_log_index,
+                "reason": "watch_fire_range_mismatch",
+            }
+
         applied_count = 0
         if target_commit > current_applied:
             operations = self._coordinator.load_replication_operations_between(
@@ -646,16 +704,16 @@ class ClusterManager:
                 }
             applied_count = self._coordinator.apply_replicated_operations(operations)
 
-        watch_fires = [
-            WatchFireRecord.from_dict(item)
-            for item in (watch_fires_payload or [])
-        ]
         if watch_fires:
             self._coordinator.record_replicated_watch_fires(watch_fires)
-        self._sync_active_watches_from_leader()
 
         applied_at = time.time()
         current_applied = self._coordinator.get_stats().get("last_sequence", 0)
+        if (
+            active_watch_commit_index is not None
+            and int(active_watch_commit_index) == current_applied
+        ):
+            self._coordinator.restore_active_watches(active_watches_payload or [])
         with self._lock:
             self._leader_commit_index = max(self._leader_commit_index, current_applied)
             self._coordinator.advance_cluster_cursors(
@@ -1177,6 +1235,8 @@ class ClusterManager:
             )
 
         staged_peers: List[str] = []
+        activated_peers: List[str] = []
+        activation_started = False
         with self._prepare_barrier:
             self._poll_peers_once()
             current_applied = self._coordinator.get_stats().get("last_sequence", 0)
@@ -1275,6 +1335,7 @@ class ClusterManager:
                     expected_log_term=local_last_log_term,
                 )
 
+                activation_started = True
                 for peer in desired_peer_urls:
                     self._request_json(
                         f"{peer}/internal/cluster/configure",
@@ -1289,8 +1350,11 @@ class ClusterManager:
                             "phase": "activate",
                         },
                     )
+                    activated_peers.append(peer)
 
                 with self._lock:
+                    self._previous_config_version = self._config_version
+                    self._previous_peer_urls = list(self._peer_urls)
                     self._peer_urls = list(desired_peer_urls)
                     self._peer_states = self._rebuild_peer_states(self._peer_urls, self._peer_states)
                     self._config_version = next_version
@@ -1299,37 +1363,106 @@ class ClusterManager:
                     self._reconfig_in_progress = False
                     self._persist_cluster_state_locked()
             except Exception as exc:
-                if staged_peers:
-                    for peer in staged_peers:
-                        try:
-                            self._request_json(
-                                f"{peer}/internal/cluster/configure",
-                                "POST",
-                                {
-                                    "leader_id": self._node_id,
-                                    "leader_url": self._advertise_url,
-                                    "term": self._current_term,
-                                    "config_version": next_version,
-                                    "cluster_urls": cluster_urls,
-                                    "node_url": peer,
-                                    "phase": "abort",
-                                },
-                            )
-                        except Exception:
-                            continue
+                if not activation_started:
+                    if staged_peers:
+                        for peer in staged_peers:
+                            try:
+                                self._request_json(
+                                    f"{peer}/internal/cluster/configure",
+                                    "POST",
+                                    {
+                                        "leader_id": self._node_id,
+                                        "leader_url": self._advertise_url,
+                                        "term": self._current_term,
+                                        "config_version": next_version,
+                                        "cluster_urls": cluster_urls,
+                                        "node_url": peer,
+                                        "phase": "abort",
+                                    },
+                                )
+                            except Exception:
+                                continue
+                    with self._lock:
+                        self._pending_config_version = None
+                        self._pending_peer_urls = []
+                        self._reconfig_in_progress = False
+                        self._peer_states = self._rebuild_peer_states(self._peer_urls, self._peer_states)
+                        self._last_error = str(exc)
+                        self._persist_cluster_state_locked()
+                    if isinstance(exc, ConflictError):
+                        raise
+                    raise ConflictError(
+                        "Cluster reconfiguration failed during staging",
+                        error="cluster_reconfig_failed",
+                        detail=str(exc),
+                    ) from exc
+
+                rollback_failures: List[str] = []
+                staged_only_peers = [
+                    peer for peer in staged_peers
+                    if peer not in activated_peers
+                ]
+                for peer in staged_only_peers:
+                    try:
+                        self._request_json(
+                            f"{peer}/internal/cluster/configure",
+                            "POST",
+                            {
+                                "leader_id": self._node_id,
+                                "leader_url": self._advertise_url,
+                                "term": self._current_term,
+                                "config_version": next_version,
+                                "cluster_urls": cluster_urls,
+                                "node_url": peer,
+                                "phase": "abort",
+                            },
+                        )
+                    except Exception:
+                        rollback_failures.append(peer)
+                for peer in reversed(activated_peers):
+                    try:
+                        self._request_json(
+                            f"{peer}/internal/cluster/configure",
+                            "POST",
+                            {
+                                "leader_id": self._node_id,
+                                "leader_url": self._advertise_url,
+                                "term": self._current_term,
+                                "config_version": next_version,
+                                "cluster_urls": cluster_urls,
+                                "node_url": peer,
+                                "phase": "rollback",
+                            },
+                        )
+                    except Exception:
+                        rollback_failures.append(peer)
+
+                if not rollback_failures:
+                    with self._lock:
+                        self._pending_config_version = None
+                        self._pending_peer_urls = []
+                        self._reconfig_in_progress = False
+                        self._peer_states = self._rebuild_peer_states(self._peer_urls, self._peer_states)
+                        self._last_error = f"cluster reconfiguration activation failed and rolled back: {exc}"
+                        self._persist_cluster_state_locked()
+                    raise ConflictError(
+                        "Cluster reconfiguration activation failed and was rolled back",
+                        error="cluster_reconfig_activation_rolled_back",
+                        detail=str(exc),
+                    ) from exc
+
                 with self._lock:
-                    self._pending_config_version = None
-                    self._pending_peer_urls = []
-                    self._reconfig_in_progress = False
-                    self._peer_states = self._rebuild_peer_states(self._peer_urls, self._peer_states)
-                    self._last_error = str(exc)
+                    self._last_error = (
+                        f"cluster reconfiguration activation failed: {exc}; "
+                        f"rollback failed for {', '.join(rollback_failures)}"
+                    )
                     self._persist_cluster_state_locked()
-                if isinstance(exc, ConflictError):
-                    raise
+                self._step_down_to_candidate("Cluster reconfiguration activation rollback failed")
                 raise ConflictError(
-                    "Cluster reconfiguration failed",
-                    error="cluster_reconfig_failed",
+                    "Cluster reconfiguration activation failed and rollback was incomplete",
+                    error="cluster_reconfig_activation_failed",
                     detail=str(exc),
+                    rollback_failures=rollback_failures,
                 ) from exc
 
         return self.build_status()
@@ -1355,6 +1488,7 @@ class ClusterManager:
         ]
         phase_value = (phase or "").strip().lower()
         apply_mode = False
+        refresh_mode = False
 
         with self._prepare_barrier:
             with self._lock:
@@ -1366,7 +1500,7 @@ class ClusterManager:
                         "reason": "stale_term",
                     }
 
-                if phase_value not in {"stage", "activate", "abort"}:
+                if phase_value not in {"stage", "activate", "abort", "rollback"}:
                     raise ValueError(f"Unsupported configure phase: {phase}")
 
                 if term > self._current_term:
@@ -1394,12 +1528,15 @@ class ClusterManager:
                 self._last_leader_contact_at = time.time()
 
                 if phase_value == "stage":
+                    self._previous_config_version = self._config_version
+                    self._previous_peer_urls = list(self._peer_urls)
                     self._pending_config_version = int(config_version)
                     self._pending_peer_urls = list(desired_peer_urls)
                     self._reconfig_in_progress = True
                     if self._role != "leader" or leader_id != self._node_id:
                         self._role = "follower"
                         apply_mode = True
+                        refresh_mode = True
                     self._persist_cluster_state_locked()
                 elif phase_value == "activate":
                     if (
@@ -1413,6 +1550,9 @@ class ClusterManager:
                             "reason": "config_not_staged",
                             "config_version": self._config_version,
                         }
+                    if self._previous_config_version is None:
+                        self._previous_config_version = self._config_version
+                        self._previous_peer_urls = list(self._peer_urls)
                     self._peer_urls = list(desired_peer_urls)
                     self._peer_states = self._rebuild_peer_states(self._peer_urls, self._peer_states)
                     self._config_version = int(config_version)
@@ -1422,17 +1562,51 @@ class ClusterManager:
                     if self._role != "leader" or leader_id != self._node_id:
                         self._role = "follower"
                         apply_mode = True
+                        refresh_mode = True
                     self._persist_cluster_state_locked()
                 else:
-                    if self._pending_config_version == int(config_version):
-                        self._pending_config_version = None
-                        self._pending_peer_urls = []
-                        self._reconfig_in_progress = False
-                        self._persist_cluster_state_locked()
+                    staged_matches = self._pending_config_version == int(config_version)
+                    active_matches = (
+                        phase_value == "rollback"
+                        and self._config_version == int(config_version)
+                        and self._previous_config_version is not None
+                    )
+                    if not staged_matches and not active_matches:
+                        return {
+                            "accepted": False,
+                            "term": self._current_term,
+                            "node_id": self._node_id,
+                            "reason": "config_not_staged",
+                            "config_version": self._config_version,
+                        }
 
-        if apply_mode:
+                    if active_matches:
+                        self._config_version = int(self._previous_config_version or self._config_version)
+                        self._peer_urls = list(self._previous_peer_urls)
+                        self._peer_states = self._rebuild_peer_states(self._peer_urls, self._peer_states)
+
+                    self._pending_config_version = None
+                    self._pending_peer_urls = []
+                    self._reconfig_in_progress = False
+
+                    if self._role != "leader" or leader_id != self._node_id:
+                        if not self._peer_urls:
+                            self._role = "standalone"
+                            self._leader_id = None
+                            self._leader_url = None
+                        else:
+                            self._role = "follower"
+                            apply_mode = True
+                        refresh_mode = True
+
+                    self._previous_config_version = None
+                    self._previous_peer_urls = []
+                    self._persist_cluster_state_locked()
+
+        if refresh_mode:
             self._apply_replica_mode()
-            self.start()
+            if self._role != "standalone" or self._peer_urls or self._leader_url:
+                self.start()
         return {
             "accepted": True,
             "term": self._current_term,
@@ -1520,6 +1694,8 @@ class ClusterManager:
             WatchFireRecord.from_dict(item)
             for item in payload.get("watch_fires", [])
         ]
+        active_watch_commit_index = payload.get("active_watch_commit_index")
+        active_watches_payload = payload.get("active_watches", [])
         leader_commit_index = int(payload.get("commit_index", 0))
         if current_sequence > leader_commit_index:
             return self._resync_from_leader_snapshot(reason="local_ahead_of_leader")
@@ -1558,7 +1734,16 @@ class ClusterManager:
             return self._resync_from_leader_snapshot(reason="apply_conflict")
         if watch_fires:
             self._coordinator.record_replicated_watch_fires(watch_fires)
-        self._sync_active_watches_from_leader()
+        target_sequence = (
+            operations_to_apply[-1].sequence_number
+            if operations_to_apply
+            else current_sequence
+        )
+        if (
+            active_watch_commit_index is not None
+            and int(active_watch_commit_index) == int(target_sequence)
+        ):
+            self._coordinator.restore_active_watches(active_watches_payload or [])
         applied_at = time.time()
 
         with self._lock:
@@ -1802,6 +1987,16 @@ class ClusterManager:
                 error="leader_lease_expired",
             )
 
+    def assert_cluster_write_allowed(self) -> None:
+        """Reject leader writes that violate cluster-level safety fences."""
+        with self._lock:
+            if self._role == "leader" and self._reconfig_in_progress:
+                raise ConflictError(
+                    "Write quorum unavailable: cluster reconfiguration is in progress",
+                    error="cluster_reconfig_in_progress",
+                )
+        self.assert_write_quorum_available()
+
     def _start_election_once(self, auto: bool = False) -> Dict[str, Any]:
         """Run one election round and become leader on majority votes."""
         if self._role == "standalone":
@@ -1877,6 +2072,14 @@ class ClusterManager:
         """Push newly committed operations to followers for lower replication lag."""
         if self._role != "leader" or not self._push_commit_replication or not self._peer_urls:
             return
+        watch_fire_records = self._coordinator.load_watch_fires_for_operations(
+            [operation.sequence_number]
+        )
+        active_watch_sync = self._build_active_watch_sync_payload(
+            operations=[operation],
+            watch_fire_records=watch_fire_records,
+            commit_index=operation.sequence_number,
+        )
         for peer in self._peer_urls:
             started_at = time.time()
             try:
@@ -1888,6 +2091,9 @@ class ClusterManager:
                         "source_term": self._current_term,
                         "prepared_write": self._require_write_quorum,
                         "operations": [operation.to_dict()],
+                        "watch_fires": [record.to_dict() for record in watch_fire_records],
+                        "active_watch_commit_index": active_watch_sync["active_watch_commit_index"],
+                        "active_watches": active_watch_sync["active_watches"],
                     },
                 )
                 last_applied = int(payload.get("last_applied", operation.sequence_number))
@@ -1938,8 +2144,12 @@ class ClusterManager:
             self._coordinator.set_prepare_guard(None)
         else:
             self._coordinator.set_read_only(False)
-            self._coordinator.set_write_guard(self.assert_write_quorum_available if self._require_write_quorum else None)
-            self._coordinator.set_prepare_guard(self.prepare_write_quorum if self._require_write_quorum else None)
+            self._coordinator.set_write_guard(
+                self.assert_cluster_write_allowed if self._role == "leader" else None
+            )
+            self._coordinator.set_prepare_guard(
+                self.prepare_write_quorum if self._role == "leader" and self._require_write_quorum else None
+            )
             self._coordinator.enable_local_maintenance()
         self._sync_commit_callback_locked()
 
@@ -2100,6 +2310,15 @@ class ClusterManager:
         watch_fire_records: Optional[List[WatchFireRecord]] = None,
     ) -> None:
         """Tell followers to apply all appended entries through one commit index."""
+        commit_operations = self._coordinator.load_replication_operations_between(
+            max(1, int(prev_log_index) + 1),
+            commit_index,
+        )
+        active_watch_sync = self._build_active_watch_sync_payload(
+            operations=commit_operations,
+            watch_fire_records=watch_fire_records or [],
+            commit_index=commit_index,
+        )
         for peer in peers:
             started_at = time.time()
             try:
@@ -2118,6 +2337,8 @@ class ClusterManager:
                             record.to_dict()
                             for record in (watch_fire_records or [])
                         ],
+                        "active_watch_commit_index": active_watch_sync["active_watch_commit_index"],
+                        "active_watches": active_watch_sync["active_watches"],
                     },
                 )
                 last_applied = int(payload.get("last_applied", 0))
@@ -2163,6 +2384,32 @@ class ClusterManager:
                     "last_error": str(exc),
                 }
 
+    def _build_active_watch_sync_payload(
+        self,
+        *,
+        operations: List[Operation],
+        watch_fire_records: List[WatchFireRecord],
+        commit_index: int,
+    ) -> Dict[str, Any]:
+        """Project the leader's post-commit active-watch set for one replicated boundary."""
+        fired_watch_ids = {
+            record.watch_id
+            for record in watch_fire_records
+        }
+        closed_session_ids = {
+            operation.session_id
+            for operation in operations
+            if operation.operation_type == OperationType.SESSION_CLOSE
+            and operation.session_id
+        }
+        return {
+            "active_watch_commit_index": int(commit_index),
+            "active_watches": self._coordinator.export_active_watches(
+                exclude_watch_ids=fired_watch_ids,
+                exclude_session_ids=closed_session_ids,
+            ),
+        }
+
     def _broadcast_truncate(
         self,
         *,
@@ -2185,10 +2432,10 @@ class ClusterManager:
             except Exception:
                 continue
 
-    def _sync_active_watches_from_leader(self) -> None:
-        """Mirror leader active watches so follower inspectors stay current."""
+    def _sync_active_watches_from_leader(self) -> bool:
+        """Best-effort fallback mirror for follower active-watch parity."""
         if self._role != "follower" or not self._leader_url:
-            return
+            return False
         try:
             payload = self._request_json(
                 f"{self._leader_url}/internal/replication/watches",
@@ -2196,8 +2443,16 @@ class ClusterManager:
                 None,
             )
             self._coordinator.restore_active_watches(payload.get("watches", []))
+            with self._lock:
+                if self._last_error == "active_watch_sync_failed":
+                    self._last_error = None
+                    self._persist_cluster_state_locked()
+            return True
         except Exception:
-            return
+            with self._lock:
+                self._last_error = "active_watch_sync_failed"
+                self._persist_cluster_state_locked()
+            return False
 
     def _compute_quorum_commit_index_locked(self, current_sequence: int) -> Optional[int]:
         """Compute the highest sequence known to be present on a majority."""
@@ -2231,6 +2486,8 @@ class ClusterManager:
             leader_url=self._leader_url,
             config_version=self._config_version,
             peer_urls=self._peer_urls,
+            previous_config_version=self._previous_config_version,
+            previous_peer_urls=self._previous_peer_urls,
             pending_config_version=self._pending_config_version,
             pending_peer_urls=self._pending_peer_urls,
             reconfig_in_progress=self._reconfig_in_progress,

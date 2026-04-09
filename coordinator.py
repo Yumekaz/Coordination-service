@@ -188,6 +188,8 @@ class Coordinator:
         leader_url: Optional[str] = None,
         config_version: int = 1,
         peer_urls: Optional[List[str]] = None,
+        previous_config_version: Optional[int] = None,
+        previous_peer_urls: Optional[List[str]] = None,
         pending_config_version: Optional[int] = None,
         pending_peer_urls: Optional[List[str]] = None,
         reconfig_in_progress: bool = False,
@@ -203,6 +205,8 @@ class Coordinator:
             leader_url=leader_url,
             config_version=config_version,
             peer_urls=peer_urls,
+            previous_config_version=previous_config_version,
+            previous_peer_urls=previous_peer_urls,
             pending_config_version=pending_config_version,
             pending_peer_urls=pending_peer_urls,
             reconfig_in_progress=reconfig_in_progress,
@@ -248,13 +252,60 @@ class Coordinator:
             last_applied=last_applied,
         )
 
-    def export_active_watches(self) -> List[Dict[str, Any]]:
+    def export_active_watches(
+        self,
+        *,
+        exclude_watch_ids: Optional[Set[str]] = None,
+        exclude_session_ids: Optional[Set[str]] = None,
+    ) -> List[Dict[str, Any]]:
         """Export leader-side active watches for follower parity sync."""
-        return [
-            watch.to_dict()
-            for watch in self._watch_manager.get_all_watches()
-            if not watch.is_fired
-        ]
+        excluded_watch_ids = set(exclude_watch_ids or set())
+        excluded_session_ids = set(exclude_session_ids or set())
+        with self._lock:
+            return [
+                watch.to_dict()
+                for watch in self._watch_manager.get_all_watches()
+                if not watch.is_fired
+                and watch.watch_id not in excluded_watch_ids
+                and watch.session_id not in excluded_session_ids
+            ]
+
+    def export_replication_batch(
+        self,
+        *,
+        since_sequence: int = 0,
+        limit: int = 100,
+    ) -> Dict[str, Any]:
+        """Export a causally aligned follower catch-up batch."""
+        with self._lock:
+            operations = self._operation_log.get_operations_since(since_sequence)
+            if limit > 0:
+                operations = operations[:limit]
+            else:
+                operations = []
+
+            commit_index = self._operation_log.current_sequence
+            watch_fires: List[WatchFireRecord] = []
+            for operation in operations:
+                watch_fires.extend(
+                    self._persistence.load_watch_fires_for_operation(
+                        operation.sequence_number
+                    )
+                )
+
+            active_watch_commit_index: Optional[int] = None
+            active_watches: List[Dict[str, Any]] = []
+            if operations and operations[-1].sequence_number == commit_index:
+                active_watch_commit_index = commit_index
+                active_watches = self.export_active_watches()
+
+            return {
+                "commit_index": commit_index,
+                "operations": [operation.to_dict() for operation in operations],
+                "watch_fires": [record.to_dict() for record in watch_fires],
+                "active_watch_commit_index": active_watch_commit_index,
+                "active_watches": active_watches,
+            }
 
     def restore_active_watches(self, watches_payload: List[Dict[str, Any]]) -> int:
         """Replace in-memory active watches from a leader mirror payload."""

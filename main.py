@@ -366,6 +366,9 @@ class InternalReplicationApplyRequest(BaseModel):
     source_term: Optional[int] = Field(default=None, ge=0)
     prepared_write: bool = False
     operations: List[Dict[str, Any]] = Field(default_factory=list)
+    watch_fires: List[Dict[str, Any]] = Field(default_factory=list)
+    active_watch_commit_index: Optional[int] = Field(default=None, ge=0)
+    active_watches: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class InternalReplicationAppendRequest(BaseModel):
@@ -409,6 +412,8 @@ class InternalReplicationCommitRequest(BaseModel):
     prev_log_term: int = Field(default=0, ge=0)
     commit_term: Optional[int] = Field(default=None, ge=0)
     watch_fires: List[Dict[str, Any]] = Field(default_factory=list)
+    active_watch_commit_index: Optional[int] = Field(default=None, ge=0)
+    active_watches: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class InternalReplicationTruncateRequest(BaseModel):
@@ -1061,6 +1066,9 @@ async def internal_replication_apply(
         source_term=payload.source_term,
         prepared_write=payload.prepared_write,
         operations_payload=payload.operations,
+        watch_fires_payload=payload.watch_fires,
+        active_watch_commit_index=payload.active_watch_commit_index,
+        active_watches_payload=payload.active_watches,
     )
 
 
@@ -1128,6 +1136,8 @@ async def internal_replication_commit(
         prev_log_term=payload.prev_log_term,
         commit_term=payload.commit_term,
         watch_fires_payload=payload.watch_fires,
+        active_watch_commit_index=payload.active_watch_commit_index,
+        active_watches_payload=payload.active_watches,
     )
 
 
