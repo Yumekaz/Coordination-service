@@ -336,6 +336,7 @@ class ClusterStatusResponse(BaseModel):
     pending_config_version: Optional[int] = None
     pending_peer_urls: List[str] = Field(default_factory=list)
     reconfig_in_progress: bool = False
+    decommissioned: bool = False
     voted_for: Optional[str] = None
     commit_index: int
     last_applied: int
@@ -1012,7 +1013,7 @@ async def cluster_status() -> ClusterStatusResponse:
 
 @app.post("/api/cluster/reconfigure")
 async def cluster_reconfigure(request: ClusterReconfigureRequest) -> dict:
-    """Stage and activate a conservative add-only cluster reconfiguration."""
+    """Stage and activate a conservative single-peer add/remove cluster reconfiguration."""
     return _require_cluster_manager().reconfigure_cluster(
         expected_version=request.expected_version,
         peer_urls=request.peer_urls,

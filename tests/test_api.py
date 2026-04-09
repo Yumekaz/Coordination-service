@@ -2234,7 +2234,54 @@ class TestClusterEndpoints:
             except OSError:
                 pass
 
-    def test_reconfigure_rejects_remove_or_replace_requests(self):
+    def test_vote_request_rejected_while_persisted_reconfiguration_is_in_progress(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as cluster_db:
+            db_path = cluster_db.name
+
+        coordinator = Coordinator(db_path=db_path)
+        coordinator.start()
+        coordinator.save_cluster_state(
+            node_id="node-b",
+            current_term=4,
+            config_version=1,
+            peer_urls=["http://leader-a"],
+            pending_config_version=2,
+            pending_peer_urls=["http://leader-a", "http://peer-c"],
+            reconfig_in_progress=True,
+        )
+        coordinator.stop()
+
+        coordinator = Coordinator(db_path=db_path)
+        coordinator.start()
+        manager = ClusterManager(
+            coordinator,
+            node_id="node-b",
+            role="follower",
+            leader_url="http://leader-a",
+            advertise_url="http://peer-b",
+        )
+
+        try:
+            vote = manager.request_vote(
+                candidate_id="node-c",
+                term=5,
+                candidate_last_applied=0,
+                candidate_last_log_index=0,
+                candidate_last_log_term=0,
+                candidate_config_version=2,
+            )
+
+            assert vote["vote_granted"] is False
+            assert vote["reason"] == "cluster_reconfig_in_progress"
+        finally:
+            manager.stop()
+            coordinator.stop()
+            try:
+                os.unlink(db_path)
+            except OSError:
+                pass
+
+    def test_reconfigure_rejects_single_follower_collapse_or_replace_request(self):
         with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as leader_db, tempfile.NamedTemporaryFile(suffix=".db", delete=False) as follower_db:
             leader_path = leader_db.name
             follower_path = follower_db.name
@@ -2275,19 +2322,264 @@ class TestClusterEndpoints:
 
         try:
             leader.open_session(30)
+            leader_cluster._send_heartbeats_once()
+            leader_cluster._poll_peers_once()
             with pytest.raises(ConflictError) as exc_info:
                 leader_cluster.reconfigure_cluster(
                     expected_version=1,
                     peer_urls=[],
                 )
 
-            assert exc_info.value.error == "cluster_reconfig_add_only"
+            assert exc_info.value.error == "cluster_reconfig_remove_requires_survivor_quorum"
+
+            with pytest.raises(ConflictError) as replace_exc:
+                leader_cluster.reconfigure_cluster(
+                    expected_version=1,
+                    peer_urls=["http://peer-c"],
+                )
+
+            assert replace_exc.value.error == "cluster_reconfig_conservative_only"
         finally:
             leader_cluster.stop()
             follower_cluster.stop()
             leader.stop()
             follower.stop()
             for db_path in (leader_path, follower_path):
+                try:
+                    os.unlink(db_path)
+                except OSError:
+                    pass
+
+    def test_remove_follower_decommissions_removed_peer_and_shrinks_cluster(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as leader_db, tempfile.NamedTemporaryFile(suffix=".db", delete=False) as follower_db, tempfile.NamedTemporaryFile(suffix=".db", delete=False) as new_peer_db:
+            leader_path = leader_db.name
+            follower_path = follower_db.name
+            new_peer_path = new_peer_db.name
+
+        leader = Coordinator(db_path=leader_path)
+        follower = Coordinator(db_path=follower_path)
+        new_peer = Coordinator(db_path=new_peer_path)
+        leader.start()
+        follower.start()
+        new_peer.start()
+
+        managers: dict[str, ClusterManager] = {}
+        router = self._make_cluster_router(managers)
+
+        follower_cluster = ClusterManager(
+            follower,
+            node_id="node-b",
+            role="follower",
+            leader_url="http://leader-a",
+            advertise_url="http://peer-b",
+            request_json=router,
+        )
+        new_peer_cluster = ClusterManager(
+            new_peer,
+            node_id="node-c",
+            role="standalone",
+            advertise_url="http://peer-c",
+            request_json=router,
+        )
+        leader_cluster = ClusterManager(
+            leader,
+            node_id="leader-a",
+            role="leader",
+            peer_urls=["http://peer-b"],
+            advertise_url="http://leader-a",
+            require_write_quorum=True,
+            request_json=router,
+        )
+        managers.update(
+            {
+                "http://leader-a": leader_cluster,
+                "http://peer-b": follower_cluster,
+                "http://peer-c": new_peer_cluster,
+            }
+        )
+        leader_cluster.start()
+        follower_cluster.start()
+
+        try:
+            session = leader.open_session(30)
+            leader.create("/stable", b"payload", persistent=True)
+            leader_cluster._send_heartbeats_once()
+            leader_cluster._poll_peers_once()
+
+            leader_cluster.reconfigure_cluster(
+                expected_version=1,
+                peer_urls=["http://peer-b", "http://peer-c"],
+            )
+
+            leader_cluster._send_heartbeats_once()
+            leader_cluster._poll_peers_once()
+
+            status = leader_cluster.reconfigure_cluster(
+                expected_version=2,
+                peer_urls=["http://peer-c"],
+            )
+
+            assert status["config_version"] == 3
+            assert status["peer_count"] == 1
+            assert status["reconfig_in_progress"] is False
+
+            survivor_status = new_peer_cluster.build_status()
+            assert survivor_status["config_version"] == 3
+            assert new_peer.get_session_detail(session.session_id) is not None
+            assert new_peer.get("/stable") is not None
+
+            removed_status = follower_cluster.build_status()
+            assert removed_status["role"] == "decommissioned"
+            assert removed_status["read_only"] is True
+            assert removed_status["decommissioned"] is True
+
+            removed_vote = follower_cluster.request_vote(
+                candidate_id="rogue-candidate",
+                term=status["current_term"] + 1,
+                candidate_last_applied=leader.get_stats()["last_sequence"],
+                candidate_last_log_index=leader.get_last_replication_position()[0],
+                candidate_last_log_term=leader.get_last_replication_position()[1],
+                candidate_config_version=3,
+            )
+            assert removed_vote["vote_granted"] is False
+            assert removed_vote["reason"] == "decommissioned_node"
+
+            removed_heartbeat = follower_cluster.receive_heartbeat(
+                leader_id="leader-a",
+                term=status["current_term"] + 1,
+                leader_url="http://leader-a",
+                commit_index=leader.get_stats()["last_sequence"],
+                config_version=3,
+            )
+            assert removed_heartbeat["accepted"] is False
+            assert removed_heartbeat["reason"] == "decommissioned_node"
+        finally:
+            leader_cluster.stop()
+            follower_cluster.stop()
+            new_peer_cluster.stop()
+            leader.stop()
+            follower.stop()
+            new_peer.stop()
+            for db_path in (leader_path, follower_path, new_peer_path):
+                try:
+                    os.unlink(db_path)
+                except OSError:
+                    pass
+
+    def test_removed_peer_restart_stays_decommissioned(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as leader_db, tempfile.NamedTemporaryFile(suffix=".db", delete=False) as follower_db, tempfile.NamedTemporaryFile(suffix=".db", delete=False) as new_peer_db:
+            leader_path = leader_db.name
+            follower_path = follower_db.name
+            new_peer_path = new_peer_db.name
+
+        leader = Coordinator(db_path=leader_path)
+        follower = Coordinator(db_path=follower_path)
+        new_peer = Coordinator(db_path=new_peer_path)
+        leader.start()
+        follower.start()
+        new_peer.start()
+
+        managers: dict[str, ClusterManager] = {}
+        router = self._make_cluster_router(managers)
+
+        follower_cluster = ClusterManager(
+            follower,
+            node_id="node-b",
+            role="follower",
+            leader_url="http://leader-a",
+            advertise_url="http://peer-b",
+            request_json=router,
+        )
+        new_peer_cluster = ClusterManager(
+            new_peer,
+            node_id="node-c",
+            role="standalone",
+            advertise_url="http://peer-c",
+            request_json=router,
+        )
+        leader_cluster = ClusterManager(
+            leader,
+            node_id="leader-a",
+            role="leader",
+            peer_urls=["http://peer-b"],
+            advertise_url="http://leader-a",
+            require_write_quorum=True,
+            request_json=router,
+        )
+        managers.update(
+            {
+                "http://leader-a": leader_cluster,
+                "http://peer-b": follower_cluster,
+                "http://peer-c": new_peer_cluster,
+            }
+        )
+        leader_cluster.start()
+        follower_cluster.start()
+
+        restarted_follower = None
+        restarted_cluster = None
+
+        try:
+            leader.open_session(30)
+            leader_cluster._send_heartbeats_once()
+            leader_cluster._poll_peers_once()
+            leader_cluster.reconfigure_cluster(
+                expected_version=1,
+                peer_urls=["http://peer-b", "http://peer-c"],
+            )
+            leader_cluster._send_heartbeats_once()
+            leader_cluster._poll_peers_once()
+            leader_cluster.reconfigure_cluster(
+                expected_version=2,
+                peer_urls=["http://peer-c"],
+            )
+
+            follower_cluster.stop()
+            follower.stop()
+
+            restarted_follower = Coordinator(db_path=follower_path)
+            restarted_follower.start()
+            restarted_cluster = ClusterManager(
+                restarted_follower,
+                node_id="node-b",
+                role="follower",
+                leader_url="http://leader-a",
+                advertise_url="http://peer-b",
+            )
+
+            status = restarted_cluster.build_status()
+            assert status["role"] == "decommissioned"
+            assert status["read_only"] is True
+            assert status["decommissioned"] is True
+
+            with pytest.raises(ForbiddenError) as exc_info:
+                restarted_follower.open_session(30)
+
+            assert exc_info.value.error == "read_only_replica"
+
+            vote = restarted_cluster.request_vote(
+                candidate_id="node-c",
+                term=status["current_term"] + 1,
+                candidate_last_applied=0,
+                candidate_last_log_index=0,
+                candidate_last_log_term=0,
+                candidate_config_version=status["config_version"],
+            )
+            assert vote["vote_granted"] is False
+            assert vote["reason"] == "decommissioned_node"
+        finally:
+            if restarted_cluster is not None:
+                restarted_cluster.stop()
+            if restarted_follower is not None:
+                restarted_follower.stop()
+            else:
+                follower_cluster.stop()
+                follower.stop()
+            leader_cluster.stop()
+            new_peer_cluster.stop()
+            leader.stop()
+            new_peer.stop()
+            for db_path in (leader_path, follower_path, new_peer_path):
                 try:
                     os.unlink(db_path)
                 except OSError:

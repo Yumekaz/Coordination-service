@@ -193,6 +193,7 @@ class Coordinator:
         pending_config_version: Optional[int] = None,
         pending_peer_urls: Optional[List[str]] = None,
         reconfig_in_progress: bool = False,
+        decommissioned: bool = False,
         commit_index: int = 0,
         last_applied: int = 0,
     ) -> None:
@@ -210,6 +211,7 @@ class Coordinator:
             pending_config_version=pending_config_version,
             pending_peer_urls=pending_peer_urls,
             reconfig_in_progress=reconfig_in_progress,
+            decommissioned=decommissioned,
             commit_index=commit_index,
             last_applied=last_applied,
         )

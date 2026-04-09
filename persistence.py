@@ -459,6 +459,7 @@ class Persistence:
                     pending_config_version INTEGER,
                     pending_peer_urls_json TEXT,
                     reconfig_in_progress INTEGER NOT NULL DEFAULT 0,
+                    decommissioned INTEGER NOT NULL DEFAULT 0,
                     commit_index INTEGER NOT NULL DEFAULT 0,
                     last_applied INTEGER NOT NULL DEFAULT 0,
                     updated_at REAL NOT NULL
@@ -512,6 +513,10 @@ class Persistence:
             if "reconfig_in_progress" not in existing_cluster_columns:
                 conn.execute(
                     "ALTER TABLE cluster_state ADD COLUMN reconfig_in_progress INTEGER NOT NULL DEFAULT 0"
+                )
+            if "decommissioned" not in existing_cluster_columns:
+                conn.execute(
+                    "ALTER TABLE cluster_state ADD COLUMN decommissioned INTEGER NOT NULL DEFAULT 0"
                 )
             
             # Note: DDL statements are auto-committed in isolation_level=None mode
@@ -801,6 +806,7 @@ class Persistence:
         pending_config_version: Optional[int] = None,
         pending_peer_urls: Optional[List[str]] = None,
         reconfig_in_progress: bool = False,
+        decommissioned: bool = False,
         commit_index: int = 0,
         last_applied: int = 0,
     ) -> None:
@@ -822,11 +828,12 @@ class Persistence:
                         pending_config_version,
                         pending_peer_urls_json,
                         reconfig_in_progress,
+                        decommissioned,
                         commit_index,
                         last_applied,
                         updated_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     node_id,
                     int(current_term),
@@ -840,6 +847,7 @@ class Persistence:
                     (None if pending_config_version is None else int(pending_config_version)),
                     json.dumps(list(pending_peer_urls or [])),
                     1 if reconfig_in_progress else 0,
+                    1 if decommissioned else 0,
                     int(commit_index),
                     int(last_applied),
                     datetime.now().timestamp(),
@@ -874,6 +882,7 @@ class Persistence:
                     pending_config_version,
                     pending_peer_urls_json,
                     reconfig_in_progress,
+                    decommissioned,
                     commit_index,
                     last_applied,
                     updated_at
@@ -907,6 +916,7 @@ class Persistence:
                 ),
                 "pending_peer_urls": json.loads(row["pending_peer_urls_json"] or "[]"),
                 "reconfig_in_progress": bool(row["reconfig_in_progress"]),
+                "decommissioned": bool(row["decommissioned"]),
                 "commit_index": int(row["commit_index"] or 0),
                 "last_applied": int(row["last_applied"] or 0),
                 "updated_at": row["updated_at"],

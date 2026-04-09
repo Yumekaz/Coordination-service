@@ -87,6 +87,7 @@ class ClusterManager:
         self._pending_config_version: Optional[int] = None
         self._pending_peer_urls: List[str] = []
         self._reconfig_in_progress = False
+        self._decommissioned = False
         self._reconfig_timeout_seconds = max(8.0, self._prepare_timeout_seconds * 2.0)
         self._quorum_commit_index = 0
         self._prepared_sequence: Optional[int] = None
@@ -130,6 +131,7 @@ class ClusterManager:
         self._pending_config_version = persisted_state.get("pending_config_version")
         self._pending_peer_urls = self._normalize_peer_urls(persisted_state.get("pending_peer_urls", []))
         self._reconfig_in_progress = bool(persisted_state.get("reconfig_in_progress", False))
+        self._decommissioned = bool(persisted_state.get("decommissioned", False))
         self._leader_commit_index = int(
             persisted_state.get("commit_index", self._leader_commit_index)
         )
@@ -142,6 +144,14 @@ class ClusterManager:
         if isinstance(persisted_peer_urls, list):
             self._peer_urls = self._normalize_peer_urls(persisted_peer_urls)
             self._peer_states = self._rebuild_peer_states(self._peer_urls, self._peer_states)
+
+        if self._decommissioned:
+            self._role = "decommissioned"
+            self._leader_id = None
+            self._leader_url = None
+            self._leader_lease_until = None
+            self._last_leader_contact_at = None
+            self._voted_for = None
 
         should_bootstrap_leader = self._role == "leader" and not (
             loaded_persisted_state and self._peer_urls
@@ -203,6 +213,8 @@ class ClusterManager:
         """Start background catch-up/peer-monitoring if needed."""
         with self._lock:
             if self._running:
+                return
+            if self._role == "decommissioned":
                 return
             if self._role == "standalone" and not self._peer_urls and not self._leader_url:
                 return
@@ -1093,6 +1105,14 @@ class ClusterManager:
         apply_mode = False
         with self._prepare_barrier:
             with self._lock:
+                if self._decommissioned or self._role == "decommissioned":
+                    return {
+                        "accepted": False,
+                        "term": self._current_term,
+                        "node_id": self._node_id,
+                        "last_applied": self._coordinator.get_stats().get("last_sequence", 0),
+                        "reason": "decommissioned_node",
+                    }
                 if term < self._current_term:
                     return {
                         "accepted": False,
@@ -1167,6 +1187,13 @@ class ClusterManager:
         apply_mode = False
         with self._prepare_barrier:
             with self._lock:
+                if self._decommissioned or self._role == "decommissioned":
+                    return {
+                        "vote_granted": False,
+                        "term": self._current_term,
+                        "node_id": self._node_id,
+                        "reason": "decommissioned_node",
+                    }
                 if term < self._current_term:
                     return {
                         "vote_granted": False,
@@ -1180,6 +1207,16 @@ class ClusterManager:
                         "term": self._current_term,
                         "node_id": self._node_id,
                         "reason": "stale_config_version",
+                        "config_version": self._config_version,
+                    }
+
+                if self._reconfig_in_progress:
+                    self._persist_cluster_state_locked()
+                    return {
+                        "vote_granted": False,
+                        "term": self._current_term,
+                        "node_id": self._node_id,
+                        "reason": "cluster_reconfig_in_progress",
                         "config_version": self._config_version,
                     }
 
@@ -1226,7 +1263,7 @@ class ClusterManager:
         return self._start_election_once(auto=False)
 
     def reconfigure_cluster(self, expected_version: int, peer_urls: List[str]) -> Dict[str, Any]:
-        """Stage and activate a conservative add-only cluster reconfiguration."""
+        """Stage and activate a conservative single-peer add/remove cluster reconfiguration."""
         desired_peer_urls = self._normalize_peer_urls(peer_urls)
         if not self._advertise_url:
             raise ConflictError(
@@ -1237,6 +1274,7 @@ class ClusterManager:
         staged_peers: List[str] = []
         activated_peers: List[str] = []
         activation_started = False
+        decommissioned_peer: Optional[str] = None
         with self._prepare_barrier:
             self._poll_peers_once()
             current_applied = self._coordinator.get_stats().get("last_sequence", 0)
@@ -1274,10 +1312,26 @@ class ClusterManager:
                 current_peers = list(self._peer_urls)
                 additions = [peer for peer in desired_peer_urls if peer not in current_peers]
                 removals = [peer for peer in current_peers if peer not in desired_peer_urls]
-                if removals or len(additions) != 1 or len(desired_peer_urls) != (len(current_peers) + 1):
+                add_mode = (
+                    len(additions) == 1
+                    and not removals
+                    and len(desired_peer_urls) == (len(current_peers) + 1)
+                )
+                remove_mode = (
+                    len(removals) == 1
+                    and not additions
+                    and len(current_peers) >= 2
+                    and len(desired_peer_urls) == (len(current_peers) - 1)
+                )
+                if len(removals) == 1 and not additions and len(current_peers) < 2:
                     raise ConflictError(
-                        "This reconfiguration path only supports adding one peer at a time",
-                        error="cluster_reconfig_add_only",
+                        "This reconfiguration path does not support collapsing to a single node",
+                        error="cluster_reconfig_remove_requires_survivor_quorum",
+                    )
+                if not add_mode and not remove_mode:
+                    raise ConflictError(
+                        "This reconfiguration path only supports adding or removing one follower at a time",
+                        error="cluster_reconfig_conservative_only",
                     )
 
                 for peer in current_peers:
@@ -1301,18 +1355,20 @@ class ClusterManager:
                             peer_url=peer,
                         )
 
+                target_peer_url = additions[0] if add_mode else removals[0]
                 next_version = self._config_version + 1
                 self._pending_config_version = next_version
                 self._pending_peer_urls = list(desired_peer_urls)
                 self._reconfig_in_progress = True
-                self._peer_states = self._rebuild_peer_states(desired_peer_urls, self._peer_states)
+                tracked_peers = desired_peer_urls if add_mode else current_peers
+                self._peer_states = self._rebuild_peer_states(tracked_peers, self._peer_states)
                 self._persist_cluster_state_locked()
 
             cluster_urls = [self._advertise_url] + list(desired_peer_urls)
-            new_peer_url = additions[0]
+            stage_targets = desired_peer_urls if add_mode else current_peers
 
             try:
-                for peer in desired_peer_urls:
+                for peer in stage_targets:
                     self._request_json(
                         f"{peer}/internal/cluster/configure",
                         "POST",
@@ -1328,12 +1384,13 @@ class ClusterManager:
                     )
                     staged_peers.append(peer)
 
-                self._wait_for_peer_alignment(
-                    peer_url=new_peer_url,
-                    expected_applied=current_applied,
-                    expected_log_index=local_last_log_index,
-                    expected_log_term=local_last_log_term,
-                )
+                if add_mode:
+                    self._wait_for_peer_alignment(
+                        peer_url=target_peer_url,
+                        expected_applied=current_applied,
+                        expected_log_index=local_last_log_index,
+                        expected_log_term=local_last_log_term,
+                    )
 
                 activation_started = True
                 for peer in desired_peer_urls:
@@ -1351,6 +1408,22 @@ class ClusterManager:
                         },
                     )
                     activated_peers.append(peer)
+
+                if remove_mode:
+                    self._request_json(
+                        f"{target_peer_url}/internal/cluster/configure",
+                        "POST",
+                        {
+                            "leader_id": self._node_id,
+                            "leader_url": self._advertise_url,
+                            "term": self._current_term,
+                            "config_version": next_version,
+                            "cluster_urls": cluster_urls,
+                            "node_url": target_peer_url,
+                            "phase": "decommission",
+                        },
+                    )
+                    decommissioned_peer = target_peer_url
 
                 with self._lock:
                     self._previous_config_version = self._config_version
@@ -1400,7 +1473,7 @@ class ClusterManager:
                 rollback_failures: List[str] = []
                 staged_only_peers = [
                     peer for peer in staged_peers
-                    if peer not in activated_peers
+                    if peer not in activated_peers and peer != decommissioned_peer
                 ]
                 for peer in staged_only_peers:
                     try:
@@ -1419,6 +1492,23 @@ class ClusterManager:
                         )
                     except Exception:
                         rollback_failures.append(peer)
+                if decommissioned_peer is not None:
+                    try:
+                        self._request_json(
+                            f"{decommissioned_peer}/internal/cluster/configure",
+                            "POST",
+                            {
+                                "leader_id": self._node_id,
+                                "leader_url": self._advertise_url,
+                                "term": self._current_term,
+                                "config_version": next_version,
+                                "cluster_urls": cluster_urls,
+                                "node_url": decommissioned_peer,
+                                "phase": "rollback",
+                            },
+                        )
+                    except Exception:
+                        rollback_failures.append(decommissioned_peer)
                 for peer in reversed(activated_peers):
                     try:
                         self._request_json(
@@ -1478,7 +1568,7 @@ class ClusterManager:
         node_url: str,
         phase: str,
     ) -> Dict[str, Any]:
-        """Stage, activate, or abort one conservative cluster configuration change."""
+        """Stage, activate, decommission, or roll back one conservative cluster configuration change."""
         normalized_node_url = node_url.rstrip("/")
         normalized_cluster_urls = self._normalize_peer_urls(cluster_urls)
         desired_peer_urls = [
@@ -1500,7 +1590,7 @@ class ClusterManager:
                         "reason": "stale_term",
                     }
 
-                if phase_value not in {"stage", "activate", "abort", "rollback"}:
+                if phase_value not in {"stage", "activate", "abort", "rollback", "decommission"}:
                     raise ValueError(f"Unsupported configure phase: {phase}")
 
                 if term > self._current_term:
@@ -1508,7 +1598,7 @@ class ClusterManager:
                     self._voted_for = leader_id
                     self._leader_lease_until = None
                     self._clear_prepare_reservation_locked()
-                    if self._role != "standalone":
+                    if self._role not in {"standalone", "decommissioned"}:
                         self._role = "follower"
                         apply_mode = True
                 elif (
@@ -1528,6 +1618,7 @@ class ClusterManager:
                 self._last_leader_contact_at = time.time()
 
                 if phase_value == "stage":
+                    self._decommissioned = False
                     self._previous_config_version = self._config_version
                     self._previous_peer_urls = list(self._peer_urls)
                     self._pending_config_version = int(config_version)
@@ -1553,6 +1644,7 @@ class ClusterManager:
                     if self._previous_config_version is None:
                         self._previous_config_version = self._config_version
                         self._previous_peer_urls = list(self._peer_urls)
+                    self._decommissioned = False
                     self._peer_urls = list(desired_peer_urls)
                     self._peer_states = self._rebuild_peer_states(self._peer_urls, self._peer_states)
                     self._config_version = int(config_version)
@@ -1563,6 +1655,36 @@ class ClusterManager:
                         self._role = "follower"
                         apply_mode = True
                         refresh_mode = True
+                    self._persist_cluster_state_locked()
+                elif phase_value == "decommission":
+                    if (
+                        self._pending_config_version != int(config_version)
+                        or self._pending_peer_urls != list(desired_peer_urls)
+                    ):
+                        return {
+                            "accepted": False,
+                            "term": self._current_term,
+                            "node_id": self._node_id,
+                            "reason": "config_not_staged",
+                            "config_version": self._config_version,
+                        }
+                    if self._previous_config_version is None:
+                        self._previous_config_version = self._config_version
+                        self._previous_peer_urls = list(self._peer_urls)
+                    self._config_version = int(config_version)
+                    self._peer_urls = []
+                    self._peer_states = self._rebuild_peer_states(self._peer_urls, self._peer_states)
+                    self._pending_config_version = None
+                    self._pending_peer_urls = []
+                    self._reconfig_in_progress = False
+                    self._decommissioned = True
+                    self._voted_for = None
+                    self._leader_id = None
+                    self._leader_url = None
+                    self._leader_lease_until = None
+                    self._last_leader_contact_at = None
+                    self._role = "decommissioned"
+                    apply_mode = True
                     self._persist_cluster_state_locked()
                 else:
                     staged_matches = self._pending_config_version == int(config_version)
@@ -1588,6 +1710,7 @@ class ClusterManager:
                     self._pending_config_version = None
                     self._pending_peer_urls = []
                     self._reconfig_in_progress = False
+                    self._decommissioned = False
 
                     if self._role != "leader" or leader_id != self._node_id:
                         if not self._peer_urls:
@@ -1603,8 +1726,9 @@ class ClusterManager:
                     self._previous_peer_urls = []
                     self._persist_cluster_state_locked()
 
-        if refresh_mode:
+        if apply_mode:
             self._apply_replica_mode()
+        if refresh_mode:
             if self._role != "standalone" or self._peer_urls or self._leader_url:
                 self.start()
         return {
@@ -1645,13 +1769,14 @@ class ClusterManager:
                 "pending_config_version": self._pending_config_version,
                 "pending_peer_urls": list(self._pending_peer_urls),
                 "reconfig_in_progress": self._reconfig_in_progress,
+                "decommissioned": self._decommissioned,
                 "voted_for": self._voted_for,
                 "commit_index": current_sequence if self._role != "follower" else self._leader_commit_index,
                 "last_applied": current_sequence,
                 "quorum_size": self._quorum_size(),
                 "read_only": read_only["read_only"],
                 "read_only_reason": read_only["reason"],
-                "replication_enabled": self._role != "standalone",
+                "replication_enabled": self._role not in {"standalone", "decommissioned"},
                 "peer_count": len(peers),
                 "healthy_peer_count": healthy_peers,
                 "max_replication_lag": max_lag,
@@ -2001,6 +2126,8 @@ class ClusterManager:
         """Run one election round and become leader on majority votes."""
         if self._role == "standalone":
             return {"status": "standalone", "term": self._current_term, "votes": 1}
+        if self._role == "decommissioned":
+            return {"status": "decommissioned", "term": self._current_term, "votes": 0}
 
         with self._lock:
             if self._reconfig_in_progress:
@@ -2134,10 +2261,13 @@ class ClusterManager:
 
     def _apply_replica_mode(self) -> None:
         """Align coordinator runtime behavior with cluster role."""
-        if self._role in {"follower", "candidate"}:
+        if self._role in {"follower", "candidate", "decommissioned"}:
+            reason = "This node is not the active leader. Write to the leader instead."
+            if self._role == "decommissioned":
+                reason = "This node has been decommissioned and cannot accept cluster writes."
             self._coordinator.set_read_only(
                 True,
-                "This node is not the active leader. Write to the leader instead.",
+                reason,
             )
             self._coordinator.disable_local_maintenance()
             self._coordinator.set_write_guard(None)
@@ -2491,6 +2621,7 @@ class ClusterManager:
             pending_config_version=self._pending_config_version,
             pending_peer_urls=self._pending_peer_urls,
             reconfig_in_progress=self._reconfig_in_progress,
+            decommissioned=self._decommissioned,
             commit_index=commit_index,
             last_applied=current_applied,
         )
