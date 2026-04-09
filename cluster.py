@@ -81,6 +81,11 @@ class ClusterManager:
         self._voted_for: Optional[str] = None
         self._last_leader_contact_at: Optional[float] = time.time() if self._role == "leader" else None
         self._leader_lease_until: Optional[float] = None
+        self._config_version = 1
+        self._pending_config_version: Optional[int] = None
+        self._pending_peer_urls: List[str] = []
+        self._reconfig_in_progress = False
+        self._reconfig_timeout_seconds = max(8.0, self._prepare_timeout_seconds * 2.0)
         self._quorum_commit_index = 0
         self._prepared_sequence: Optional[int] = None
         self._prepared_count: int = 0
@@ -95,6 +100,10 @@ class ClusterManager:
                 "reachable": False,
                 "healthy": False,
                 "last_applied": 0,
+                "last_log_index": 0,
+                "last_log_term": 0,
+                "match_index": 0,
+                "match_term": 0,
                 "replication_lag": None,
                 "last_ack_at": None,
                 "last_error": None,
@@ -107,6 +116,10 @@ class ClusterManager:
         self._current_term = int(persisted_state.get("current_term", self._current_term))
         self._voted_for = persisted_state.get("voted_for") or self._voted_for
         self._leader_id = persisted_state.get("leader_id") or self._leader_id
+        self._config_version = int(persisted_state.get("config_version", self._config_version))
+        self._pending_config_version = persisted_state.get("pending_config_version")
+        self._pending_peer_urls = self._normalize_peer_urls(persisted_state.get("pending_peer_urls", []))
+        self._reconfig_in_progress = bool(persisted_state.get("reconfig_in_progress", False))
         self._leader_commit_index = int(
             persisted_state.get("commit_index", self._leader_commit_index)
         )
@@ -115,6 +128,10 @@ class ClusterManager:
         )
         if not self._leader_url:
             self._leader_url = persisted_state.get("leader_url") or self._leader_url
+        persisted_peer_urls = persisted_state.get("peer_urls")
+        if isinstance(persisted_peer_urls, list):
+            self._peer_urls = self._normalize_peer_urls(persisted_peer_urls)
+            self._peer_states = self._rebuild_peer_states(self._peer_urls, self._peer_states)
 
         if self._role == "leader":
             self._current_term = max(1, self._current_term + 1)
@@ -241,6 +258,10 @@ class ClusterManager:
             "node_id": self._node_id,
             "role": self._role,
             "term": self._current_term,
+            "config_version": self._config_version,
+            "pending_config_version": self._pending_config_version,
+            "pending_peer_urls": list(self._pending_peer_urls),
+            "reconfig_in_progress": self._reconfig_in_progress,
             "commit_index": self._leader_commit_index if self._role == "follower" else stats.get("last_sequence", 0),
             "last_applied": stats.get("last_sequence", 0),
             "last_log_index": last_log_index,
@@ -335,6 +356,8 @@ class ClusterManager:
         leader_id: str,
         term: int,
         leader_url: Optional[str],
+        prev_log_index: int,
+        prev_log_term: int,
         operations_payload: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
         """Durably append a leader batch without applying it yet."""
@@ -351,11 +374,13 @@ class ClusterManager:
             }
 
         ordered = sorted(operations, key=lambda item: item.sequence_number)
-        expected_start = ordered[0].sequence_number
+        expected_start = int(prev_log_index) + 1
         apply_mode = False
+        truncated = 0
         with self._prepare_barrier:
             with self._lock:
                 local_last_log_index, local_last_log_term = self._coordinator.get_last_replication_position()
+                local_last_applied = self._coordinator.get_stats().get("last_sequence", 0)
                 if term < self._current_term:
                     return {
                         "accepted": False,
@@ -376,17 +401,65 @@ class ClusterManager:
                         "last_applied": self._coordinator.get_stats().get("last_sequence", 0),
                         "reason": "voted_for_other_leader",
                     }
-                if expected_start != (local_last_log_index + 1):
+                if ordered[0].sequence_number != expected_start:
                     return {
                         "accepted": False,
                         "term": self._current_term,
                         "node_id": self._node_id,
                         "last_log_index": local_last_log_index,
                         "last_log_term": local_last_log_term,
-                        "last_applied": self._coordinator.get_stats().get("last_sequence", 0),
-                        "expected_next_log": local_last_log_index + 1,
-                        "reason": "log_gap",
+                        "last_applied": local_last_applied,
+                        "expected_next_log": expected_start,
+                        "reason": "append_sequence_mismatch",
                     }
+                if int(prev_log_index) < local_last_applied:
+                    return {
+                        "accepted": False,
+                        "term": self._current_term,
+                        "node_id": self._node_id,
+                        "last_log_index": local_last_log_index,
+                        "last_log_term": local_last_log_term,
+                        "last_applied": local_last_applied,
+                        "reason": "prev_log_before_committed",
+                    }
+                if int(prev_log_index) > local_last_log_index:
+                    return {
+                        "accepted": False,
+                        "term": self._current_term,
+                        "node_id": self._node_id,
+                        "last_log_index": local_last_log_index,
+                        "last_log_term": local_last_log_term,
+                        "last_applied": local_last_applied,
+                        "expected_prev_log_index": local_last_log_index,
+                        "reason": "missing_prev_log",
+                    }
+                if int(prev_log_index) > 0:
+                    previous_entries = self._coordinator.load_replication_operations_between(
+                        int(prev_log_index),
+                        int(prev_log_index),
+                    )
+                    if not previous_entries:
+                        return {
+                            "accepted": False,
+                            "term": self._current_term,
+                            "node_id": self._node_id,
+                            "last_log_index": local_last_log_index,
+                            "last_log_term": local_last_log_term,
+                            "last_applied": local_last_applied,
+                            "reason": "missing_prev_log",
+                        }
+                    local_prev_term = int(previous_entries[0].term or 0)
+                    if local_prev_term != int(prev_log_term):
+                        return {
+                            "accepted": False,
+                            "term": self._current_term,
+                            "node_id": self._node_id,
+                            "last_log_index": local_last_log_index,
+                            "last_log_term": local_last_log_term,
+                            "last_applied": local_last_applied,
+                            "local_prev_term": local_prev_term,
+                            "reason": "prev_log_term_mismatch",
+                        }
 
                 if term > self._current_term:
                     self._current_term = term
@@ -398,6 +471,50 @@ class ClusterManager:
                         apply_mode = True
                 elif self._voted_for is None:
                     self._voted_for = leader_id
+
+                overlap_end = min(local_last_log_index, ordered[-1].sequence_number)
+                if overlap_end >= expected_start:
+                    overlapping = self._coordinator.load_replication_operations_between(
+                        expected_start,
+                        overlap_end,
+                    )
+                    for index, incoming in enumerate(
+                        ordered[: max(0, overlap_end - expected_start + 1)]
+                    ):
+                        existing = overlapping[index]
+                        if existing != incoming or int(existing.term or 0) != int(incoming.term or term):
+                            conflict_sequence = incoming.sequence_number
+                            if conflict_sequence <= local_last_applied:
+                                return {
+                                    "accepted": False,
+                                    "term": self._current_term,
+                                    "node_id": self._node_id,
+                                    "last_log_index": local_last_log_index,
+                                    "last_log_term": local_last_log_term,
+                                    "last_applied": local_last_applied,
+                                    "conflict_sequence": conflict_sequence,
+                                    "reason": "conflict_with_applied",
+                                }
+                            truncated += self._coordinator.truncate_replication_entries_after(
+                                conflict_sequence - 1
+                            )
+                            local_last_log_index = conflict_sequence - 1
+                            break
+
+                if local_last_log_index > ordered[-1].sequence_number:
+                    if ordered[-1].sequence_number < local_last_applied:
+                        return {
+                            "accepted": False,
+                            "term": self._current_term,
+                            "node_id": self._node_id,
+                            "last_log_index": local_last_log_index,
+                            "last_log_term": local_last_log_term,
+                            "last_applied": local_last_applied,
+                            "reason": "tail_conflict_with_applied",
+                        }
+                    truncated += self._coordinator.truncate_replication_entries_after(
+                        ordered[-1].sequence_number
+                    )
 
                 self._coordinator.append_replication_entries(term, ordered)
                 self._leader_id = leader_id
@@ -412,7 +529,8 @@ class ClusterManager:
                     "node_id": self._node_id,
                     "last_log_index": last_log_index,
                     "last_log_term": last_log_term,
-                    "last_applied": self._coordinator.get_stats().get("last_sequence", 0),
+                    "last_applied": local_last_applied,
+                    "truncated": truncated,
                 }
 
         if apply_mode:
@@ -425,6 +543,9 @@ class ClusterManager:
         term: int,
         leader_url: Optional[str],
         commit_index: int,
+        prev_log_index: int = 0,
+        prev_log_term: int = 0,
+        commit_term: Optional[int] = None,
         watch_fires_payload: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """Advance a follower commit index and apply durable log entries."""
@@ -477,6 +598,35 @@ class ClusterManager:
                 "last_log_index": last_log_index,
                 "reason": "commit_ahead_of_log",
             }
+
+        if target_commit > 0 and commit_term is not None:
+            if int(prev_log_index) > 0:
+                previous_entries = self._coordinator.load_replication_operations_between(
+                    int(prev_log_index),
+                    int(prev_log_index),
+                )
+                if not previous_entries or int(previous_entries[0].term or 0) != int(prev_log_term):
+                    return {
+                        "accepted": False,
+                        "term": self._current_term,
+                        "node_id": self._node_id,
+                        "last_applied": current_applied,
+                        "last_log_index": last_log_index,
+                        "reason": "commit_log_mismatch",
+                    }
+            commit_entries = self._coordinator.load_replication_operations_between(
+                target_commit,
+                target_commit,
+            )
+            if not commit_entries or int(commit_entries[0].term or 0) != int(commit_term):
+                return {
+                    "accepted": False,
+                    "term": self._current_term,
+                    "node_id": self._node_id,
+                    "last_applied": current_applied,
+                    "last_log_index": last_log_index,
+                    "reason": "commit_log_mismatch",
+                }
 
         applied_count = 0
         if target_commit > current_applied:
@@ -747,9 +897,12 @@ class ClusterManager:
                             last_applied=commit_index,
                         )
                         self._broadcast_commit(
-                            peers=self._peer_urls,
+                            peers=list(appended_peers),
                             term=current_term,
                             commit_index=commit_index,
+                            prev_log_index=start_sequence - 1,
+                            prev_log_term=batch_prev_log_term,
+                            commit_term=int(ordered[-1].term or current_term),
                             watch_fire_records=watch_fire_records,
                         )
                     else:
@@ -774,12 +927,12 @@ class ClusterManager:
                 current_term = self._current_term
 
             self.assert_write_quorum_available(current_sequence_override=start_sequence - 1)
-            last_log_index, _ = self._coordinator.get_last_replication_position()
-            if last_log_index != start_sequence - 1:
+            batch_prev_log_index, batch_prev_log_term = self._coordinator.get_last_replication_position()
+            if batch_prev_log_index != start_sequence - 1:
                 raise ConflictError(
                     "Write quorum append failed: local replicated log is not aligned with the next sequence",
                     error="write_quorum_log_misaligned",
-                    last_log_index=last_log_index,
+                    last_log_index=batch_prev_log_index,
                     start_sequence=start_sequence,
                 )
 
@@ -796,6 +949,8 @@ class ClusterManager:
                             "leader_id": self._node_id,
                             "leader_url": self._advertise_url,
                             "term": current_term,
+                            "prev_log_index": batch_prev_log_index,
+                            "prev_log_term": batch_prev_log_term,
                             "operations": [operation.to_dict() for operation in ordered],
                         },
                     )
@@ -809,7 +964,8 @@ class ClusterManager:
 
                     reserved = bool(payload.get("accepted"))
                     last_applied = int(payload.get("last_applied", 0))
-                    last_log_index = int(payload.get("last_log_index", 0))
+                    peer_last_log_index = int(payload.get("last_log_index", 0))
+                    peer_last_log_term = int(payload.get("last_log_term", 0))
                     self._peer_states[peer] = {
                         "peer_url": peer,
                         "peer_id": payload.get("node_id"),
@@ -817,10 +973,13 @@ class ClusterManager:
                         "reachable": True,
                         "healthy": reserved,
                         "last_applied": last_applied,
+                        "last_log_index": peer_last_log_index,
+                        "last_log_term": peer_last_log_term,
+                        "match_index": peer_last_log_index if reserved else 0,
+                        "match_term": peer_last_log_term if reserved else 0,
                         "replication_lag": max(0, self._coordinator.get_stats().get("last_sequence", 0) - last_applied),
                         "last_ack_at": time.time(),
                         "last_error": None if reserved else payload.get("reason", "append_rejected"),
-                        "last_log_index": last_log_index,
                     }
                     if reserved:
                         appended_peers.append(peer)
@@ -870,6 +1029,7 @@ class ClusterManager:
         term: int,
         leader_url: Optional[str],
         commit_index: int,
+        config_version: int = 1,
     ) -> Dict[str, Any]:
         """Accept or reject a leader heartbeat."""
         apply_mode = False
@@ -881,6 +1041,16 @@ class ClusterManager:
                         "term": self._current_term,
                         "node_id": self._node_id,
                         "last_applied": self._coordinator.get_stats().get("last_sequence", 0),
+                    }
+
+                if not self._config_version_accepts(int(config_version)):
+                    return {
+                        "accepted": False,
+                        "term": self._current_term,
+                        "node_id": self._node_id,
+                        "last_applied": self._coordinator.get_stats().get("last_sequence", 0),
+                        "reason": "stale_config_version",
+                        "config_version": self._config_version,
                     }
 
                 if term == self._current_term and self._voted_for not in {None, leader_id}:
@@ -914,6 +1084,7 @@ class ClusterManager:
                     "term": self._current_term,
                     "node_id": self._node_id,
                     "last_applied": self._coordinator.get_stats().get("last_sequence", 0),
+                    "config_version": self._config_version,
                 }
 
         if apply_mode:
@@ -932,6 +1103,7 @@ class ClusterManager:
         candidate_last_applied: int,
         candidate_last_log_index: int = 0,
         candidate_last_log_term: int = 0,
+        candidate_config_version: int = 1,
     ) -> Dict[str, Any]:
         """Evaluate a vote request from a candidate."""
         apply_mode = False
@@ -942,6 +1114,15 @@ class ClusterManager:
                         "vote_granted": False,
                         "term": self._current_term,
                         "node_id": self._node_id,
+                    }
+
+                if not self._config_version_accepts(int(candidate_config_version)):
+                    return {
+                        "vote_granted": False,
+                        "term": self._current_term,
+                        "node_id": self._node_id,
+                        "reason": "stale_config_version",
+                        "config_version": self._config_version,
                     }
 
                 if term > self._current_term:
@@ -986,6 +1167,281 @@ class ClusterManager:
         """Start one leader-election attempt and return the outcome."""
         return self._start_election_once(auto=False)
 
+    def reconfigure_cluster(self, expected_version: int, peer_urls: List[str]) -> Dict[str, Any]:
+        """Stage and activate a conservative add-only cluster reconfiguration."""
+        desired_peer_urls = self._normalize_peer_urls(peer_urls)
+        if not self._advertise_url:
+            raise ConflictError(
+                "Cluster reconfiguration requires this leader to advertise its own URL",
+                error="cluster_reconfig_missing_advertise_url",
+            )
+
+        staged_peers: List[str] = []
+        with self._prepare_barrier:
+            self._poll_peers_once()
+            current_applied = self._coordinator.get_stats().get("last_sequence", 0)
+            local_last_log_index, local_last_log_term = self._coordinator.get_last_replication_position()
+
+            with self._lock:
+                if self._role != "leader":
+                    raise ConflictError(
+                        "Cluster reconfiguration is only allowed on the active leader",
+                        error="cluster_reconfig_not_leader",
+                    )
+                if self._reconfig_in_progress:
+                    raise ConflictError(
+                        "Cluster reconfiguration is already in progress",
+                        error="cluster_reconfig_in_progress",
+                    )
+                if int(expected_version) != self._config_version:
+                    raise ConflictError(
+                        "Cluster configuration version mismatch",
+                        error="cluster_reconfig_version_mismatch",
+                        expected_version=expected_version,
+                        current_version=self._config_version,
+                    )
+                if self._prepared_sequence is not None:
+                    raise ConflictError(
+                        "Cluster reconfiguration requires a quiet write path",
+                        error="cluster_reconfig_prepare_active",
+                    )
+                if self._leader_lease_expired_locked():
+                    raise ConflictError(
+                        "Cluster reconfiguration rejected because leader quorum lease is expired",
+                        error="leader_lease_expired",
+                    )
+
+                current_peers = list(self._peer_urls)
+                additions = [peer for peer in desired_peer_urls if peer not in current_peers]
+                removals = [peer for peer in current_peers if peer not in desired_peer_urls]
+                if removals or len(additions) != 1 or len(desired_peer_urls) != (len(current_peers) + 1):
+                    raise ConflictError(
+                        "This reconfiguration path only supports adding one peer at a time",
+                        error="cluster_reconfig_add_only",
+                    )
+
+                for peer in current_peers:
+                    peer_state = self._peer_states.get(peer, {})
+                    if not peer_state.get("healthy"):
+                        raise ConflictError(
+                            "Cluster reconfiguration requires every current peer to be healthy",
+                            error="cluster_reconfig_peer_unhealthy",
+                            peer_url=peer,
+                        )
+                    if int(peer_state.get("last_applied", 0) or 0) < current_applied:
+                        raise ConflictError(
+                            "Cluster reconfiguration requires every current peer to be fully applied",
+                            error="cluster_reconfig_peer_behind",
+                            peer_url=peer,
+                        )
+                    if int(peer_state.get("last_log_index", 0) or 0) != local_last_log_index:
+                        raise ConflictError(
+                            "Cluster reconfiguration requires every current peer to have the full durable log",
+                            error="cluster_reconfig_peer_log_behind",
+                            peer_url=peer,
+                        )
+
+                next_version = self._config_version + 1
+                self._pending_config_version = next_version
+                self._pending_peer_urls = list(desired_peer_urls)
+                self._reconfig_in_progress = True
+                self._peer_states = self._rebuild_peer_states(desired_peer_urls, self._peer_states)
+                self._persist_cluster_state_locked()
+
+            cluster_urls = [self._advertise_url] + list(desired_peer_urls)
+            new_peer_url = additions[0]
+
+            try:
+                for peer in desired_peer_urls:
+                    self._request_json(
+                        f"{peer}/internal/cluster/configure",
+                        "POST",
+                        {
+                            "leader_id": self._node_id,
+                            "leader_url": self._advertise_url,
+                            "term": self._current_term,
+                            "config_version": next_version,
+                            "cluster_urls": cluster_urls,
+                            "node_url": peer,
+                            "phase": "stage",
+                        },
+                    )
+                    staged_peers.append(peer)
+
+                self._wait_for_peer_alignment(
+                    peer_url=new_peer_url,
+                    expected_applied=current_applied,
+                    expected_log_index=local_last_log_index,
+                    expected_log_term=local_last_log_term,
+                )
+
+                for peer in desired_peer_urls:
+                    self._request_json(
+                        f"{peer}/internal/cluster/configure",
+                        "POST",
+                        {
+                            "leader_id": self._node_id,
+                            "leader_url": self._advertise_url,
+                            "term": self._current_term,
+                            "config_version": next_version,
+                            "cluster_urls": cluster_urls,
+                            "node_url": peer,
+                            "phase": "activate",
+                        },
+                    )
+
+                with self._lock:
+                    self._peer_urls = list(desired_peer_urls)
+                    self._peer_states = self._rebuild_peer_states(self._peer_urls, self._peer_states)
+                    self._config_version = next_version
+                    self._pending_config_version = None
+                    self._pending_peer_urls = []
+                    self._reconfig_in_progress = False
+                    self._persist_cluster_state_locked()
+            except Exception as exc:
+                if staged_peers:
+                    for peer in staged_peers:
+                        try:
+                            self._request_json(
+                                f"{peer}/internal/cluster/configure",
+                                "POST",
+                                {
+                                    "leader_id": self._node_id,
+                                    "leader_url": self._advertise_url,
+                                    "term": self._current_term,
+                                    "config_version": next_version,
+                                    "cluster_urls": cluster_urls,
+                                    "node_url": peer,
+                                    "phase": "abort",
+                                },
+                            )
+                        except Exception:
+                            continue
+                with self._lock:
+                    self._pending_config_version = None
+                    self._pending_peer_urls = []
+                    self._reconfig_in_progress = False
+                    self._peer_states = self._rebuild_peer_states(self._peer_urls, self._peer_states)
+                    self._last_error = str(exc)
+                    self._persist_cluster_state_locked()
+                if isinstance(exc, ConflictError):
+                    raise
+                raise ConflictError(
+                    "Cluster reconfiguration failed",
+                    error="cluster_reconfig_failed",
+                    detail=str(exc),
+                ) from exc
+
+        return self.build_status()
+
+    def receive_configure(
+        self,
+        *,
+        leader_id: str,
+        leader_url: Optional[str],
+        term: int,
+        config_version: int,
+        cluster_urls: List[str],
+        node_url: str,
+        phase: str,
+    ) -> Dict[str, Any]:
+        """Stage, activate, or abort one conservative cluster configuration change."""
+        normalized_node_url = node_url.rstrip("/")
+        normalized_cluster_urls = self._normalize_peer_urls(cluster_urls)
+        desired_peer_urls = [
+            url
+            for url in normalized_cluster_urls
+            if url != normalized_node_url
+        ]
+        phase_value = (phase or "").strip().lower()
+        apply_mode = False
+
+        with self._prepare_barrier:
+            with self._lock:
+                if term < self._current_term:
+                    return {
+                        "accepted": False,
+                        "term": self._current_term,
+                        "node_id": self._node_id,
+                        "reason": "stale_term",
+                    }
+
+                if phase_value not in {"stage", "activate", "abort"}:
+                    raise ValueError(f"Unsupported configure phase: {phase}")
+
+                if term > self._current_term:
+                    self._current_term = term
+                    self._voted_for = leader_id
+                    self._leader_lease_until = None
+                    self._clear_prepare_reservation_locked()
+                    if self._role != "standalone":
+                        self._role = "follower"
+                        apply_mode = True
+                elif (
+                    phase_value != "stage"
+                    and not self._config_version_accepts(int(config_version))
+                ):
+                    return {
+                        "accepted": False,
+                        "term": self._current_term,
+                        "node_id": self._node_id,
+                        "reason": "stale_config_version",
+                        "config_version": self._config_version,
+                    }
+
+                self._leader_id = leader_id
+                self._leader_url = leader_url.rstrip("/") if leader_url else self._leader_url
+                self._last_leader_contact_at = time.time()
+
+                if phase_value == "stage":
+                    self._pending_config_version = int(config_version)
+                    self._pending_peer_urls = list(desired_peer_urls)
+                    self._reconfig_in_progress = True
+                    if self._role != "leader" or leader_id != self._node_id:
+                        self._role = "follower"
+                        apply_mode = True
+                    self._persist_cluster_state_locked()
+                elif phase_value == "activate":
+                    if (
+                        self._pending_config_version != int(config_version)
+                        or self._pending_peer_urls != list(desired_peer_urls)
+                    ):
+                        return {
+                            "accepted": False,
+                            "term": self._current_term,
+                            "node_id": self._node_id,
+                            "reason": "config_not_staged",
+                            "config_version": self._config_version,
+                        }
+                    self._peer_urls = list(desired_peer_urls)
+                    self._peer_states = self._rebuild_peer_states(self._peer_urls, self._peer_states)
+                    self._config_version = int(config_version)
+                    self._pending_config_version = None
+                    self._pending_peer_urls = []
+                    self._reconfig_in_progress = False
+                    if self._role != "leader" or leader_id != self._node_id:
+                        self._role = "follower"
+                        apply_mode = True
+                    self._persist_cluster_state_locked()
+                else:
+                    if self._pending_config_version == int(config_version):
+                        self._pending_config_version = None
+                        self._pending_peer_urls = []
+                        self._reconfig_in_progress = False
+                        self._persist_cluster_state_locked()
+
+        if apply_mode:
+            self._apply_replica_mode()
+            self.start()
+        return {
+            "accepted": True,
+            "term": self._current_term,
+            "node_id": self._node_id,
+            "config_version": self._config_version,
+            "pending_config_version": self._pending_config_version,
+            "reconfig_in_progress": self._reconfig_in_progress,
+        }
+
     def build_status(self) -> Dict[str, Any]:
         """Return user-facing cluster status."""
         stats = self._coordinator.get_stats()
@@ -1011,6 +1467,10 @@ class ClusterManager:
                 "leader_id": self._leader_id,
                 "leader_url": self._leader_url,
                 "current_term": self._current_term,
+                "config_version": self._config_version,
+                "pending_config_version": self._pending_config_version,
+                "pending_peer_urls": list(self._pending_peer_urls),
+                "reconfig_in_progress": self._reconfig_in_progress,
                 "voted_for": self._voted_for,
                 "commit_index": current_sequence if self._role != "follower" else self._leader_commit_index,
                 "last_applied": current_sequence,
@@ -1078,6 +1538,19 @@ class ClusterManager:
                 for operation in operations
                 if operation.sequence_number > current_sequence
             ]
+
+        local_last_log_index, _ = self._coordinator.get_last_replication_position()
+        log_operations = [
+            operation
+            for operation in operations
+            if operation.sequence_number > local_last_log_index
+        ]
+        if log_operations:
+            leader_term_hint = payload.get("term")
+            self._coordinator.append_replication_entries(
+                int(leader_term_hint or 0),
+                log_operations,
+            )
 
         try:
             applied = self._coordinator.apply_replicated_operations(operations_to_apply)
@@ -1185,7 +1658,10 @@ class ClusterManager:
         for peer in self._peer_urls:
             try:
                 payload = self._request_json(f"{peer}/internal/replication/state", "GET", None)
+                previous = self._peer_states.get(peer, {})
                 last_applied = int(payload.get("last_applied", 0))
+                last_log_index = int(payload.get("last_log_index", last_applied))
+                last_log_term = int(payload.get("last_log_term", previous.get("last_log_term", 0) or 0))
                 self._peer_states[peer] = {
                     "peer_url": peer,
                     "peer_id": payload.get("node_id"),
@@ -1193,6 +1669,10 @@ class ClusterManager:
                     "reachable": True,
                     "healthy": not payload.get("last_error"),
                     "last_applied": last_applied,
+                    "last_log_index": last_log_index,
+                    "last_log_term": last_log_term,
+                    "match_index": last_log_index,
+                    "match_term": last_log_term,
                     "replication_lag": max(0, current_sequence - last_applied),
                     "last_ack_at": time.time(),
                     "last_error": payload.get("last_error"),
@@ -1205,6 +1685,10 @@ class ClusterManager:
                     "reachable": False,
                     "healthy": False,
                     "last_applied": 0,
+                    "last_log_index": 0,
+                    "last_log_term": 0,
+                    "match_index": 0,
+                    "match_term": 0,
                     "replication_lag": None,
                     "last_ack_at": None,
                     "last_error": str(exc),
@@ -1226,6 +1710,7 @@ class ClusterManager:
                         "leader_url": self._advertise_url,
                         "term": self._current_term,
                         "commit_index": current_sequence,
+                        "config_version": self._config_version,
                     },
                 )
                 peer_term = int(payload.get("term", self._current_term))
@@ -1234,6 +1719,9 @@ class ClusterManager:
                     return
                 accepted = bool(payload.get("accepted"))
                 last_applied = int(payload.get("last_applied", 0))
+                previous = self._peer_states.get(peer, {})
+                last_log_index = int(payload.get("last_log_index", previous.get("last_log_index", last_applied) or last_applied))
+                last_log_term = int(payload.get("last_log_term", previous.get("last_log_term", 0) or 0))
                 if accepted:
                     accepted_votes += 1
                 self._peer_states[peer] = {
@@ -1243,6 +1731,10 @@ class ClusterManager:
                     "reachable": True,
                     "healthy": accepted,
                     "last_applied": last_applied,
+                    "last_log_index": last_log_index,
+                    "last_log_term": last_log_term,
+                    "match_index": last_log_index if accepted else int(previous.get("match_index", 0) or 0),
+                    "match_term": last_log_term if accepted else int(previous.get("match_term", 0) or 0),
                     "replication_lag": max(0, current_sequence - last_applied),
                     "last_ack_at": time.time() if accepted else None,
                     "last_error": None if accepted else "heartbeat_rejected",
@@ -1280,6 +1772,11 @@ class ClusterManager:
         )
         should_step_down = False
         with self._lock:
+            if self._reconfig_in_progress:
+                raise ConflictError(
+                    "Write quorum unavailable: cluster reconfiguration is in progress",
+                    error="cluster_reconfig_in_progress",
+                )
             if self._leader_lease_expired_locked():
                 should_step_down = True
             healthy_peers = sum(1 for peer in self._peer_states.values() if peer.get("healthy"))
@@ -1311,6 +1808,8 @@ class ClusterManager:
             return {"status": "standalone", "term": self._current_term, "votes": 1}
 
         with self._lock:
+            if self._reconfig_in_progress:
+                return {"status": "reconfiguring", "term": self._current_term, "votes": 0}
             if auto:
                 if self._role != "follower":
                     return {"status": self._role, "term": self._current_term, "votes": 0}
@@ -1342,6 +1841,7 @@ class ClusterManager:
                         "candidate_last_applied": candidate_last_applied,
                         "candidate_last_log_index": candidate_last_log_index,
                         "candidate_last_log_term": candidate_last_log_term,
+                        "candidate_config_version": self._config_version,
                     },
                 )
                 peer_term = int(payload.get("term", term))
@@ -1594,6 +2094,9 @@ class ClusterManager:
         peers: List[str],
         term: int,
         commit_index: int,
+        prev_log_index: int,
+        prev_log_term: int,
+        commit_term: int,
         watch_fire_records: Optional[List[WatchFireRecord]] = None,
     ) -> None:
         """Tell followers to apply all appended entries through one commit index."""
@@ -1608,6 +2111,9 @@ class ClusterManager:
                         "leader_url": self._advertise_url,
                         "term": term,
                         "commit_index": commit_index,
+                        "prev_log_index": prev_log_index,
+                        "prev_log_term": prev_log_term,
+                        "commit_term": commit_term,
                         "watch_fires": [
                             record.to_dict()
                             for record in (watch_fire_records or [])
@@ -1622,6 +2128,10 @@ class ClusterManager:
                     "reachable": True,
                     "healthy": bool(payload.get("accepted", True)),
                     "last_applied": last_applied,
+                    "last_log_index": int(payload.get("last_log_index", commit_index)),
+                    "last_log_term": int(payload.get("last_log_term", commit_term)),
+                    "match_index": int(payload.get("last_log_index", commit_index)),
+                    "match_term": int(payload.get("last_log_term", commit_term)),
                     "replication_lag": max(0, commit_index - last_applied),
                     "last_ack_at": time.time(),
                     "last_error": None if payload.get("accepted", True) else payload.get("reason", "commit_rejected"),
@@ -1644,6 +2154,10 @@ class ClusterManager:
                     "reachable": False,
                     "healthy": False,
                     "last_applied": 0,
+                    "last_log_index": 0,
+                    "last_log_term": 0,
+                    "match_index": 0,
+                    "match_term": 0,
                     "replication_lag": None,
                     "last_ack_at": None,
                     "last_error": str(exc),
@@ -1693,11 +2207,12 @@ class ClusterManager:
         if self._role != "leader":
             return None
 
-        acked_sequences: List[int] = [current_sequence]
+        leader_last_log_index, _ = self._coordinator.get_last_replication_position()
+        acked_sequences: List[int] = [leader_last_log_index or current_sequence]
         for peer in self._peer_urls:
             peer_state = self._peer_states.get(peer, {})
-            last_applied = peer_state.get("last_applied")
-            acked_sequences.append(int(last_applied) if isinstance(last_applied, int) else 0)
+            match_index = peer_state.get("match_index")
+            acked_sequences.append(int(match_index) if isinstance(match_index, int) else 0)
 
         acked_sequences.sort(reverse=True)
         quorum_index = acked_sequences[self._quorum_size() - 1] if len(acked_sequences) >= self._quorum_size() else 0
@@ -1714,6 +2229,11 @@ class ClusterManager:
             voted_for=self._voted_for,
             leader_id=self._leader_id,
             leader_url=self._leader_url,
+            config_version=self._config_version,
+            peer_urls=self._peer_urls,
+            pending_config_version=self._pending_config_version,
+            pending_peer_urls=self._pending_peer_urls,
+            reconfig_in_progress=self._reconfig_in_progress,
             commit_index=commit_index,
             last_applied=current_applied,
         )
@@ -1744,6 +2264,76 @@ class ClusterManager:
         """Return the majority quorum for the configured node count."""
         node_count = 1 + len(self._peer_urls)
         return (node_count // 2) + 1
+
+    def _normalize_peer_urls(self, peer_urls: Optional[List[str]]) -> List[str]:
+        """Normalize peer URLs while preserving order and removing duplicates."""
+        normalized: List[str] = []
+        seen: set[str] = set()
+        for peer in (peer_urls or []):
+            candidate = str(peer or "").strip().rstrip("/")
+            if not candidate or candidate in seen:
+                continue
+            normalized.append(candidate)
+            seen.add(candidate)
+        return normalized
+
+    def _rebuild_peer_states(
+        self,
+        peer_urls: List[str],
+        previous: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Rebuild the peer-state map while preserving known peers when possible."""
+        previous = previous or {}
+        rebuilt: Dict[str, Dict[str, Any]] = {}
+        for peer in self._normalize_peer_urls(peer_urls):
+            state = dict(previous.get(peer, {}))
+            state.setdefault("peer_url", peer)
+            state.setdefault("peer_id", None)
+            state.setdefault("role", "unknown")
+            state.setdefault("reachable", False)
+            state.setdefault("healthy", False)
+            state.setdefault("last_applied", 0)
+            state.setdefault("last_log_index", 0)
+            state.setdefault("last_log_term", 0)
+            state.setdefault("match_index", 0)
+            state.setdefault("match_term", 0)
+            state.setdefault("replication_lag", None)
+            state.setdefault("last_ack_at", None)
+            state.setdefault("last_error", None)
+            rebuilt[peer] = state
+        return rebuilt
+
+    def _config_version_accepts(self, incoming_version: int) -> bool:
+        """Return whether one cluster message version is valid for the local state."""
+        allowed_versions = {int(self._config_version)}
+        if self._pending_config_version is not None:
+            allowed_versions.add(int(self._pending_config_version))
+        return int(incoming_version) in allowed_versions
+
+    def _wait_for_peer_alignment(
+        self,
+        *,
+        peer_url: str,
+        expected_applied: int,
+        expected_log_index: int,
+        expected_log_term: int,
+    ) -> None:
+        """Wait briefly for one staged peer to catch up before activation."""
+        deadline = time.time() + self._reconfig_timeout_seconds
+        while time.time() < deadline:
+            payload = self._request_json(f"{peer_url}/internal/replication/state", "GET", None)
+            if (
+                int(payload.get("last_applied", 0)) >= int(expected_applied)
+                and int(payload.get("last_log_index", 0)) >= int(expected_log_index)
+                and int(payload.get("last_log_term", 0)) == int(expected_log_term)
+            ):
+                return
+            time.sleep(0.2)
+        raise ConflictError(
+            "New peer did not catch up before reconfiguration activation",
+            error="cluster_reconfig_peer_catchup_timeout",
+            peer_url=peer_url,
+        )
 
     def _default_request_json(
         self,

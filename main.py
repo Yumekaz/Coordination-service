@@ -332,6 +332,10 @@ class ClusterStatusResponse(BaseModel):
     leader_id: Optional[str] = None
     leader_url: Optional[str] = None
     current_term: int
+    config_version: int = 1
+    pending_config_version: Optional[int] = None
+    pending_peer_urls: List[str] = Field(default_factory=list)
+    reconfig_in_progress: bool = False
     voted_for: Optional[str] = None
     commit_index: int
     last_applied: int
@@ -368,6 +372,8 @@ class InternalReplicationAppendRequest(BaseModel):
     leader_id: str
     leader_url: Optional[str] = None
     term: int = Field(..., ge=0)
+    prev_log_index: int = Field(default=0, ge=0)
+    prev_log_term: int = Field(default=0, ge=0)
     operations: List[Dict[str, Any]] = Field(default_factory=list)
 
 
@@ -391,6 +397,7 @@ class InternalHeartbeatRequest(BaseModel):
     leader_url: Optional[str] = None
     term: int = Field(..., ge=0)
     commit_index: int = Field(default=0, ge=0)
+    config_version: int = Field(default=1, ge=1)
 
 
 class InternalReplicationCommitRequest(BaseModel):
@@ -398,6 +405,9 @@ class InternalReplicationCommitRequest(BaseModel):
     leader_url: Optional[str] = None
     term: int = Field(..., ge=0)
     commit_index: int = Field(default=0, ge=0)
+    prev_log_index: int = Field(default=0, ge=0)
+    prev_log_term: int = Field(default=0, ge=0)
+    commit_term: Optional[int] = Field(default=None, ge=0)
     watch_fires: List[Dict[str, Any]] = Field(default_factory=list)
 
 
@@ -413,6 +423,22 @@ class InternalVoteRequest(BaseModel):
     candidate_last_applied: int = Field(default=0, ge=0)
     candidate_last_log_index: int = Field(default=0, ge=0)
     candidate_last_log_term: int = Field(default=0, ge=0)
+    candidate_config_version: int = Field(default=1, ge=1)
+
+
+class InternalClusterConfigureRequest(BaseModel):
+    leader_id: str
+    leader_url: Optional[str] = None
+    term: int = Field(..., ge=0)
+    config_version: int = Field(..., ge=1)
+    cluster_urls: List[str] = Field(default_factory=list)
+    node_url: str
+    phase: str
+
+
+class ClusterReconfigureRequest(BaseModel):
+    expected_version: int = Field(..., ge=1)
+    peer_urls: List[str] = Field(default_factory=list)
 
 
 class PathNodeResponse(BaseModel):
@@ -979,6 +1005,15 @@ async def cluster_status() -> ClusterStatusResponse:
     )
 
 
+@app.post("/api/cluster/reconfigure")
+async def cluster_reconfigure(request: ClusterReconfigureRequest) -> dict:
+    """Stage and activate a conservative add-only cluster reconfiguration."""
+    return _require_cluster_manager().reconfigure_cluster(
+        expected_version=request.expected_version,
+        peer_urls=request.peer_urls,
+    )
+
+
 @app.get("/internal/replication/operations")
 async def internal_replication_operations(
     request: Request,
@@ -1040,6 +1075,8 @@ async def internal_replication_append(
         leader_id=payload.leader_id,
         leader_url=payload.leader_url,
         term=payload.term,
+        prev_log_index=payload.prev_log_index,
+        prev_log_term=payload.prev_log_term,
         operations_payload=payload.operations,
     )
 
@@ -1087,6 +1124,9 @@ async def internal_replication_commit(
         leader_url=payload.leader_url,
         term=payload.term,
         commit_index=payload.commit_index,
+        prev_log_index=payload.prev_log_index,
+        prev_log_term=payload.prev_log_term,
+        commit_term=payload.commit_term,
         watch_fires_payload=payload.watch_fires,
     )
 
@@ -1117,6 +1157,7 @@ async def internal_cluster_heartbeat(
         term=payload.term,
         leader_url=payload.leader_url,
         commit_index=payload.commit_index,
+        config_version=payload.config_version,
     )
 
 
@@ -1133,6 +1174,25 @@ async def internal_cluster_request_vote(
         candidate_last_applied=payload.candidate_last_applied,
         candidate_last_log_index=payload.candidate_last_log_index,
         candidate_last_log_term=payload.candidate_last_log_term,
+        candidate_config_version=payload.candidate_config_version,
+    )
+
+
+@app.post("/internal/cluster/configure")
+async def internal_cluster_configure(
+    request: Request,
+    payload: InternalClusterConfigureRequest,
+) -> dict:
+    """Stage, activate, or abort a conservative cluster configuration change."""
+    _require_replication_auth(request)
+    return _require_cluster_manager().receive_configure(
+        leader_id=payload.leader_id,
+        leader_url=payload.leader_url,
+        term=payload.term,
+        config_version=payload.config_version,
+        cluster_urls=payload.cluster_urls,
+        node_url=payload.node_url,
+        phase=payload.phase,
     )
 
 

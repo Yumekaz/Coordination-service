@@ -186,6 +186,11 @@ class Coordinator:
         voted_for: Optional[str] = None,
         leader_id: Optional[str] = None,
         leader_url: Optional[str] = None,
+        config_version: int = 1,
+        peer_urls: Optional[List[str]] = None,
+        pending_config_version: Optional[int] = None,
+        pending_peer_urls: Optional[List[str]] = None,
+        reconfig_in_progress: bool = False,
         commit_index: int = 0,
         last_applied: int = 0,
     ) -> None:
@@ -196,6 +201,11 @@ class Coordinator:
             voted_for=voted_for,
             leader_id=leader_id,
             leader_url=leader_url,
+            config_version=config_version,
+            peer_urls=peer_urls,
+            pending_config_version=pending_config_version,
+            pending_peer_urls=pending_peer_urls,
+            reconfig_in_progress=reconfig_in_progress,
             commit_index=commit_index,
             last_applied=last_applied,
         )

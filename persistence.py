@@ -452,6 +452,11 @@ class Persistence:
                     voted_for TEXT,
                     leader_id TEXT,
                     leader_url TEXT,
+                    config_version INTEGER NOT NULL DEFAULT 1,
+                    peer_urls_json TEXT,
+                    pending_config_version INTEGER,
+                    pending_peer_urls_json TEXT,
+                    reconfig_in_progress INTEGER NOT NULL DEFAULT 0,
                     commit_index INTEGER NOT NULL DEFAULT 0,
                     last_applied INTEGER NOT NULL DEFAULT 0,
                     updated_at REAL NOT NULL
@@ -477,6 +482,26 @@ class Persistence:
             if "last_applied" not in existing_cluster_columns:
                 conn.execute(
                     "ALTER TABLE cluster_state ADD COLUMN last_applied INTEGER NOT NULL DEFAULT 0"
+                )
+            if "config_version" not in existing_cluster_columns:
+                conn.execute(
+                    "ALTER TABLE cluster_state ADD COLUMN config_version INTEGER NOT NULL DEFAULT 1"
+                )
+            if "peer_urls_json" not in existing_cluster_columns:
+                conn.execute(
+                    "ALTER TABLE cluster_state ADD COLUMN peer_urls_json TEXT"
+                )
+            if "pending_config_version" not in existing_cluster_columns:
+                conn.execute(
+                    "ALTER TABLE cluster_state ADD COLUMN pending_config_version INTEGER"
+                )
+            if "pending_peer_urls_json" not in existing_cluster_columns:
+                conn.execute(
+                    "ALTER TABLE cluster_state ADD COLUMN pending_peer_urls_json TEXT"
+                )
+            if "reconfig_in_progress" not in existing_cluster_columns:
+                conn.execute(
+                    "ALTER TABLE cluster_state ADD COLUMN reconfig_in_progress INTEGER NOT NULL DEFAULT 0"
                 )
             
             # Note: DDL statements are auto-committed in isolation_level=None mode
@@ -759,6 +784,11 @@ class Persistence:
         voted_for: Optional[str] = None,
         leader_id: Optional[str] = None,
         leader_url: Optional[str] = None,
+        config_version: int = 1,
+        peer_urls: Optional[List[str]] = None,
+        pending_config_version: Optional[int] = None,
+        pending_peer_urls: Optional[List[str]] = None,
+        reconfig_in_progress: bool = False,
         commit_index: int = 0,
         last_applied: int = 0,
     ) -> None:
@@ -767,24 +797,44 @@ class Persistence:
             with self._transaction() as conn:
                 conn.execute("""
                     INSERT OR REPLACE INTO cluster_state
-                    (node_id, current_term, voted_for, leader_id, leader_url, commit_index, last_applied, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (
+                        node_id,
+                        current_term,
+                        voted_for,
+                        leader_id,
+                        leader_url,
+                        config_version,
+                        peer_urls_json,
+                        pending_config_version,
+                        pending_peer_urls_json,
+                        reconfig_in_progress,
+                        commit_index,
+                        last_applied,
+                        updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     node_id,
                     int(current_term),
                     voted_for,
                     leader_id,
                     leader_url,
+                    int(config_version),
+                    json.dumps(list(peer_urls or [])),
+                    (None if pending_config_version is None else int(pending_config_version)),
+                    json.dumps(list(pending_peer_urls or [])),
+                    1 if reconfig_in_progress else 0,
                     int(commit_index),
                     int(last_applied),
                     datetime.now().timestamp(),
                 ))
                 logger.debug(
-                    "Saved cluster state: node=%s term=%s voted_for=%s leader=%s commit_index=%s last_applied=%s",
+                    "Saved cluster state: node=%s term=%s voted_for=%s leader=%s config_version=%s commit_index=%s last_applied=%s",
                     node_id,
                     current_term,
                     voted_for,
                     leader_id,
+                    config_version,
                     commit_index,
                     last_applied,
                 )
@@ -795,7 +845,20 @@ class Persistence:
             conn = self._get_connection()
             cursor = conn.execute(
                 """
-                SELECT node_id, current_term, voted_for, leader_id, leader_url, commit_index, last_applied, updated_at
+                SELECT
+                    node_id,
+                    current_term,
+                    voted_for,
+                    leader_id,
+                    leader_url,
+                    config_version,
+                    peer_urls_json,
+                    pending_config_version,
+                    pending_peer_urls_json,
+                    reconfig_in_progress,
+                    commit_index,
+                    last_applied,
+                    updated_at
                 FROM cluster_state
                 WHERE node_id = ?
                 """,
@@ -811,6 +874,15 @@ class Persistence:
                 "voted_for": row["voted_for"],
                 "leader_id": row["leader_id"],
                 "leader_url": row["leader_url"],
+                "config_version": int(row["config_version"] or 1),
+                "peer_urls": json.loads(row["peer_urls_json"] or "[]"),
+                "pending_config_version": (
+                    None
+                    if row["pending_config_version"] is None
+                    else int(row["pending_config_version"])
+                ),
+                "pending_peer_urls": json.loads(row["pending_peer_urls_json"] or "[]"),
+                "reconfig_in_progress": bool(row["reconfig_in_progress"]),
                 "commit_index": int(row["commit_index"] or 0),
                 "last_applied": int(row["last_applied"] or 0),
                 "updated_at": row["updated_at"],
