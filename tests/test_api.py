@@ -2940,17 +2940,7 @@ class TestClusterEndpoints:
         new_peer.start()
 
         managers: dict[str, ClusterManager] = {}
-        base_router = self._make_cluster_router(managers)
-
-        def router(url: str, method: str, payload: dict | None):
-            parsed = parse.urlparse(url)
-            if (
-                parsed.netloc == "peer-c"
-                and parsed.path == "/internal/cluster/configure"
-                and (payload or {}).get("phase") == "activate"
-            ):
-                raise RuntimeError("peer-c activate failed")
-            return base_router(url, method, payload)
+        router = self._make_cluster_router(managers)
 
         follower_cluster = ClusterManager(
             follower,
@@ -2991,6 +2981,13 @@ class TestClusterEndpoints:
             leader_cluster._send_heartbeats_once()
             leader_cluster._poll_peers_once()
 
+            original_commit_reserved = leader.commit_reserved_internal_operation
+
+            def fail_commit_reserved(operation):
+                raise RuntimeError("local cluster config commit failed")
+
+            leader.commit_reserved_internal_operation = fail_commit_reserved
+
             with pytest.raises(ConflictError) as exc_info:
                 leader_cluster.reconfigure_cluster(
                     expected_version=1,
@@ -3011,6 +3008,7 @@ class TestClusterEndpoints:
             assert new_peer_status["role"] == "standalone"
             assert new_peer_status["config_version"] == 1
             assert new_peer_status["pending_config_version"] is None
+            leader.commit_reserved_internal_operation = original_commit_reserved
         finally:
             leader_cluster.stop()
             follower_cluster.stop()
@@ -3043,17 +3041,11 @@ class TestClusterEndpoints:
         def router(url: str, method: str, payload: dict | None):
             parsed = parse.urlparse(url)
             if (
-                parsed.netloc == "peer-c"
-                and parsed.path == "/internal/cluster/configure"
-                and (payload or {}).get("phase") == "activate"
-            ):
-                raise RuntimeError("peer-c activate failed")
-            if (
                 parsed.netloc == "peer-b"
                 and parsed.path == "/internal/cluster/configure"
-                and (payload or {}).get("phase") == "rollback"
+                and (payload or {}).get("phase") == "abort"
             ):
-                raise RuntimeError("peer-b rollback failed")
+                raise RuntimeError("peer-b abort failed")
             return base_router(url, method, payload)
 
         follower_cluster = ClusterManager(
@@ -3095,6 +3087,13 @@ class TestClusterEndpoints:
             leader_cluster._send_heartbeats_once()
             leader_cluster._poll_peers_once()
 
+            original_commit_reserved = leader.commit_reserved_internal_operation
+
+            def fail_commit_reserved(operation):
+                raise RuntimeError("local cluster config commit failed")
+
+            leader.commit_reserved_internal_operation = fail_commit_reserved
+
             with pytest.raises(ConflictError) as exc_info:
                 leader_cluster.reconfigure_cluster(
                     expected_version=1,
@@ -3106,6 +3105,7 @@ class TestClusterEndpoints:
             assert status["role"] == "candidate"
             assert status["reconfig_in_progress"] is True
             assert status["read_only"] is True
+            leader.commit_reserved_internal_operation = original_commit_reserved
         finally:
             leader_cluster.stop()
             follower_cluster.stop()
@@ -3192,17 +3192,11 @@ class TestClusterEndpoints:
         def router(url: str, method: str, payload: dict | None):
             parsed = parse.urlparse(url)
             if (
-                parsed.netloc == "peer-c"
-                and parsed.path == "/internal/cluster/configure"
-                and (payload or {}).get("phase") == "activate"
-            ):
-                raise RuntimeError("peer-c activate failed")
-            if (
                 parsed.netloc == "peer-b"
                 and parsed.path == "/internal/cluster/configure"
-                and (payload or {}).get("phase") == "rollback"
+                and (payload or {}).get("phase") == "abort"
             ):
-                raise RuntimeError("peer-b rollback failed")
+                raise RuntimeError("peer-b abort failed")
             return base_router(url, method, payload)
 
         follower_cluster = ClusterManager(
@@ -3249,6 +3243,13 @@ class TestClusterEndpoints:
             leader_cluster._send_heartbeats_once()
             leader_cluster._poll_peers_once()
 
+            original_commit_reserved = leader.commit_reserved_internal_operation
+
+            def fail_commit_reserved(operation):
+                raise RuntimeError("local cluster config commit failed")
+
+            leader.commit_reserved_internal_operation = fail_commit_reserved
+
             with pytest.raises(ConflictError) as exc_info:
                 leader_cluster.reconfigure_cluster(
                     expected_version=1,
@@ -3256,6 +3257,7 @@ class TestClusterEndpoints:
                 )
 
             assert exc_info.value.error == "cluster_reconfig_activation_failed"
+            leader.commit_reserved_internal_operation = original_commit_reserved
 
             leader_cluster.stop()
             follower_cluster.stop()
@@ -3306,7 +3308,7 @@ class TestClusterEndpoints:
             assert leader_status["pending_config_version"] == 2
             persisted_leader_state = restarted_leader.load_cluster_state("leader-a")
             assert persisted_leader_state is not None
-            assert persisted_leader_state["previous_config_version"] is None
+            assert persisted_leader_state["previous_config_version"] == 1
 
             with pytest.raises(ForbiddenError) as write_exc:
                 restarted_leader.open_session(30)
@@ -3314,7 +3316,8 @@ class TestClusterEndpoints:
             assert write_exc.value.error == "read_only_replica"
 
             follower_status = restarted_follower_cluster.build_status()
-            assert follower_status["config_version"] == 2
+            assert follower_status["config_version"] == 1
+            assert follower_status["pending_config_version"] == 2
             persisted_follower_state = restarted_follower.load_cluster_state("node-b")
             assert persisted_follower_state is not None
             assert persisted_follower_state["previous_config_version"] == 1

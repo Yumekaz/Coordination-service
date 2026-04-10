@@ -33,6 +33,7 @@ class OperationType(Enum):
     SESSION_OPEN = "SESSION_OPEN"
     SESSION_CLOSE = "SESSION_CLOSE"
     SESSION_HEARTBEAT = "SESSION_HEARTBEAT"
+    CLUSTER_CONFIG = "CLUSTER_CONFIG"
 
 
 DELETE_CAUSE_DELETE = "delete"
@@ -40,6 +41,53 @@ DELETE_CAUSE_LEASE_RELEASE = "lease_release"
 DELETE_CAUSE_LEASE_EXPIRED = "lease_expired"
 DELETE_CAUSE_SESSION_CLOSED = "session_closed"
 DELETE_CAUSE_SESSION_EXPIRED = "session_expired"
+
+
+def encode_cluster_config_operation_payload(
+    *,
+    previous_config_version: int,
+    previous_cluster_urls: List[str],
+    config_version: int,
+    cluster_urls: List[str],
+    mode: str,
+) -> bytes:
+    """Encode one committed cluster-configuration transition payload."""
+    payload = {
+        "previous_config_version": int(previous_config_version),
+        "previous_cluster_urls": [str(url).strip() for url in previous_cluster_urls if str(url).strip()],
+        "config_version": int(config_version),
+        "cluster_urls": [str(url).strip() for url in cluster_urls if str(url).strip()],
+        "mode": str(mode or "").strip().lower(),
+    }
+    return json.dumps(payload, sort_keys=True).encode("utf-8")
+
+
+def decode_cluster_config_operation_payload(data: Any) -> Dict[str, Any]:
+    """Decode a committed cluster-configuration transition payload."""
+    if not data:
+        raise ValueError("Cluster config payload is required")
+
+    raw = data.decode("utf-8") if isinstance(data, (bytes, bytearray)) else str(data)
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise ValueError("Cluster config payload must be an object")
+
+    cluster_urls = parsed.get("cluster_urls", [])
+    previous_cluster_urls = parsed.get("previous_cluster_urls", [])
+    if not isinstance(cluster_urls, list) or not isinstance(previous_cluster_urls, list):
+        raise ValueError("Cluster config payload URL fields must be lists")
+
+    mode = str(parsed.get("mode") or "").strip().lower()
+    if mode not in {"add", "remove"}:
+        raise ValueError("Cluster config payload mode must be 'add' or 'remove'")
+
+    return {
+        "previous_config_version": int(parsed["previous_config_version"]),
+        "previous_cluster_urls": [str(url).strip() for url in previous_cluster_urls if str(url).strip()],
+        "config_version": int(parsed["config_version"]),
+        "cluster_urls": [str(url).strip() for url in cluster_urls if str(url).strip()],
+        "mode": mode,
+    }
 
 
 def encode_delete_operation_payload(

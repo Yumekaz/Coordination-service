@@ -36,6 +36,8 @@ from models import (
     DELETE_CAUSE_SESSION_EXPIRED,
     encode_delete_operation_payload,
     decode_delete_operation_payload,
+    encode_cluster_config_operation_payload,
+    decode_cluster_config_operation_payload,
 )
 from metadata_tree import MetadataTree
 from session_manager import SessionManager
@@ -253,6 +255,48 @@ class Coordinator:
             commit_index=commit_index,
             last_applied=last_applied,
         )
+
+    def reserve_internal_operation(
+        self,
+        *,
+        operation_type: OperationType,
+        path: str = "",
+        data: bytes = b"",
+        session_id: Optional[str] = None,
+        node_type: Optional[NodeType] = None,
+        term: Optional[int] = None,
+    ) -> Operation:
+        """Reserve the next global sequence for an internal committed operation."""
+        with self._lock:
+            sequence_number = self._operation_log.next_sequence()
+            return Operation(
+                sequence_number=sequence_number,
+                operation_type=operation_type,
+                path=path,
+                data=data,
+                session_id=session_id,
+                timestamp=datetime.now().timestamp(),
+                node_type=node_type,
+                term=term,
+            )
+
+    def commit_reserved_internal_operation(self, operation: Operation) -> None:
+        """Persist and expose a previously reserved internal operation."""
+        with self._lock:
+            existing = self._operation_log.get_operation(operation.sequence_number)
+            if existing is not None:
+                if existing != operation:
+                    raise ValueError(
+                        f"Internal operation conflict at sequence {operation.sequence_number}"
+                    )
+                return
+            self._persistence.append_operation(operation)
+            self._operation_log.append_external_committed(operation)
+
+    def rollback_reserved_internal_operation(self, sequence_number: int) -> bool:
+        """Release the most recent reserved internal operation sequence."""
+        with self._lock:
+            return self._operation_log.discard_last_operation(sequence_number)
 
     def export_active_watches(
         self,
@@ -2404,6 +2448,12 @@ class Coordinator:
                         sequence_number=operation.sequence_number,
                     )
                 self._notify_lease_waiters_locked()
+                return True
+
+            if operation.operation_type == OperationType.CLUSTER_CONFIG:
+                decode_cluster_config_operation_payload(operation.data)
+                self._persistence.append_operation(operation)
+                self._operation_log.append_external_committed(operation)
                 return True
 
             raise ValueError(f"Unsupported replicated operation: {operation.operation_type.value}")

@@ -238,6 +238,8 @@ class RecoveryManager:
                 self._replay_set(op)
             elif op.operation_type == OperationType.DELETE:
                 self._replay_delete(op)
+            elif op.operation_type == OperationType.CLUSTER_CONFIG:
+                pass
             else:
                 raise ValueError(f"Unsupported operation type during recovery: {op.operation_type}")
 

@@ -18,7 +18,13 @@ from typing import Any, Callable, Deque, Dict, List, Optional
 from urllib import error, parse, request
 
 from coordinator import Coordinator
-from models import Operation, OperationType, WatchFireRecord
+from models import (
+    Operation,
+    OperationType,
+    WatchFireRecord,
+    encode_cluster_config_operation_payload,
+    decode_cluster_config_operation_payload,
+)
 from errors import ConflictError
 from logger import get_logger
 
@@ -362,7 +368,18 @@ class ClusterManager:
                         error="replication_prepare_mismatch",
                         reason=reason,
                     )
-        applied = self._coordinator.apply_replicated_operations(operations)
+        applied = 0
+        for operation in operations:
+            replicated = self._coordinator.apply_replicated_operation(operation)
+            if replicated:
+                applied += 1
+                if operation.operation_type == OperationType.CLUSTER_CONFIG:
+                    self._apply_cluster_config_operation(
+                        operation,
+                        leader_id=source_node_id,
+                        leader_url=self._leader_url,
+                        term=source_term,
+                    )
         if watch_fires:
             self._coordinator.record_replicated_watch_fires(watch_fires)
         current_applied = self._coordinator.get_stats().get("last_sequence", 0)
@@ -746,7 +763,17 @@ class ClusterManager:
                     "last_log_index": last_log_index,
                     "reason": "commit_gap",
                 }
-            applied_count = self._coordinator.apply_replicated_operations(operations)
+            for operation in operations:
+                applied = self._coordinator.apply_replicated_operation(operation)
+                if applied:
+                    applied_count += 1
+                    if operation.operation_type == OperationType.CLUSTER_CONFIG:
+                        self._apply_cluster_config_operation(
+                            operation,
+                            leader_id=leader_id,
+                            leader_url=leader_url,
+                            term=term,
+                        )
 
         if watch_fires:
             self._coordinator.record_replicated_watch_fires(watch_fires)
@@ -992,9 +1019,15 @@ class ClusterManager:
     def prepare_write_quorum(
         self,
         operations: List[Operation],
+        *,
+        peer_urls_override: Optional[List[str]] = None,
+        quorum_peer_sets_override: Optional[List[List[str]]] = None,
+        config_version_override: Optional[int] = None,
+        allow_reconfig_in_progress: bool = False,
     ) -> Optional[Callable[[bool], None]]:
         """Append a write batch to a majority before local state-machine apply."""
-        if self._role != "leader" or not self._require_write_quorum or not self._peer_urls:
+        target_peers = self._normalize_peer_urls(peer_urls_override if peer_urls_override is not None else self._peer_urls)
+        if self._role != "leader" or not self._require_write_quorum or not target_peers:
             return None
         if not operations:
             return None
@@ -1015,6 +1048,8 @@ class ClusterManager:
         appended_peers: List[str] = []
         append_succeeded = False
         current_term = 0
+        payload_config_version = 1
+        quorum_peer_sets: List[List[str]] = []
 
         def finish_prepare(committed: bool) -> None:
             nonlocal released
@@ -1039,6 +1074,7 @@ class ClusterManager:
                             prev_log_term=batch_prev_log_term,
                             commit_term=int(ordered[-1].term or current_term),
                             watch_fire_records=watch_fire_records,
+                            config_version=payload_config_version,
                         )
                     else:
                         truncate_after = start_sequence - 1
@@ -1047,6 +1083,7 @@ class ClusterManager:
                             peers=appended_peers,
                             term=current_term,
                             truncate_after=truncate_after,
+                            config_version=payload_config_version,
                         )
                 finally:
                     released = True
@@ -1060,8 +1097,23 @@ class ClusterManager:
                         error="write_quorum_stepped_down",
                     )
                 current_term = self._current_term
+                payload_config_version = (
+                    int(config_version_override)
+                    if config_version_override is not None
+                    else self._config_version
+                )
+                if quorum_peer_sets_override is not None:
+                    quorum_peer_sets = [
+                        self._normalize_peer_urls(peer_urls)
+                        for peer_urls in quorum_peer_sets_override
+                    ]
+                else:
+                    quorum_peer_sets = [list(target_peers)]
 
-            self.assert_write_quorum_available(current_sequence_override=start_sequence - 1)
+            self.assert_write_quorum_available(
+                current_sequence_override=start_sequence - 1,
+                allow_reconfig_in_progress=allow_reconfig_in_progress,
+            )
             batch_prev_log_index, batch_prev_log_term = self._coordinator.get_last_replication_position()
             if batch_prev_log_index != start_sequence - 1:
                 raise ConflictError(
@@ -1073,8 +1125,7 @@ class ClusterManager:
 
             self._coordinator.append_replication_entries(current_term, ordered)
 
-            reserved_votes = 1
-            for peer in self._peer_urls:
+            for peer in target_peers:
                 started_at = time.time()
                 try:
                     payload = self._request_json(
@@ -1084,7 +1135,7 @@ class ClusterManager:
                             "leader_id": self._node_id,
                             "leader_url": self._advertise_url,
                             "term": current_term,
-                            "config_version": self._config_version,
+                            "config_version": payload_config_version,
                             "prev_log_index": batch_prev_log_index,
                             "prev_log_term": batch_prev_log_term,
                             "operations": [operation.to_dict() for operation in ordered],
@@ -1119,7 +1170,6 @@ class ClusterManager:
                     }
                     if reserved:
                         appended_peers.append(peer)
-                        reserved_votes += 1
                     self._recent_apply_events.appendleft(
                         {
                             "sequence_number": ordered[-1].sequence_number,
@@ -1145,13 +1195,22 @@ class ClusterManager:
                         "last_error": str(exc),
                     }
 
-            if reserved_votes < self._quorum_size():
+            with self._lock:
+                quorum_satisfied = self._append_satisfies_quorum_sets_locked(
+                    appended_peers=appended_peers,
+                    peer_sets=quorum_peer_sets,
+                )
+            if not quorum_satisfied:
+                quorum_size = max(
+                    self._quorum_size_for_peer_urls_locked(peer_urls)
+                    for peer_urls in quorum_peer_sets
+                ) if quorum_peer_sets else self._quorum_size()
                 raise ConflictError(
                     "Write quorum append failed: majority could not durably append the next sequence range",
                     error="write_quorum_append_failed",
                     start_sequence=start_sequence,
-                    prepared_votes=reserved_votes,
-                    quorum_size=self._quorum_size(),
+                    prepared_votes=1 + len(appended_peers),
+                    quorum_size=quorum_size,
                 )
             append_succeeded = True
             return finish_prepare
@@ -1185,6 +1244,20 @@ class ClusterManager:
                         "term": self._current_term,
                         "node_id": self._node_id,
                         "last_applied": self._coordinator.get_stats().get("last_sequence", 0),
+                    }
+
+                if (
+                    self._reconfig_in_progress
+                    and self._pending_config_version is not None
+                    and int(config_version) != int(self._pending_config_version)
+                ):
+                    return {
+                        "accepted": False,
+                        "term": self._current_term,
+                        "node_id": self._node_id,
+                        "last_applied": self._coordinator.get_stats().get("last_sequence", 0),
+                        "reason": "stale_config_version",
+                        "config_version": int(self._pending_config_version),
                     }
 
                 if not self._config_version_accepts(int(config_version)):
@@ -1338,9 +1411,10 @@ class ClusterManager:
             )
 
         staged_peers: List[str] = []
-        activated_peers: List[str] = []
         activation_started = False
-        decommissioned_peer: Optional[str] = None
+        config_prepare: Optional[Callable[[bool], None]] = None
+        config_operation: Optional[Operation] = None
+        config_recorded = False
         with self._prepare_barrier:
             self._poll_peers_once()
             current_applied = self._coordinator.get_stats().get("last_sequence", 0)
@@ -1458,49 +1532,34 @@ class ClusterManager:
                         expected_log_term=local_last_log_term,
                     )
 
+                config_operation = self._build_cluster_config_operation(
+                    previous_config_version=self._config_version,
+                    previous_peer_urls=current_peers,
+                    config_version=next_version,
+                    peer_urls=desired_peer_urls,
+                    mode="add" if add_mode else "remove",
+                    term=self._current_term,
+                )
+                config_prepare = self.prepare_write_quorum(
+                    [config_operation],
+                    peer_urls_override=stage_targets,
+                    quorum_peer_sets_override=[current_peers, desired_peer_urls],
+                    config_version_override=next_version,
+                    allow_reconfig_in_progress=True,
+                )
                 activation_started = True
-                for peer in desired_peer_urls:
-                    self._request_json(
-                        f"{peer}/internal/cluster/configure",
-                        "POST",
-                        {
-                            "leader_id": self._node_id,
-                            "leader_url": self._advertise_url,
-                            "term": self._current_term,
-                            "config_version": next_version,
-                            "cluster_urls": cluster_urls,
-                            "node_url": peer,
-                            "phase": "activate",
-                        },
-                    )
-                    activated_peers.append(peer)
-
-                if remove_mode:
-                    self._request_json(
-                        f"{target_peer_url}/internal/cluster/configure",
-                        "POST",
-                        {
-                            "leader_id": self._node_id,
-                            "leader_url": self._advertise_url,
-                            "term": self._current_term,
-                            "config_version": next_version,
-                            "cluster_urls": cluster_urls,
-                            "node_url": target_peer_url,
-                            "phase": "decommission",
-                        },
-                    )
-                    decommissioned_peer = target_peer_url
-
+                self._apply_cluster_config_operation(
+                    config_operation,
+                    leader_id=self._node_id,
+                    leader_url=self._advertise_url,
+                    term=self._current_term,
+                )
+                self._coordinator.commit_reserved_internal_operation(config_operation)
+                config_recorded = True
                 with self._lock:
-                    self._previous_config_version = self._config_version
-                    self._previous_peer_urls = list(self._peer_urls)
-                    self._peer_urls = list(desired_peer_urls)
-                    self._peer_states = self._rebuild_peer_states(self._peer_urls, self._peer_states)
-                    self._config_version = next_version
-                    self._pending_config_version = None
-                    self._pending_peer_urls = []
-                    self._reconfig_in_progress = False
                     self._persist_cluster_state_locked()
+                if config_prepare is not None:
+                    config_prepare(True)
             except Exception as exc:
                 if not activation_started:
                     if staged_peers:
@@ -1532,16 +1591,21 @@ class ClusterManager:
                         raise
                     raise ConflictError(
                         "Cluster reconfiguration failed during staging",
-                        error="cluster_reconfig_failed",
-                        detail=str(exc),
-                    ) from exc
+                            error="cluster_reconfig_failed",
+                            detail=str(exc),
+                        ) from exc
+
+                if config_prepare is not None:
+                    try:
+                        config_prepare(False)
+                    except Exception:
+                        pass
+                if config_operation is not None and not config_recorded:
+                    self._revert_local_cluster_config_operation(config_operation)
+                    self._coordinator.rollback_reserved_internal_operation(config_operation.sequence_number)
 
                 rollback_failures: List[str] = []
-                staged_only_peers = [
-                    peer for peer in staged_peers
-                    if peer not in activated_peers and peer != decommissioned_peer
-                ]
-                for peer in staged_only_peers:
+                for peer in reversed(staged_peers):
                     try:
                         self._request_json(
                             f"{peer}/internal/cluster/configure",
@@ -1554,40 +1618,6 @@ class ClusterManager:
                                 "cluster_urls": cluster_urls,
                                 "node_url": peer,
                                 "phase": "abort",
-                            },
-                        )
-                    except Exception:
-                        rollback_failures.append(peer)
-                if decommissioned_peer is not None:
-                    try:
-                        self._request_json(
-                            f"{decommissioned_peer}/internal/cluster/configure",
-                            "POST",
-                            {
-                                "leader_id": self._node_id,
-                                "leader_url": self._advertise_url,
-                                "term": self._current_term,
-                                "config_version": next_version,
-                                "cluster_urls": cluster_urls,
-                                "node_url": decommissioned_peer,
-                                "phase": "rollback",
-                            },
-                        )
-                    except Exception:
-                        rollback_failures.append(decommissioned_peer)
-                for peer in reversed(activated_peers):
-                    try:
-                        self._request_json(
-                            f"{peer}/internal/cluster/configure",
-                            "POST",
-                            {
-                                "leader_id": self._node_id,
-                                "leader_url": self._advertise_url,
-                                "term": self._current_term,
-                                "config_version": next_version,
-                                "cluster_urls": cluster_urls,
-                                "node_url": peer,
-                                "phase": "rollback",
                             },
                         )
                     except Exception:
@@ -1806,13 +1836,143 @@ class ClusterManager:
             "reconfig_in_progress": self._reconfig_in_progress,
         }
 
+    def _build_cluster_config_operation(
+        self,
+        *,
+        previous_config_version: int,
+        previous_peer_urls: List[str],
+        config_version: int,
+        peer_urls: List[str],
+        mode: str,
+        term: int,
+    ) -> Operation:
+        """Reserve one committed log entry representing a cluster config transition."""
+        if not self._advertise_url:
+            raise ConflictError(
+                "Cluster config changes require an advertised leader URL",
+                error="cluster_reconfig_missing_advertise_url",
+            )
+        cluster_urls = [self._advertise_url] + list(peer_urls)
+        return self._coordinator.reserve_internal_operation(
+            operation_type=OperationType.CLUSTER_CONFIG,
+            path="/__cluster__/config",
+            data=encode_cluster_config_operation_payload(
+                previous_config_version=previous_config_version,
+                previous_cluster_urls=[self._advertise_url] + list(previous_peer_urls),
+                config_version=config_version,
+                cluster_urls=cluster_urls,
+                mode=mode,
+            ),
+            term=term,
+        )
+
+    def _apply_cluster_config_operation(
+        self,
+        operation: Operation,
+        *,
+        leader_id: Optional[str],
+        leader_url: Optional[str],
+        term: Optional[int],
+    ) -> None:
+        """Apply one committed cluster config transition into durable cluster state."""
+        payload = decode_cluster_config_operation_payload(operation.data)
+        local_url = self._advertise_url.rstrip("/") if self._advertise_url else None
+        cluster_urls = self._normalize_peer_urls(payload["cluster_urls"])
+        previous_cluster_urls = self._normalize_peer_urls(payload["previous_cluster_urls"])
+        desired_peer_urls = [
+            url for url in cluster_urls
+            if local_url is None or url != local_url
+        ]
+        previous_peer_urls = [
+            url for url in previous_cluster_urls
+            if local_url is None or url != local_url
+        ]
+        active_here = local_url is None or local_url in cluster_urls
+        next_term = int(term) if term is not None else self._current_term
+
+        apply_mode = False
+        with self._prepare_barrier:
+            with self._lock:
+                if next_term > self._current_term:
+                    self._current_term = next_term
+                    self._voted_for = leader_id
+                    self._leader_lease_until = None
+                    self._clear_prepare_reservation_locked()
+
+                self._previous_config_version = int(payload["previous_config_version"])
+                self._previous_peer_urls = list(previous_peer_urls)
+                self._config_version = int(payload["config_version"])
+                self._pending_config_version = None
+                self._pending_peer_urls = []
+                self._reconfig_in_progress = False
+
+                if active_here:
+                    self._decommissioned = False
+                    self._peer_urls = list(desired_peer_urls)
+                    self._peer_states = self._rebuild_peer_states(self._peer_urls, self._peer_states)
+                    self._leader_id = leader_id
+                    self._leader_url = leader_url.rstrip("/") if leader_url else self._leader_url
+                    self._last_leader_contact_at = time.time()
+                    if self._role != "leader" or leader_id != self._node_id:
+                        self._role = "follower" if self._peer_urls else "standalone"
+                        apply_mode = self._role == "follower"
+                else:
+                    self._peer_urls = []
+                    self._peer_states = self._rebuild_peer_states(self._peer_urls, self._peer_states)
+                    self._decommissioned = True
+                    self._voted_for = None
+                    self._leader_id = None
+                    self._leader_url = None
+                    self._leader_lease_until = None
+                    self._last_leader_contact_at = None
+                    self._role = "decommissioned"
+                    apply_mode = True
+
+                self._persist_cluster_state_locked()
+
+        if apply_mode:
+            self._apply_replica_mode()
+
+    def _revert_local_cluster_config_operation(self, operation: Operation) -> None:
+        """Restore the previous active config after a local config-op failure."""
+        payload = decode_cluster_config_operation_payload(operation.data)
+        local_url = self._advertise_url.rstrip("/") if self._advertise_url else None
+        previous_cluster_urls = self._normalize_peer_urls(payload["previous_cluster_urls"])
+        previous_peer_urls = [
+            url for url in previous_cluster_urls
+            if local_url is None or url != local_url
+        ]
+
+        with self._prepare_barrier:
+            with self._lock:
+                self._config_version = int(payload["previous_config_version"])
+                self._peer_urls = list(previous_peer_urls)
+                self._peer_states = self._rebuild_peer_states(self._peer_urls, self._peer_states)
+                self._pending_config_version = int(payload["config_version"])
+                self._pending_peer_urls = [
+                    url for url in self._normalize_peer_urls(payload["cluster_urls"])
+                    if local_url is None or url != local_url
+                ]
+                self._reconfig_in_progress = True
+                self._decommissioned = False
+                self._role = "leader"
+                self._leader_id = self._node_id
+                self._leader_url = self._advertise_url
+                self._leader_lease_until = None
+                self._last_leader_contact_at = time.time()
+                self._persist_cluster_state_locked()
+
     def build_status(self) -> Dict[str, Any]:
         """Return user-facing cluster status."""
         stats = self._coordinator.get_stats()
         current_sequence = stats.get("last_sequence", 0)
         read_only = self._coordinator.get_read_only_status()
         with self._lock:
-            peers = [dict(state) for state in self._peer_states.values()]
+            visible_peer_urls = self._reconfig_target_peer_urls_locked()
+            peers = [
+                dict(self._peer_states.get(peer, {"peer_url": peer}))
+                for peer in visible_peer_urls
+            ]
             healthy_peers = sum(1 for peer in peers if peer.get("healthy"))
             lag_values = [
                 peer["replication_lag"]
@@ -1927,8 +2087,19 @@ class ClusterManager:
                 log_operations,
             )
 
+        applied = 0
         try:
-            applied = self._coordinator.apply_replicated_operations(operations_to_apply)
+            for operation in operations_to_apply:
+                replicated = self._coordinator.apply_replicated_operation(operation)
+                if replicated:
+                    applied += 1
+                    if operation.operation_type == OperationType.CLUSTER_CONFIG:
+                        self._apply_cluster_config_operation(
+                            operation,
+                            leader_id=payload.get("node_id"),
+                            leader_url=self._leader_url,
+                            term=payload.get("term"),
+                        )
         except (KeyError, ValueError):
             return self._resync_from_leader_snapshot(reason="apply_conflict")
         if watch_fires:
@@ -1981,11 +2152,26 @@ class ClusterManager:
             None,
         )
         summary = self._coordinator.restore_replica_snapshot(payload)
+        latest_cluster_config = next(
+            (
+                Operation.from_dict(item)
+                for item in reversed(payload.get("operations", []))
+                if item.get("operation_type") == OperationType.CLUSTER_CONFIG.value
+            ),
+            None,
+        )
         leader_id = payload.get("node_id")
         payload_term = payload.get("term")
         leader_term = int(payload_term) if payload_term is not None else None
         leader_commit_index = int(payload.get("commit_index", summary["last_sequence"]))
         total_applied = summary["operations"]
+        if latest_cluster_config is not None:
+            self._apply_cluster_config_operation(
+                latest_cluster_config,
+                leader_id=leader_id,
+                leader_url=self._leader_url,
+                term=leader_term,
+            )
 
         applied_at = time.time()
         with self._lock:
@@ -2088,6 +2274,11 @@ class ClusterManager:
         accepted_votes = 1
         with self._lock:
             heartbeat_targets = self._reconfig_target_peer_urls_locked()
+            heartbeat_config_version = (
+                int(self._pending_config_version)
+                if self._reconfig_in_progress and self._pending_config_version is not None
+                else self._config_version
+            )
         for peer in heartbeat_targets:
             try:
                 payload = self._request_json(
@@ -2098,7 +2289,7 @@ class ClusterManager:
                         "leader_url": self._advertise_url,
                         "term": self._current_term,
                         "commit_index": current_sequence,
-                        "config_version": self._config_version,
+                        "config_version": heartbeat_config_version,
                     },
                 )
                 peer_term = int(payload.get("term", self._current_term))
@@ -2154,7 +2345,12 @@ class ClusterManager:
         if should_step_down:
             self._step_down_to_candidate("Leader lease expired: majority heartbeat quorum lost")
 
-    def assert_write_quorum_available(self, current_sequence_override: Optional[int] = None) -> None:
+    def assert_write_quorum_available(
+        self,
+        current_sequence_override: Optional[int] = None,
+        *,
+        allow_reconfig_in_progress: bool = False,
+    ) -> None:
         """Reject writes when the leader cannot reach a majority of peers."""
         if self._role != "leader" or not self._require_write_quorum:
             return
@@ -2166,7 +2362,7 @@ class ClusterManager:
         )
         should_step_down = False
         with self._lock:
-            if self._reconfig_in_progress:
+            if self._reconfig_in_progress and not allow_reconfig_in_progress:
                 raise ConflictError(
                     "Write quorum unavailable: cluster reconfiguration is in progress",
                     error="cluster_reconfig_in_progress",
@@ -2496,6 +2692,7 @@ class ClusterManager:
         term: int,
         start_sequence: int,
         count: int,
+        config_version: Optional[int] = None,
     ) -> None:
         """Best-effort release of follower reservations after a failed prepare quorum."""
         for peer in peers:
@@ -2506,7 +2703,11 @@ class ClusterManager:
                     {
                         "leader_id": self._node_id,
                         "term": term,
-                        "config_version": self._config_version,
+                        "config_version": (
+                            self._config_version
+                            if config_version is None
+                            else int(config_version)
+                        ),
                         "start_sequence": start_sequence,
                         "count": count,
                     },
@@ -2524,6 +2725,7 @@ class ClusterManager:
         prev_log_term: int,
         commit_term: int,
         watch_fire_records: Optional[List[WatchFireRecord]] = None,
+        config_version: Optional[int] = None,
     ) -> None:
         """Tell followers to apply all appended entries through one commit index."""
         commit_operations = self._coordinator.load_replication_operations_between(
@@ -2541,15 +2743,19 @@ class ClusterManager:
                 payload = self._request_json(
                     f"{peer}/internal/replication/commit",
                     "POST",
-                    {
-                        "leader_id": self._node_id,
-                        "leader_url": self._advertise_url,
-                        "term": term,
-                        "config_version": self._config_version,
-                        "commit_index": commit_index,
-                        "prev_log_index": prev_log_index,
-                        "prev_log_term": prev_log_term,
-                        "commit_term": commit_term,
+                        {
+                            "leader_id": self._node_id,
+                            "leader_url": self._advertise_url,
+                            "term": term,
+                            "config_version": (
+                                self._config_version
+                                if config_version is None
+                                else int(config_version)
+                            ),
+                            "commit_index": commit_index,
+                            "prev_log_index": prev_log_index,
+                            "prev_log_term": prev_log_term,
+                            "commit_term": commit_term,
                         "watch_fires": [
                             record.to_dict()
                             for record in (watch_fire_records or [])
@@ -2654,6 +2860,25 @@ class ClusterManager:
                 healthy_nodes += 1
         return healthy_nodes
 
+    def _append_satisfies_quorum_sets_locked(
+        self,
+        *,
+        appended_peers: List[str],
+        peer_sets: List[List[str]],
+    ) -> bool:
+        """Return True when one append batch satisfies every required config quorum."""
+        appended = set(self._normalize_peer_urls(appended_peers))
+        if not peer_sets:
+            return True
+        for peer_urls in peer_sets:
+            votes = 1
+            for peer in self._normalize_peer_urls(peer_urls):
+                if peer in appended:
+                    votes += 1
+            if votes < self._quorum_size_for_peer_urls_locked(peer_urls):
+                return False
+        return True
+
     def _config_quorum_commit_index_for_peer_urls_locked(
         self,
         *,
@@ -2678,6 +2903,7 @@ class ClusterManager:
         peers: List[str],
         term: int,
         truncate_after: int,
+        config_version: Optional[int] = None,
     ) -> None:
         """Best-effort rollback for uncommitted replicated-log entries."""
         for peer in peers:
@@ -2688,7 +2914,11 @@ class ClusterManager:
                     {
                         "leader_id": self._node_id,
                         "term": term,
-                        "config_version": self._config_version,
+                        "config_version": (
+                            self._config_version
+                            if config_version is None
+                            else int(config_version)
+                        ),
                         "truncate_after": truncate_after,
                     },
                 )
