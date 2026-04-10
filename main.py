@@ -365,6 +365,7 @@ class ClusterStatusResponse(BaseModel):
 class InternalReplicationApplyRequest(BaseModel):
     source_node_id: Optional[str] = None
     source_term: Optional[int] = Field(default=None, ge=0)
+    config_version: int = Field(default=1, ge=1)
     prepared_write: bool = False
     operations: List[Dict[str, Any]] = Field(default_factory=list)
     watch_fires: List[Dict[str, Any]] = Field(default_factory=list)
@@ -376,6 +377,7 @@ class InternalReplicationAppendRequest(BaseModel):
     leader_id: str
     leader_url: Optional[str] = None
     term: int = Field(..., ge=0)
+    config_version: int = Field(default=1, ge=1)
     prev_log_index: int = Field(default=0, ge=0)
     prev_log_term: int = Field(default=0, ge=0)
     operations: List[Dict[str, Any]] = Field(default_factory=list)
@@ -385,6 +387,7 @@ class InternalReplicationPrepareRequest(BaseModel):
     leader_id: str
     leader_url: Optional[str] = None
     term: int = Field(..., ge=0)
+    config_version: int = Field(default=1, ge=1)
     start_sequence: int = Field(..., ge=1)
     count: int = Field(default=1, ge=1)
 
@@ -392,6 +395,7 @@ class InternalReplicationPrepareRequest(BaseModel):
 class InternalReplicationCancelPrepareRequest(BaseModel):
     leader_id: str
     term: int = Field(..., ge=0)
+    config_version: int = Field(default=1, ge=1)
     start_sequence: int = Field(..., ge=1)
     count: int = Field(default=1, ge=1)
 
@@ -408,6 +412,7 @@ class InternalReplicationCommitRequest(BaseModel):
     leader_id: str
     leader_url: Optional[str] = None
     term: int = Field(..., ge=0)
+    config_version: int = Field(default=1, ge=1)
     commit_index: int = Field(default=0, ge=0)
     prev_log_index: int = Field(default=0, ge=0)
     prev_log_term: int = Field(default=0, ge=0)
@@ -420,6 +425,7 @@ class InternalReplicationCommitRequest(BaseModel):
 class InternalReplicationTruncateRequest(BaseModel):
     leader_id: str
     term: int = Field(..., ge=0)
+    config_version: int = Field(default=1, ge=1)
     truncate_after: int = Field(default=0, ge=0)
 
 
@@ -1065,6 +1071,7 @@ async def internal_replication_apply(
     return _require_cluster_manager().apply_replication_batch(
         source_node_id=payload.source_node_id,
         source_term=payload.source_term,
+        config_version=payload.config_version,
         prepared_write=payload.prepared_write,
         operations_payload=payload.operations,
         watch_fires_payload=payload.watch_fires,
@@ -1084,6 +1091,7 @@ async def internal_replication_append(
         leader_id=payload.leader_id,
         leader_url=payload.leader_url,
         term=payload.term,
+        config_version=payload.config_version,
         prev_log_index=payload.prev_log_index,
         prev_log_term=payload.prev_log_term,
         operations_payload=payload.operations,
@@ -1101,6 +1109,7 @@ async def internal_replication_prepare(
         leader_id=payload.leader_id,
         leader_url=payload.leader_url,
         term=payload.term,
+        config_version=payload.config_version,
         start_sequence=payload.start_sequence,
         count=payload.count,
     )
@@ -1116,6 +1125,7 @@ async def internal_replication_cancel_prepare(
     return _require_cluster_manager().receive_cancel_prepare(
         leader_id=payload.leader_id,
         term=payload.term,
+        config_version=payload.config_version,
         start_sequence=payload.start_sequence,
         count=payload.count,
     )
@@ -1132,6 +1142,7 @@ async def internal_replication_commit(
         leader_id=payload.leader_id,
         leader_url=payload.leader_url,
         term=payload.term,
+        config_version=payload.config_version,
         commit_index=payload.commit_index,
         prev_log_index=payload.prev_log_index,
         prev_log_term=payload.prev_log_term,
@@ -1152,6 +1163,7 @@ async def internal_replication_truncate(
     return _require_cluster_manager().receive_truncate(
         leader_id=payload.leader_id,
         term=payload.term,
+        config_version=payload.config_version,
         truncate_after=payload.truncate_after,
     )
 

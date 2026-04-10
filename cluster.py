@@ -313,6 +313,7 @@ class ClusterManager:
         source_node_id: Optional[str],
         source_term: Optional[int],
         operations_payload: List[Dict[str, Any]],
+        config_version: int = 1,
         prepared_write: bool = False,
         watch_fires_payload: Optional[List[Dict[str, Any]]] = None,
         active_watch_commit_index: Optional[int] = None,
@@ -327,6 +328,13 @@ class ClusterManager:
         started_at = time.time()
         with self._lock:
             self._clear_expired_prepare_locked()
+            membership_reason = self._replication_membership_rejection_reason_locked(config_version)
+            if membership_reason is not None:
+                raise ConflictError(
+                    "Replication apply rejected: cluster membership fence blocked the sender",
+                    error=membership_reason,
+                    config_version=self._config_version,
+                )
             if source_term is not None and int(source_term) < self._current_term:
                 raise ConflictError(
                     "Replication apply rejected: stale leader term",
@@ -409,6 +417,7 @@ class ClusterManager:
         prev_log_index: int,
         prev_log_term: int,
         operations_payload: List[Dict[str, Any]],
+        config_version: int = 1,
     ) -> Dict[str, Any]:
         """Durably append a leader batch without applying it yet."""
         operations = [Operation.from_dict(item) for item in operations_payload]
@@ -431,6 +440,18 @@ class ClusterManager:
             with self._lock:
                 local_last_log_index, local_last_log_term = self._coordinator.get_last_replication_position()
                 local_last_applied = self._coordinator.get_stats().get("last_sequence", 0)
+                membership_reason = self._replication_membership_rejection_reason_locked(config_version)
+                if membership_reason is not None:
+                    return {
+                        "accepted": False,
+                        "term": self._current_term,
+                        "node_id": self._node_id,
+                        "last_log_index": local_last_log_index,
+                        "last_log_term": local_last_log_term,
+                        "last_applied": local_last_applied,
+                        "reason": membership_reason,
+                        "config_version": self._config_version,
+                    }
                 if term < self._current_term:
                     return {
                         "accepted": False,
@@ -599,11 +620,22 @@ class ClusterManager:
         watch_fires_payload: Optional[List[Dict[str, Any]]] = None,
         active_watch_commit_index: Optional[int] = None,
         active_watches_payload: Optional[List[Dict[str, Any]]] = None,
+        config_version: int = 1,
     ) -> Dict[str, Any]:
         """Advance a follower commit index and apply durable log entries."""
         apply_mode = False
         with self._prepare_barrier:
             with self._lock:
+                membership_reason = self._replication_membership_rejection_reason_locked(config_version)
+                if membership_reason is not None:
+                    return {
+                        "accepted": False,
+                        "term": self._current_term,
+                        "node_id": self._node_id,
+                        "last_applied": self._coordinator.get_stats().get("last_sequence", 0),
+                        "reason": membership_reason,
+                        "config_version": self._config_version,
+                    }
                 if term < self._current_term:
                     return {
                         "accepted": False,
@@ -765,10 +797,20 @@ class ClusterManager:
         leader_id: str,
         term: int,
         truncate_after: int,
+        config_version: int = 1,
     ) -> Dict[str, Any]:
         """Best-effort rollback of an uncommitted replicated-log tail."""
         with self._prepare_barrier:
             with self._lock:
+                membership_reason = self._replication_membership_rejection_reason_locked(config_version)
+                if membership_reason is not None:
+                    return {
+                        "accepted": False,
+                        "term": self._current_term,
+                        "node_id": self._node_id,
+                        "reason": membership_reason,
+                        "config_version": self._config_version,
+                    }
                 if term < self._current_term:
                     return {
                         "accepted": False,
@@ -815,6 +857,7 @@ class ClusterManager:
         leader_url: Optional[str],
         start_sequence: int,
         count: int = 1,
+        config_version: int = 1,
     ) -> Dict[str, Any]:
         """Reserve the exact next committed sequence range for a leader."""
         if count < 1:
@@ -822,6 +865,17 @@ class ClusterManager:
 
         with self._lock:
             self._clear_expired_prepare_locked()
+            membership_reason = self._replication_membership_rejection_reason_locked(config_version)
+            if membership_reason is not None:
+                return {
+                    "accepted": False,
+                    "term": self._current_term,
+                    "node_id": self._node_id,
+                    "last_applied": self._coordinator.get_stats().get("last_sequence", 0),
+                    "expected_next": self._coordinator.get_stats().get("last_sequence", 0) + 1,
+                    "reason": membership_reason,
+                    "config_version": self._config_version,
+                }
             local_last_applied = self._coordinator.get_stats().get("last_sequence", 0)
             expected_next = local_last_applied + 1
 
@@ -906,9 +960,20 @@ class ClusterManager:
         term: int,
         start_sequence: int,
         count: int = 1,
+        config_version: int = 1,
     ) -> Dict[str, Any]:
         """Best-effort release for a follower-side prepare reservation."""
         with self._lock:
+            membership_reason = self._replication_membership_rejection_reason_locked(config_version)
+            if membership_reason is not None:
+                return {
+                    "cancelled": False,
+                    "term": self._current_term,
+                    "node_id": self._node_id,
+                    "last_applied": self._coordinator.get_stats().get("last_sequence", 0),
+                    "reason": membership_reason,
+                    "config_version": self._config_version,
+                }
             cancelled = (
                 self._prepared_sequence == start_sequence
                 and self._prepared_count == count
@@ -1019,6 +1084,7 @@ class ClusterManager:
                             "leader_id": self._node_id,
                             "leader_url": self._advertise_url,
                             "term": current_term,
+                            "config_version": self._config_version,
                             "prev_log_index": batch_prev_log_index,
                             "prev_log_term": batch_prev_log_term,
                             "operations": [operation.to_dict() for operation in ordered],
@@ -1756,7 +1822,12 @@ class ClusterManager:
             max_lag = max(lag_values) if lag_values else 0
             quorum_commit_index = self._compute_quorum_commit_index_locked(current_sequence)
             leader_lease_expired = self._leader_lease_expired_locked()
-            write_quorum_ready = (1 + healthy_peers) >= self._quorum_size()
+            config_peer_sets = self._config_peer_sets_locked()
+            write_quorum_ready = not self._reconfig_in_progress and all(
+                self._healthy_node_count_for_peer_urls_locked(peer_urls)
+                >= self._quorum_size_for_peer_urls_locked(peer_urls)
+                for peer_urls in config_peer_sets
+            )
             if self._role == "leader" and self._peer_urls:
                 write_quorum_ready = write_quorum_ready and not leader_lease_expired
             return {
@@ -1773,7 +1844,10 @@ class ClusterManager:
                 "voted_for": self._voted_for,
                 "commit_index": current_sequence if self._role != "follower" else self._leader_commit_index,
                 "last_applied": current_sequence,
-                "quorum_size": self._quorum_size(),
+                "quorum_size": max(
+                    self._quorum_size_for_peer_urls_locked(peer_urls)
+                    for peer_urls in config_peer_sets
+                ),
                 "read_only": read_only["read_only"],
                 "read_only_reason": read_only["reason"],
                 "replication_enabled": self._role not in {"standalone", "decommissioned"},
@@ -1965,7 +2039,9 @@ class ClusterManager:
     def _poll_peers_once(self) -> None:
         """Refresh leader-side visibility into follower health and lag."""
         current_sequence = self._coordinator.get_stats().get("last_sequence", 0)
-        for peer in self._peer_urls:
+        with self._lock:
+            poll_targets = self._reconfig_target_peer_urls_locked()
+        for peer in poll_targets:
             try:
                 payload = self._request_json(f"{peer}/internal/replication/state", "GET", None)
                 previous = self._peer_states.get(peer, {})
@@ -2010,7 +2086,9 @@ class ClusterManager:
             return
         current_sequence = self._coordinator.get_stats().get("last_sequence", 0)
         accepted_votes = 1
-        for peer in self._peer_urls:
+        with self._lock:
+            heartbeat_targets = self._reconfig_target_peer_urls_locked()
+        for peer in heartbeat_targets:
             try:
                 payload = self._request_json(
                     f"{peer}/internal/cluster/heartbeat",
@@ -2063,7 +2141,13 @@ class ClusterManager:
                 }
         should_step_down = False
         with self._lock:
-            if accepted_votes >= self._quorum_size():
+            quorum_sets = self._config_peer_sets_locked()
+            has_joint_majority = all(
+                self._healthy_node_count_for_peer_urls_locked(peer_urls)
+                >= self._quorum_size_for_peer_urls_locked(peer_urls)
+                for peer_urls in quorum_sets
+            )
+            if has_joint_majority:
                 self._leader_lease_until = time.time() + self._election_timeout_seconds
             elif self._leader_lease_expired_locked():
                 should_step_down = True
@@ -2216,6 +2300,7 @@ class ClusterManager:
                     {
                         "source_node_id": self._node_id,
                         "source_term": self._current_term,
+                        "config_version": self._config_version,
                         "prepared_write": self._require_write_quorum,
                         "operations": [operation.to_dict()],
                         "watch_fires": [record.to_dict() for record in watch_fire_records],
@@ -2421,6 +2506,7 @@ class ClusterManager:
                     {
                         "leader_id": self._node_id,
                         "term": term,
+                        "config_version": self._config_version,
                         "start_sequence": start_sequence,
                         "count": count,
                     },
@@ -2459,6 +2545,7 @@ class ClusterManager:
                         "leader_id": self._node_id,
                         "leader_url": self._advertise_url,
                         "term": term,
+                        "config_version": self._config_version,
                         "commit_index": commit_index,
                         "prev_log_index": prev_log_index,
                         "prev_log_term": prev_log_term,
@@ -2540,6 +2627,51 @@ class ClusterManager:
             ),
         }
 
+    def _reconfig_target_peer_urls_locked(self) -> List[str]:
+        """Return the peer URLs that matter for the current config transition."""
+        targets = list(self._peer_urls)
+        if self._reconfig_in_progress and self._pending_peer_urls:
+            targets = self._normalize_peer_urls(targets + list(self._pending_peer_urls))
+        return targets
+
+    def _config_peer_sets_locked(self) -> List[List[str]]:
+        """Return the active config peer sets that currently need quorum coverage."""
+        peer_sets = [list(self._peer_urls)]
+        if self._reconfig_in_progress and self._pending_peer_urls:
+            peer_sets.append(list(self._pending_peer_urls))
+        return [self._normalize_peer_urls(peer_urls) for peer_urls in peer_sets]
+
+    def _quorum_size_for_peer_urls_locked(self, peer_urls: List[str]) -> int:
+        """Return the majority size for one specific peer configuration."""
+        node_count = 1 + len(self._normalize_peer_urls(peer_urls))
+        return (node_count // 2) + 1
+
+    def _healthy_node_count_for_peer_urls_locked(self, peer_urls: List[str]) -> int:
+        """Count leader+self plus healthy peers for one specific config."""
+        healthy_nodes = 1
+        for peer in self._normalize_peer_urls(peer_urls):
+            if self._peer_states.get(peer, {}).get("healthy"):
+                healthy_nodes += 1
+        return healthy_nodes
+
+    def _config_quorum_commit_index_for_peer_urls_locked(
+        self,
+        *,
+        current_sequence: int,
+        leader_last_log_index: int,
+        peer_urls: List[str],
+    ) -> int:
+        """Compute the commit index for one specific config's majority."""
+        acked_sequences: List[int] = [leader_last_log_index or current_sequence]
+        for peer in self._normalize_peer_urls(peer_urls):
+            peer_state = self._peer_states.get(peer, {})
+            match_index = peer_state.get("match_index")
+            acked_sequences.append(int(match_index) if isinstance(match_index, int) else 0)
+
+        acked_sequences.sort(reverse=True)
+        quorum_size = self._quorum_size_for_peer_urls_locked(peer_urls)
+        return acked_sequences[quorum_size - 1] if len(acked_sequences) >= quorum_size else 0
+
     def _broadcast_truncate(
         self,
         *,
@@ -2556,6 +2688,7 @@ class ClusterManager:
                     {
                         "leader_id": self._node_id,
                         "term": term,
+                        "config_version": self._config_version,
                         "truncate_after": truncate_after,
                     },
                 )
@@ -2593,14 +2726,15 @@ class ClusterManager:
             return None
 
         leader_last_log_index, _ = self._coordinator.get_last_replication_position()
-        acked_sequences: List[int] = [leader_last_log_index or current_sequence]
-        for peer in self._peer_urls:
-            peer_state = self._peer_states.get(peer, {})
-            match_index = peer_state.get("match_index")
-            acked_sequences.append(int(match_index) if isinstance(match_index, int) else 0)
-
-        acked_sequences.sort(reverse=True)
-        quorum_index = acked_sequences[self._quorum_size() - 1] if len(acked_sequences) >= self._quorum_size() else 0
+        quorum_indexes = [
+            self._config_quorum_commit_index_for_peer_urls_locked(
+                current_sequence=current_sequence,
+                leader_last_log_index=leader_last_log_index,
+                peer_urls=peer_urls,
+            )
+            for peer_urls in self._config_peer_sets_locked()
+        ]
+        quorum_index = min(quorum_indexes) if quorum_indexes else 0
         self._quorum_commit_index = quorum_index
         return quorum_index
 
@@ -2697,6 +2831,14 @@ class ClusterManager:
         if self._pending_config_version is not None:
             allowed_versions.add(int(self._pending_config_version))
         return int(incoming_version) in allowed_versions
+
+    def _replication_membership_rejection_reason_locked(self, config_version: int) -> Optional[str]:
+        """Return a membership-fence rejection reason for replication-plane RPCs."""
+        if self._decommissioned or self._role == "decommissioned":
+            return "decommissioned_node"
+        if not self._config_version_accepts(int(config_version)):
+            return "stale_config_version"
+        return None
 
     def _wait_for_peer_alignment(
         self,
