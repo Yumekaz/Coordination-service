@@ -1,30 +1,14 @@
 # Coordination Service
 
-A coordination engine for hierarchical metadata, session-backed leases, one-shot watches, committed operation history, crash recovery, and leader/follower replication with a durable replicated log, quorum-commit flow, and stronger failover fencing.
+A coordination engine for hierarchical metadata, session-backed leases, one-shot watches, committed operation history, crash recovery, and leader/follower replication with a durable replicated log, quorum-commit flow, leadership handoff, and stronger failover fencing.
 
-`285 tests passing` | `Python + FastAPI + SQLite`
+`306 tests passing` | `Python + FastAPI + SQLite`
 
-## What It Does
+## Operational Playbooks
 
-- Persistent and ephemeral nodes in a hierarchical namespace
-- Session lifecycle with deterministic expiry cleanup
-- Version-guarded writes through `expected_version`
-- Exclusive leases with monotonic fencing tokens
-- One-shot watches with `event_types` filtering
-- Committed operation timeline with per-operation lookup
-- Operation-centric incident reports with blast radius and causality
-- Startup recovery report plus WAL-backed replay
-- Rollback-safe metadata and session persistence paths
-- Read-only follower catch-up from committed leader history
-- Follower divergence detection plus snapshot-based rebuild from the leader
-- Cluster status with role, peer health, and replication lag
-- Leader push replication for lower follower lag
-- Durable append/commit/truncate replication RPCs
-- Optional true write-quorum commit on leaders
-- Term-aware heartbeats plus vote requests with log-freshness checks
-- Durable term/vote persistence across restart
-- Durable replicated-log position persistence across restart
-- Quorum commit index and lag visibility for the leader
+- Leadership handoff: term-aware heartbeats, log-fresh vote checks, and majority fencing keep the active leader honest while followers stay read-only until they catch up.
+- Safe old-leader removal: reconfiguration is staged, committed, and fenced so a removed or stale leader stays out of the write path on restart.
+- Cluster chaos coverage: the test suite covers partitions, rejoin, leader crash timing, divergent tails, snapshot rebuilds, quorum rollback, and reconfiguration failure paths.
 
 ## Current Product Surface
 
@@ -65,6 +49,7 @@ A coordination engine for hierarchical metadata, session-backed leases, one-shot
 
 ### Cluster
 - `GET /api/cluster/status`
+- `POST /api/cluster/transfer-leadership`
 - `GET /internal/replication/operations`
 - `GET /internal/replication/snapshot`
 - `GET /internal/replication/state`
@@ -77,6 +62,7 @@ A coordination engine for hierarchical metadata, session-backed leases, one-shot
 - `POST /internal/replication/apply`
 - `POST /internal/cluster/heartbeat`
 - `POST /internal/cluster/request-vote`
+- `POST /internal/cluster/transfer-leadership`
 
 ### Visualizer
 - `GET /`
@@ -164,7 +150,7 @@ The API listens on the host and port defined in `config.py`.
 .venv\Scripts\python.exe -m pytest -q
 ```
 
-Latest verified local run: `285 passed in 445.62s`.
+Latest verified local run: `306 passed in 584.87s (0:09:44)`.
 
 ## Demos
 
@@ -185,7 +171,7 @@ The `demos/` folder still covers the core scenarios:
 - Atomicity coverage includes metadata writes, session lifecycle failures, and rollback behavior.
 - API coverage includes CAS, lease behavior, watch filtering, operation timeline, incident reporting, recovery reporting, session inventory, replica snapshot rebuilds, and SSE stream snapshots.
 - Integration coverage includes concurrent behavior and recovery scenarios.
-- Cluster coverage includes durable append/commit/truncate flow, quorum rollback on local failure, stale-leader rejection after failover, follower restart replay from the replicated log, replicated watch parity, log-freshness vote checks, leader-lease step-down, and follower divergence snapshot rebuilds.
+- Cluster coverage includes durable append/commit/truncate flow, quorum rollback on local failure, leadership handoff, safe old-leader removal fencing, majority-partition failover, stale-leader rejection after failover, follower restart replay from the replicated log, replicated watch parity, log-freshness vote checks, leader-lease step-down, and follower divergence snapshot rebuilds.
 
 ## Honest Limits
 

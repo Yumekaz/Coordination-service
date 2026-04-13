@@ -16,7 +16,7 @@ import inspect
 import json
 import threading
 import time
-from urllib import parse
+from urllib import error, parse
 from fastapi.testclient import TestClient
 
 # Setup test database path before importing main
@@ -785,6 +785,17 @@ class TestClusterEndpoints:
                     node_url=(payload or {}).get("node_url", ""),
                     phase=(payload or {}).get("phase", ""),
                 )
+            if parsed.path == "/internal/cluster/transfer-leadership":
+                return manager.receive_leadership_transfer(
+                    leader_id=(payload or {})["leader_id"],
+                    leader_url=(payload or {}).get("leader_url"),
+                    term=int((payload or {})["term"]),
+                    config_version=int((payload or {}).get("config_version", 1)),
+                    target_last_applied=int((payload or {}).get("target_last_applied", 0)),
+                    target_last_log_index=int((payload or {}).get("target_last_log_index", 0)),
+                    target_last_log_term=int((payload or {}).get("target_last_log_term", 0)),
+                    timeout_seconds=float((payload or {}).get("timeout_seconds", 5.0)),
+                )
             raise AssertionError(f"Unexpected cluster URL: {url}")
 
         return fake_request_json
@@ -806,6 +817,35 @@ class TestClusterEndpoints:
         assert data["leader_lease_until"] is None
         assert data["leader_lease_expired"] is False
         assert data["leader_contact_stale"] is False
+
+    def test_cluster_transfer_leadership_endpoint_forwards_to_manager(self, client):
+        class StubClusterManager:
+            def transfer_leadership(self, *, target_url: str, timeout_seconds: float = 5.0) -> dict:
+                return {
+                    "status": "transferred",
+                    "leader_id": "node-b",
+                    "leader_url": target_url,
+                    "term": 4,
+                    "config_version": 2,
+                    "previous_leader_id": "leader-a",
+                    "timeout_seconds": timeout_seconds,
+                }
+
+        old_cluster_manager = main.cluster_manager
+        main.cluster_manager = StubClusterManager()
+        try:
+            response = client.post(
+                "/api/cluster/transfer-leadership",
+                json={"target_url": "http://peer-b", "timeout_seconds": 7.5},
+            )
+        finally:
+            main.cluster_manager = old_cluster_manager
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "transferred"
+        assert data["leader_url"] == "http://peer-b"
+        assert data["leader_id"] == "node-b"
 
     def test_follower_catches_up_from_committed_history(self):
         with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as leader_db, tempfile.NamedTemporaryFile(suffix=".db", delete=False) as follower_db:
@@ -2530,6 +2570,340 @@ class TestClusterEndpoints:
             leader.stop()
             follower.stop()
             for db_path in (leader_path, follower_path):
+                try:
+                    os.unlink(db_path)
+                except OSError:
+                    pass
+
+    def test_transfer_leadership_allows_safe_old_leader_removal(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as leader_db, tempfile.NamedTemporaryFile(suffix=".db", delete=False) as follower_b_db, tempfile.NamedTemporaryFile(suffix=".db", delete=False) as follower_c_db:
+            leader_path = leader_db.name
+            follower_b_path = follower_b_db.name
+            follower_c_path = follower_c_db.name
+
+        leader = Coordinator(db_path=leader_path)
+        follower_b = Coordinator(db_path=follower_b_path)
+        follower_c = Coordinator(db_path=follower_c_path)
+        leader.start()
+        follower_b.start()
+        follower_c.start()
+
+        managers: dict[str, ClusterManager] = {}
+        base_router = self._make_cluster_router(managers)
+
+        leader_cluster = ClusterManager(
+            leader,
+            node_id="leader-a",
+            role="leader",
+            peer_urls=["http://peer-b", "http://peer-c"],
+            advertise_url="http://leader-a",
+            require_write_quorum=True,
+            election_timeout_seconds=20.0,
+            request_json=base_router,
+        )
+        follower_b_cluster = ClusterManager(
+            follower_b,
+            node_id="node-b",
+            role="follower",
+            leader_url="http://leader-a",
+            peer_urls=["http://leader-a", "http://peer-c"],
+            advertise_url="http://peer-b",
+            require_write_quorum=True,
+            election_timeout_seconds=20.0,
+            request_json=base_router,
+        )
+        follower_c_cluster = ClusterManager(
+            follower_c,
+            node_id="node-c",
+            role="follower",
+            leader_url="http://leader-a",
+            peer_urls=["http://leader-a", "http://peer-b"],
+            advertise_url="http://peer-c",
+            require_write_quorum=True,
+            election_timeout_seconds=20.0,
+            request_json=base_router,
+        )
+        managers.update(
+            {
+                "http://leader-a": leader_cluster,
+                "http://peer-b": follower_b_cluster,
+                "http://peer-c": follower_c_cluster,
+            }
+        )
+        leader_cluster.start()
+        follower_b_cluster.start()
+        follower_c_cluster.start()
+
+        try:
+            leader_cluster._send_heartbeats_once()
+            leader_cluster._poll_peers_once()
+            session = leader.open_session(30)
+            leader.create("/stable", b"payload", persistent=True)
+            leader_cluster._send_heartbeats_once()
+            leader_cluster._poll_peers_once()
+
+            transfer = leader_cluster.transfer_leadership(target_url="http://peer-b")
+            assert transfer["status"] == "transferred"
+            assert transfer["leader_id"] == "node-b"
+
+            new_leader_status = follower_b_cluster.build_status()
+            assert new_leader_status["role"] == "leader"
+            assert new_leader_status["leader_id"] == "node-b"
+
+            old_leader_status = leader_cluster.build_status()
+            assert old_leader_status["role"] == "follower"
+            assert old_leader_status["leader_id"] == "node-b"
+            assert old_leader_status["read_only"] is True
+
+            with pytest.raises(ForbiddenError) as old_leader_write_exc:
+                leader.open_session(30)
+            assert old_leader_write_exc.value.error == "read_only_replica"
+
+            follower_b_cluster._send_heartbeats_once()
+            follower_b_cluster._poll_peers_once()
+
+            remove_status = follower_b_cluster.reconfigure_cluster(
+                expected_version=1,
+                peer_urls=["http://peer-c"],
+            )
+            assert remove_status["config_version"] == 2
+            assert remove_status["role"] == "leader"
+            assert remove_status["peer_count"] == 1
+
+            removed_status = leader_cluster.build_status()
+            assert removed_status["role"] == "decommissioned"
+            assert removed_status["decommissioned"] is True
+        finally:
+            leader_cluster.stop()
+            follower_b_cluster.stop()
+            follower_c_cluster.stop()
+            leader.stop()
+            follower_b.stop()
+            follower_c.stop()
+            for db_path in (leader_path, follower_b_path, follower_c_path):
+                try:
+                    os.unlink(db_path)
+                except OSError:
+                    pass
+
+    def test_transfer_leadership_rejects_target_that_is_not_fully_caught_up(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as leader_db, tempfile.NamedTemporaryFile(suffix=".db", delete=False) as follower_b_db, tempfile.NamedTemporaryFile(suffix=".db", delete=False) as follower_c_db:
+            leader_path = leader_db.name
+            follower_b_path = follower_b_db.name
+            follower_c_path = follower_c_db.name
+
+        leader = Coordinator(db_path=leader_path)
+        follower_b = Coordinator(db_path=follower_b_path)
+        follower_c = Coordinator(db_path=follower_c_path)
+        leader.start()
+        follower_b.start()
+        follower_c.start()
+
+        managers: dict[str, ClusterManager] = {}
+        base_router = self._make_cluster_router(managers)
+        blocked_edges: set[tuple[str, str]] = {
+            ("http://leader-a", "http://peer-b"),
+            ("http://peer-b", "http://leader-a"),
+        }
+
+        def make_router(source_url: str):
+            def route(url: str, method: str, payload: dict | None):
+                parsed = parse.urlparse(url)
+                target_url = f"{parsed.scheme}://{parsed.netloc}"
+                if (source_url, target_url) in blocked_edges:
+                    raise error.URLError("partitioned")
+                return base_router(url, method, payload)
+
+            return route
+
+        leader_cluster = ClusterManager(
+            leader,
+            node_id="leader-a",
+            role="leader",
+            peer_urls=["http://peer-b", "http://peer-c"],
+            advertise_url="http://leader-a",
+            require_write_quorum=False,
+            request_json=make_router("http://leader-a"),
+        )
+        follower_b_cluster = ClusterManager(
+            follower_b,
+            node_id="node-b",
+            role="follower",
+            leader_url="http://leader-a",
+            peer_urls=["http://leader-a", "http://peer-c"],
+            advertise_url="http://peer-b",
+            request_json=make_router("http://peer-b"),
+        )
+        follower_c_cluster = ClusterManager(
+            follower_c,
+            node_id="node-c",
+            role="follower",
+            leader_url="http://leader-a",
+            peer_urls=["http://leader-a", "http://peer-b"],
+            advertise_url="http://peer-c",
+            request_json=make_router("http://peer-c"),
+        )
+        managers.update(
+            {
+                "http://leader-a": leader_cluster,
+                "http://peer-b": follower_b_cluster,
+                "http://peer-c": follower_c_cluster,
+            }
+        )
+        leader_cluster.start()
+        follower_b_cluster.start()
+        follower_c_cluster.start()
+
+        try:
+            leader_cluster._send_heartbeats_once()
+            leader_cluster._poll_peers_once()
+            leader.open_session(30)
+            leader.create("/fresh", b"payload", persistent=True)
+            leader_cluster._send_heartbeats_once()
+            leader_cluster._poll_peers_once()
+
+            with pytest.raises(ConflictError) as exc_info:
+                leader_cluster.transfer_leadership(target_url="http://peer-b")
+
+            assert exc_info.value.error in {
+                "cluster_transfer_target_unhealthy",
+                "cluster_transfer_target_behind",
+                "cluster_transfer_target_log_behind",
+            }
+        finally:
+            leader_cluster.stop()
+            follower_b_cluster.stop()
+            follower_c_cluster.stop()
+            leader.stop()
+            follower_b.stop()
+            follower_c.stop()
+            for db_path in (leader_path, follower_b_path, follower_c_path):
+                try:
+                    os.unlink(db_path)
+                except OSError:
+                    pass
+
+    def test_majority_partition_elects_new_leader_and_old_leader_stays_fenced_after_heal(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as leader_db, tempfile.NamedTemporaryFile(suffix=".db", delete=False) as follower_b_db, tempfile.NamedTemporaryFile(suffix=".db", delete=False) as follower_c_db:
+            leader_path = leader_db.name
+            follower_b_path = follower_b_db.name
+            follower_c_path = follower_c_db.name
+
+        leader = Coordinator(db_path=leader_path)
+        follower_b = Coordinator(db_path=follower_b_path)
+        follower_c = Coordinator(db_path=follower_c_path)
+        leader.start()
+        follower_b.start()
+        follower_c.start()
+
+        managers: dict[str, ClusterManager] = {}
+        base_router = self._make_cluster_router(managers)
+        blocked_edges: set[tuple[str, str]] = set()
+
+        def make_router(source_url: str):
+            def route(url: str, method: str, payload: dict | None):
+                parsed = parse.urlparse(url)
+                target_url = f"{parsed.scheme}://{parsed.netloc}"
+                if (source_url, target_url) in blocked_edges:
+                    raise error.URLError("partitioned")
+                return base_router(url, method, payload)
+
+            return route
+
+        leader_cluster = ClusterManager(
+            leader,
+            node_id="leader-a",
+            role="leader",
+            peer_urls=["http://peer-b", "http://peer-c"],
+            advertise_url="http://leader-a",
+            require_write_quorum=True,
+            heartbeat_interval_seconds=0.2,
+            election_timeout_seconds=0.4,
+            request_json=make_router("http://leader-a"),
+        )
+        follower_b_cluster = ClusterManager(
+            follower_b,
+            node_id="node-b",
+            role="follower",
+            leader_url="http://leader-a",
+            peer_urls=["http://leader-a", "http://peer-c"],
+            advertise_url="http://peer-b",
+            require_write_quorum=True,
+            heartbeat_interval_seconds=0.2,
+            election_timeout_seconds=0.4,
+            request_json=make_router("http://peer-b"),
+        )
+        follower_c_cluster = ClusterManager(
+            follower_c,
+            node_id="node-c",
+            role="follower",
+            leader_url="http://leader-a",
+            peer_urls=["http://leader-a", "http://peer-b"],
+            advertise_url="http://peer-c",
+            require_write_quorum=True,
+            heartbeat_interval_seconds=0.2,
+            election_timeout_seconds=0.4,
+            request_json=make_router("http://peer-c"),
+        )
+        managers.update(
+            {
+                "http://leader-a": leader_cluster,
+                "http://peer-b": follower_b_cluster,
+                "http://peer-c": follower_c_cluster,
+            }
+        )
+        leader_cluster.start()
+        follower_b_cluster.start()
+        follower_c_cluster.start()
+
+        try:
+            leader_cluster._send_heartbeats_once()
+            leader_cluster._poll_peers_once()
+            leader.open_session(30)
+            leader.create("/before-partition", b"stable", persistent=True)
+            leader_cluster._send_heartbeats_once()
+            leader_cluster._poll_peers_once()
+
+            blocked_edges.update(
+                {
+                    ("http://leader-a", "http://peer-b"),
+                    ("http://leader-a", "http://peer-c"),
+                    ("http://peer-b", "http://leader-a"),
+                    ("http://peer-c", "http://leader-a"),
+                }
+            )
+
+            leader_cluster._leader_lease_until = time.time() - 0.1
+            leader_cluster._send_heartbeats_once()
+            stale_status = leader_cluster.build_status()
+            assert stale_status["role"] == "candidate"
+            leader_cluster.stop()
+
+            follower_b_cluster._last_leader_contact_at = time.time() - 1.0
+            follower_c_cluster._last_leader_contact_at = time.time() - 1.0
+            election = follower_b_cluster.trigger_election()
+            assert election["status"] == "leader"
+
+            blocked_edges.clear()
+            follower_b_cluster._send_heartbeats_once()
+            follower_b_cluster._poll_peers_once()
+
+            healed_old_leader = leader_cluster.build_status()
+            assert healed_old_leader["role"] == "follower"
+            assert healed_old_leader["leader_id"] == "node-b"
+            assert healed_old_leader["read_only"] is True
+
+            with pytest.raises(ForbiddenError) as exc_info:
+                leader.open_session(30)
+            assert exc_info.value.error == "read_only_replica"
+        finally:
+            leader_cluster.stop()
+            follower_b_cluster.stop()
+            follower_c_cluster.stop()
+            leader.stop()
+            follower_b.stop()
+            follower_c.stop()
+            for db_path in (leader_path, follower_b_path, follower_c_path):
                 try:
                     os.unlink(db_path)
                 except OSError:

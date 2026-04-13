@@ -1271,12 +1271,20 @@ class ClusterManager:
                     }
 
                 if term == self._current_term and self._voted_for not in {None, leader_id}:
-                    return {
-                        "accepted": False,
-                        "term": self._current_term,
-                        "node_id": self._node_id,
-                        "last_applied": self._coordinator.get_stats().get("last_sequence", 0),
-                    }
+                    candidate_can_yield = (
+                        self._role == "candidate"
+                        and leader_id != self._node_id
+                        and int(commit_index) >= int(self._leader_commit_index)
+                    )
+                    if not candidate_can_yield:
+                        return {
+                            "accepted": False,
+                            "term": self._current_term,
+                            "node_id": self._node_id,
+                            "last_applied": self._coordinator.get_stats().get("last_sequence", 0),
+                            "reason": "voted_for_other_leader",
+                        }
+                    self._voted_for = leader_id
 
                 if term > self._current_term:
                     self._current_term = term
@@ -1400,6 +1408,230 @@ class ClusterManager:
     def trigger_election(self) -> Dict[str, Any]:
         """Start one leader-election attempt and return the outcome."""
         return self._start_election_once(auto=False)
+
+    def transfer_leadership(
+        self,
+        *,
+        target_url: str,
+        timeout_seconds: float = 5.0,
+    ) -> Dict[str, Any]:
+        """Hand leadership to one healthy, fully caught-up follower."""
+        normalized_target = str(target_url or "").strip().rstrip("/")
+        if not normalized_target:
+            raise ConflictError(
+                "Leadership transfer requires a target follower URL",
+                error="cluster_transfer_missing_target",
+            )
+
+        self._poll_peers_once()
+        current_applied = self._coordinator.get_stats().get("last_sequence", 0)
+        local_last_log_index, local_last_log_term = self._coordinator.get_last_replication_position()
+
+        with self._prepare_barrier:
+            with self._lock:
+                if self._role != "leader":
+                    raise ConflictError(
+                        "Leadership transfer is only allowed on the active leader",
+                        error="cluster_transfer_not_leader",
+                    )
+                if self._reconfig_in_progress:
+                    raise ConflictError(
+                        "Leadership transfer is blocked while cluster reconfiguration is in progress",
+                        error="cluster_reconfig_in_progress",
+                    )
+                if normalized_target not in self._peer_urls:
+                    raise ConflictError(
+                        "Leadership transfer target is not an active cluster peer",
+                        error="cluster_transfer_unknown_target",
+                        peer_url=normalized_target,
+                    )
+                if self._leader_lease_expired_locked():
+                    raise ConflictError(
+                        "Leadership transfer rejected because the leader lease is expired",
+                        error="leader_lease_expired",
+                    )
+                peer_state = self._peer_states.get(normalized_target, {})
+                if not peer_state.get("healthy"):
+                    raise ConflictError(
+                        "Leadership transfer requires a healthy target follower",
+                        error="cluster_transfer_target_unhealthy",
+                        peer_url=normalized_target,
+                    )
+                if int(peer_state.get("last_applied", 0) or 0) < current_applied:
+                    raise ConflictError(
+                        "Leadership transfer requires the target follower to be fully applied",
+                        error="cluster_transfer_target_behind",
+                        peer_url=normalized_target,
+                    )
+                if int(peer_state.get("last_log_index", 0) or 0) != local_last_log_index:
+                    raise ConflictError(
+                        "Leadership transfer requires the target follower to have the full durable log",
+                        error="cluster_transfer_target_log_behind",
+                        peer_url=normalized_target,
+                    )
+                if int(peer_state.get("last_log_term", 0) or 0) != local_last_log_term:
+                    raise ConflictError(
+                        "Leadership transfer requires the target follower log term to match the leader",
+                        error="cluster_transfer_target_term_behind",
+                        peer_url=normalized_target,
+                    )
+                current_term = self._current_term
+                config_version = self._config_version
+                leader_url = self._advertise_url
+
+        payload = self._request_json(
+            f"{normalized_target}/internal/cluster/transfer-leadership",
+            "POST",
+            {
+                "leader_id": self._node_id,
+                "leader_url": leader_url,
+                "term": current_term,
+                "config_version": config_version,
+                "target_last_applied": current_applied,
+                "target_last_log_index": local_last_log_index,
+                "target_last_log_term": local_last_log_term,
+                "timeout_seconds": max(0.5, float(timeout_seconds)),
+            },
+        )
+
+        accepted = bool(payload.get("accepted"))
+        target_term = int(payload.get("term", current_term))
+        target_node_id = payload.get("node_id")
+        if target_term > current_term:
+            self._become_follower(target_term, target_node_id, normalized_target)
+
+        if not accepted or payload.get("status") != "leader":
+            raise ConflictError(
+                "Leadership transfer did not establish a new leader",
+                error="cluster_transfer_failed",
+                detail=payload.get("reason"),
+                target_url=normalized_target,
+                status=payload.get("status"),
+                term=target_term,
+            )
+
+        return {
+            "status": "transferred",
+            "leader_id": target_node_id,
+            "leader_url": normalized_target,
+            "term": target_term,
+            "config_version": int(payload.get("config_version", config_version)),
+            "previous_leader_id": self._node_id,
+        }
+
+    def receive_leadership_transfer(
+        self,
+        *,
+        leader_id: str,
+        leader_url: Optional[str],
+        term: int,
+        config_version: int,
+        target_last_applied: int,
+        target_last_log_index: int,
+        target_last_log_term: int,
+        timeout_seconds: float = 5.0,
+    ) -> Dict[str, Any]:
+        """Attempt an immediate election after a trusted leader handoff request."""
+        with self._prepare_barrier:
+            with self._lock:
+                if self._decommissioned or self._role == "decommissioned":
+                    return {
+                        "accepted": False,
+                        "status": self._role,
+                        "term": self._current_term,
+                        "node_id": self._node_id,
+                        "reason": "decommissioned_node",
+                    }
+                if term < self._current_term:
+                    return {
+                        "accepted": False,
+                        "status": self._role,
+                        "term": self._current_term,
+                        "node_id": self._node_id,
+                        "reason": "stale_term",
+                    }
+                if not self._config_version_accepts(int(config_version)):
+                    return {
+                        "accepted": False,
+                        "status": self._role,
+                        "term": self._current_term,
+                        "node_id": self._node_id,
+                        "reason": "stale_config_version",
+                        "config_version": self._config_version,
+                    }
+                if self._reconfig_in_progress:
+                    return {
+                        "accepted": False,
+                        "status": self._role,
+                        "term": self._current_term,
+                        "node_id": self._node_id,
+                        "reason": "cluster_reconfig_in_progress",
+                    }
+                local_last_applied = self._coordinator.get_stats().get("last_sequence", 0)
+                local_last_log_index, local_last_log_term = self._coordinator.get_last_replication_position()
+                if local_last_applied < int(target_last_applied):
+                    return {
+                        "accepted": False,
+                        "status": self._role,
+                        "term": self._current_term,
+                        "node_id": self._node_id,
+                        "reason": "transfer_target_behind",
+                    }
+                if int(local_last_log_index) != int(target_last_log_index):
+                    return {
+                        "accepted": False,
+                        "status": self._role,
+                        "term": self._current_term,
+                        "node_id": self._node_id,
+                        "reason": "transfer_target_log_behind",
+                    }
+                if int(local_last_log_term) != int(target_last_log_term):
+                    return {
+                        "accepted": False,
+                        "status": self._role,
+                        "term": self._current_term,
+                        "node_id": self._node_id,
+                        "reason": "transfer_target_term_behind",
+                    }
+                self._leader_id = leader_id
+                self._leader_url = leader_url.rstrip("/") if leader_url else self._leader_url
+                self._last_leader_contact_at = time.time()
+
+        election = self._start_election_once(
+            auto=False,
+            minimum_term=int(term) + 1,
+        )
+        if election.get("status") != "leader":
+            return {
+                "accepted": False,
+                "status": election.get("status"),
+                "term": int(election.get("term", self._current_term)),
+                "node_id": self._node_id,
+                "reason": "transfer_election_failed",
+            }
+
+        deadline = time.time() + max(0.5, float(timeout_seconds))
+        while time.time() < deadline:
+            status = self.build_status()
+            if status["role"] == "leader":
+                return {
+                    "accepted": True,
+                    "status": status["role"],
+                    "term": status["current_term"],
+                    "node_id": status["node_id"],
+                    "config_version": status["config_version"],
+                }
+            time.sleep(0.05)
+
+        status = self.build_status()
+        return {
+            "accepted": status["role"] == "leader",
+            "status": status["role"],
+            "term": status["current_term"],
+            "node_id": status["node_id"],
+            "reason": "transfer_timeout",
+            "config_version": status["config_version"],
+        }
 
     def reconfigure_cluster(self, expected_version: int, peer_urls: List[str]) -> Dict[str, Any]:
         """Stage and activate a conservative single-peer add/remove cluster reconfiguration."""
@@ -2402,7 +2634,11 @@ class ClusterManager:
                 )
         self.assert_write_quorum_available()
 
-    def _start_election_once(self, auto: bool = False) -> Dict[str, Any]:
+    def _start_election_once(
+        self,
+        auto: bool = False,
+        minimum_term: Optional[int] = None,
+    ) -> Dict[str, Any]:
         """Run one election round and become leader on majority votes."""
         if self._role == "standalone":
             return {"status": "standalone", "term": self._current_term, "votes": 1}
@@ -2418,7 +2654,10 @@ class ClusterManager:
                 if not self._leader_contact_stale_locked():
                     return {"status": "follower", "term": self._current_term, "votes": 0}
             self._role = "candidate"
-            self._current_term += 1
+            next_term = self._current_term + 1
+            if minimum_term is not None:
+                next_term = max(next_term, int(minimum_term))
+            self._current_term = next_term
             term = self._current_term
             self._voted_for = self._node_id
             self._leader_id = None

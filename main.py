@@ -448,9 +448,25 @@ class InternalClusterConfigureRequest(BaseModel):
     phase: str
 
 
+class InternalLeadershipTransferRequest(BaseModel):
+    leader_id: str
+    leader_url: Optional[str] = None
+    term: int = Field(..., ge=0)
+    config_version: int = Field(..., ge=1)
+    target_last_applied: int = Field(default=0, ge=0)
+    target_last_log_index: int = Field(default=0, ge=0)
+    target_last_log_term: int = Field(default=0, ge=0)
+    timeout_seconds: float = Field(default=5.0, ge=0.5, le=30.0)
+
+
 class ClusterReconfigureRequest(BaseModel):
     expected_version: int = Field(..., ge=1)
     peer_urls: List[str] = Field(default_factory=list)
+
+
+class ClusterTransferLeadershipRequest(BaseModel):
+    target_url: str
+    timeout_seconds: float = Field(default=5.0, ge=0.5, le=30.0)
 
 
 class PathNodeResponse(BaseModel):
@@ -1026,6 +1042,15 @@ async def cluster_reconfigure(request: ClusterReconfigureRequest) -> dict:
     )
 
 
+@app.post("/api/cluster/transfer-leadership")
+async def cluster_transfer_leadership(request: ClusterTransferLeadershipRequest) -> dict:
+    """Hand leadership to one healthy, fully caught-up follower."""
+    return _require_cluster_manager().transfer_leadership(
+        target_url=request.target_url,
+        timeout_seconds=request.timeout_seconds,
+    )
+
+
 @app.get("/internal/replication/operations")
 async def internal_replication_operations(
     request: Request,
@@ -1216,6 +1241,25 @@ async def internal_cluster_configure(
         cluster_urls=payload.cluster_urls,
         node_url=payload.node_url,
         phase=payload.phase,
+    )
+
+
+@app.post("/internal/cluster/transfer-leadership")
+async def internal_cluster_transfer_leadership(
+    request: Request,
+    payload: InternalLeadershipTransferRequest,
+) -> dict:
+    """Trigger one immediate election on a chosen successor."""
+    _require_replication_auth(request)
+    return _require_cluster_manager().receive_leadership_transfer(
+        leader_id=payload.leader_id,
+        leader_url=payload.leader_url,
+        term=payload.term,
+        config_version=payload.config_version,
+        target_last_applied=payload.target_last_applied,
+        target_last_log_index=payload.target_last_log_index,
+        target_last_log_term=payload.target_last_log_term,
+        timeout_seconds=payload.timeout_seconds,
     )
 
 
