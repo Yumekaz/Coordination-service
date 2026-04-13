@@ -4,6 +4,19 @@ A coordination engine for hierarchical metadata, session-backed leases, one-shot
 
 `306 tests passing` | `Python + FastAPI + SQLite`
 
+## Fast First Impression
+
+In under 30 seconds: this is not a toy key-value store. It is a coordination engine with a live control plane that shows committed history, causal incidents, session and lease state, follower lag, recovery reports, and cluster health in one place, so failure behavior is visible instead of hidden.
+
+What makes it memorable is the combination of hard backend behavior and inspectability. You can see why a path disappeared, which session owned it, what the watch and recovery story was, and how the cluster responded.
+
+## Try These Demo Flows
+
+- Open `/`, click `Run Demo`, then watch the committed timeline and inspector populate with real state.
+- Create a session with `+ Session`, create a node with `+ Node`, then click the session card or a timeline event to inspect the causal chain.
+- Open a path incident in the timeline and use the inspector to see blast radius, watch firings, and cleanup details.
+- Use the [`demos/README.md`](demos/README.md) guide for the best run order across crash recovery, locks, leader election, and configuration management.
+
 ## Operational Playbooks
 
 - Leadership handoff: term-aware heartbeats, log-fresh vote checks, and majority fencing keep the active leader honest while followers stay read-only until they catch up.
@@ -154,7 +167,7 @@ Latest verified local run: `306 passed in 584.87s (0:09:44)`.
 
 ## Demos
 
-The `demos/` folder still covers the core scenarios:
+The `demos/` folder covers the core scenarios:
 
 - session timeout and ephemeral cleanup
 - concurrent linearizable clients

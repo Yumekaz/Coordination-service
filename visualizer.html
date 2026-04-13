@@ -6,7 +6,7 @@
     <title>Coordination Service — Control Plane</title>
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%2322c55e'/%3E%3Cpath d='M32 16l16 16-16 16-16-16 16-16z' fill='none' stroke='%230a0a0b' stroke-width='6' stroke-linejoin='round'/%3E%3C/svg%3E">
     <style>
-        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500;600&display=swap');
+        @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&family=Space+Grotesk:wght@400;500;700&display=swap');
         
         * {
             margin: 0;
@@ -15,13 +15,15 @@
         }
         
         :root {
-            --bg-primary: #0a0a0b;
-            --bg-secondary: #111113;
-            --bg-tertiary: #18181b;
-            --border: #27272a;
-            --text-primary: #fafafa;
-            --text-secondary: #a1a1aa;
-            --text-muted: #52525b;
+            --bg-primary: #09090b;
+            --bg-secondary: #101114;
+            --bg-tertiary: #17181d;
+            --border: rgba(148, 163, 184, 0.12);
+            --border-strong: rgba(148, 163, 184, 0.18);
+            --surface: rgba(255, 255, 255, 0.02);
+            --text-primary: #f5f7fa;
+            --text-secondary: #b2b7c4;
+            --text-muted: #6b7280;
             --accent: #22c55e;
             --accent-dim: rgba(34, 197, 94, 0.1);
             --connecting: #f59e0b;
@@ -33,26 +35,50 @@
         }
         
         body {
-            font-family: 'Inter', -apple-system, sans-serif;
-            background: var(--bg-primary);
+            font-family: 'Space Grotesk', -apple-system, sans-serif;
+            background:
+                radial-gradient(circle at top left, rgba(59, 130, 246, 0.12), transparent 28%),
+                radial-gradient(circle at top right, rgba(34, 197, 94, 0.08), transparent 24%),
+                radial-gradient(circle at 30% 90%, rgba(245, 158, 11, 0.05), transparent 22%),
+                var(--bg-primary);
             color: var(--text-primary);
             min-height: 100vh;
             height: 100vh;
             display: grid;
             grid-template-rows: auto minmax(0, 1fr) auto;
             overflow: hidden;
+            position: relative;
+        }
+
+        body::before {
+            content: '';
+            position: fixed;
+            inset: 0;
+            pointer-events: none;
+            background-image:
+                linear-gradient(rgba(255, 255, 255, 0.03) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(255, 255, 255, 0.02) 1px, transparent 1px);
+            background-size: 100% 56px, 56px 100%;
+            mask-image: radial-gradient(circle at center, black 55%, transparent 100%);
+            opacity: 0.08;
+        }
+
+        body > * {
+            position: relative;
+            z-index: 1;
         }
         
         /* Header */
         .header {
             padding: 20px 32px;
-            border-bottom: 1px solid var(--border);
+            border-bottom: 1px solid rgba(148, 163, 184, 0.12);
             display: flex;
             justify-content: space-between;
-            align-items: flex-start;
+            align-items: center;
             gap: 24px;
             flex-wrap: wrap;
-            background: var(--bg-secondary);
+            background: rgba(10, 11, 14, 0.78);
+            backdrop-filter: blur(18px);
         }
         
         .header-left {
@@ -94,8 +120,8 @@
         }
         
         .logo-text {
-            font-weight: 600;
-            font-size: 16px;
+            font-weight: 650;
+            font-size: 17px;
             letter-spacing: -0.02em;
         }
         
@@ -169,20 +195,21 @@
         
         .btn {
             font-family: inherit;
-            padding: 8px 16px;
-            border-radius: 6px;
+            padding: 10px 16px;
+            border-radius: 10px;
             font-size: 13px;
             font-weight: 500;
             cursor: pointer;
             transition: all 0.15s ease;
-            border: 1px solid var(--border);
-            background: var(--bg-tertiary);
+            border: 1px solid var(--border-strong);
+            background: linear-gradient(180deg, rgba(255, 255, 255, 0.03), rgba(255, 255, 255, 0.01)), var(--bg-tertiary);
             color: var(--text-primary);
             white-space: nowrap;
         }
         
         .btn:hover {
-            background: var(--border);
+            background: rgba(255, 255, 255, 0.07);
+            transform: translateY(-1px);
         }
 
         .btn:disabled {
@@ -191,9 +218,10 @@
         }
         
         .btn-primary {
-            background: var(--accent);
+            background: linear-gradient(180deg, rgba(255, 255, 255, 0.08), transparent), var(--accent);
             border-color: var(--accent);
             color: var(--bg-primary);
+            box-shadow: 0 10px 24px rgba(34, 197, 94, 0.16);
         }
         
         .btn-primary:hover {
@@ -214,17 +242,183 @@
         /* Main Layout */
         .main {
             display: grid;
-            grid-template-columns: minmax(280px, 0.92fr) minmax(360px, 1.08fr) minmax(300px, 0.9fr);
-            gap: 1px;
-            background: var(--border);
+            grid-template-rows: auto minmax(0, 1fr);
+            gap: 16px;
+            padding: 16px 20px 0;
             min-height: 0;
             overflow: hidden;
             width: 100%;
             max-width: 100vw;
         }
+
+        .hero {
+            display: grid;
+            grid-template-columns: minmax(0, 1.25fr) minmax(300px, 0.85fr);
+            gap: 16px;
+            padding: 20px 22px;
+            border: 1px solid rgba(148, 163, 184, 0.14);
+            border-radius: 24px;
+            background:
+                linear-gradient(135deg, rgba(59, 130, 246, 0.14), rgba(59, 130, 246, 0.02) 42%, rgba(34, 197, 94, 0.04)),
+                rgba(13, 15, 19, 0.86);
+            box-shadow: 0 24px 60px rgba(0, 0, 0, 0.32);
+            backdrop-filter: blur(16px);
+            min-width: 0;
+        }
+
+        .hero-copy {
+            min-width: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            justify-content: center;
+        }
+
+        .hero-kicker {
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.16em;
+            color: var(--text-muted);
+        }
+
+        .hero-title {
+            font-size: clamp(24px, 2.6vw, 40px);
+            line-height: 1.02;
+            letter-spacing: -0.04em;
+            font-weight: 650;
+            max-width: 13ch;
+        }
+
+        .hero-summary {
+            font-size: 14px;
+            line-height: 1.65;
+            color: var(--text-secondary);
+            max-width: 62ch;
+        }
+
+        .hero-chips {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            min-width: 0;
+        }
+
+        .hero-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 7px 10px;
+            border-radius: 999px;
+            border: 1px solid rgba(148, 163, 184, 0.16);
+            background: rgba(255, 255, 255, 0.03);
+            color: var(--text-secondary);
+            font-size: 11px;
+            line-height: 1;
+        }
+
+        .hero-chip strong {
+            color: var(--text-primary);
+            font-weight: 600;
+        }
+
+        .hero-plan {
+            border: 1px solid rgba(148, 163, 184, 0.14);
+            border-radius: 20px;
+            background: rgba(17, 17, 19, 0.66);
+            padding: 16px;
+            min-width: 0;
+        }
+
+        .hero-plan-label {
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.16em;
+            color: var(--text-muted);
+            margin-bottom: 12px;
+        }
+
+        .hero-steps {
+            display: grid;
+            gap: 10px;
+        }
+
+        .hero-step {
+            padding: 12px;
+            border-radius: 14px;
+            border: 1px solid rgba(148, 163, 184, 0.12);
+            background: linear-gradient(180deg, rgba(255, 255, 255, 0.03), rgba(255, 255, 255, 0.01));
+            min-width: 0;
+        }
+
+        .hero-step.done {
+            border-color: rgba(34, 197, 94, 0.24);
+            background: linear-gradient(180deg, rgba(34, 197, 94, 0.08), rgba(255, 255, 255, 0.02));
+        }
+
+        .hero-step-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+            margin-bottom: 8px;
+        }
+
+        .hero-step-index {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 22px;
+            height: 22px;
+            border-radius: 999px;
+            background: rgba(255, 255, 255, 0.04);
+            color: var(--text-primary);
+            font-size: 11px;
+            font-weight: 600;
+            flex: 0 0 auto;
+        }
+
+        .hero-step-tag {
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: 0.12em;
+            color: var(--text-muted);
+        }
+
+        .hero-step.done .hero-step-tag {
+            color: var(--accent);
+        }
+
+        .hero-step-title {
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text-primary);
+            margin-bottom: 3px;
+        }
+
+        .hero-step-copy {
+            font-size: 12px;
+            line-height: 1.55;
+            color: var(--text-secondary);
+        }
+
+        .panels {
+            display: grid;
+            grid-template-columns: minmax(280px, 0.92fr) minmax(360px, 1.08fr) minmax(300px, 0.9fr);
+            gap: 1px;
+            background: rgba(148, 163, 184, 0.14);
+            min-height: 0;
+            overflow: hidden;
+            width: 100%;
+            max-width: 100vw;
+            border: 1px solid rgba(148, 163, 184, 0.12);
+            border-radius: 24px;
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.18);
+        }
         
         .panel {
-            background: var(--bg-primary);
+            background: linear-gradient(180deg, rgba(255, 255, 255, 0.01), transparent 18%), var(--bg-primary);
             display: flex;
             flex-direction: column;
             min-height: 0;
@@ -233,12 +427,12 @@
         
         .panel-header {
             padding: 16px 20px;
-            border-bottom: 1px solid var(--border);
+            border-bottom: 1px solid rgba(148, 163, 184, 0.12);
             display: flex;
             justify-content: space-between;
             align-items: center;
             gap: 12px;
-            background: var(--bg-secondary);
+            background: rgba(16, 17, 20, 0.94);
         }
         
         .panel-title {
@@ -252,10 +446,11 @@
         .panel-count {
             font-family: 'JetBrains Mono', monospace;
             font-size: 12px;
-            color: var(--text-muted);
-            background: var(--bg-tertiary);
-            padding: 4px 8px;
-            border-radius: 4px;
+            color: var(--text-secondary);
+            background: rgba(255, 255, 255, 0.04);
+            padding: 5px 10px;
+            border-radius: 999px;
+            border: 1px solid rgba(148, 163, 184, 0.12);
         }
         
         .panel-content {
@@ -845,14 +1040,20 @@
         
         /* Bottom Panel - Sessions */
         .sessions-panel {
-            border-top: 1px solid var(--border);
+            border-top: 1px solid rgba(148, 163, 184, 0.12);
             grid-column: 1 / -1;
-            background: var(--bg-secondary);
+            background:
+                linear-gradient(180deg, rgba(255, 255, 255, 0.01), transparent 20%),
+                rgba(15, 16, 20, 0.94);
             display: grid;
             grid-template-rows: auto minmax(0, 1fr) auto;
-            max-height: 230px;
+            max-height: 240px;
             min-height: 0;
             overflow: hidden;
+            margin: 16px 20px 20px;
+            border: 1px solid rgba(148, 163, 184, 0.12);
+            border-radius: 24px;
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.16);
         }
         
         .sessions-grid {
@@ -863,9 +1064,11 @@
         }
         
         .session-card {
-            background: var(--bg-tertiary);
-            border: 1px solid var(--border);
-            border-radius: 8px;
+            background:
+                linear-gradient(180deg, rgba(255, 255, 255, 0.03), rgba(255, 255, 255, 0.01)),
+                var(--bg-tertiary);
+            border: 1px solid rgba(148, 163, 184, 0.14);
+            border-radius: 14px;
             padding: 14px 16px;
             min-width: 0;
         }
@@ -947,8 +1150,8 @@
             display: flex;
             gap: 24px;
             padding: 12px 20px;
-            background: var(--bg-tertiary);
-            border-top: 1px solid var(--border);
+            background: rgba(255, 255, 255, 0.02);
+            border-top: 1px solid rgba(148, 163, 184, 0.12);
             flex-wrap: wrap;
         }
         
@@ -978,15 +1181,24 @@
             flex-direction: column;
             align-items: center;
             justify-content: center;
-            height: 200px;
+            min-height: 180px;
+            padding: 22px 18px;
+            margin-inline: auto;
+            width: min(100%, 420px);
             color: var(--text-muted);
             font-size: 13px;
+            text-align: center;
+            border: 1px dashed rgba(148, 163, 184, 0.16);
+            border-radius: 18px;
+            background:
+                linear-gradient(180deg, rgba(255, 255, 255, 0.025), rgba(255, 255, 255, 0.01)),
+                rgba(255, 255, 255, 0.01);
         }
         
         .empty-state svg {
-            width: 40px;
-            height: 40px;
-            margin-bottom: 12px;
+            width: 42px;
+            height: 42px;
+            margin-bottom: 14px;
             opacity: 0.3;
         }
         
@@ -1073,7 +1285,7 @@
         }
         
         @media (max-width: 1280px) {
-            .main {
+            .panels {
                 grid-template-columns: minmax(240px, 0.84fr) minmax(320px, 1fr) minmax(280px, 0.9fr);
             }
         }
@@ -1088,12 +1300,18 @@
             }
 
             .main {
+                padding: 16px 16px 0;
+            }
+
+            .hero,
+            .panels {
                 grid-template-columns: 1fr;
                 overflow: visible;
             }
 
             .sessions-panel {
                 max-height: none;
+                margin: 16px 16px 20px;
             }
         }
     </style>
@@ -1126,6 +1344,49 @@
     <div class="toast-stack" id="toastStack" aria-live="polite"></div>
     
     <main class="main">
+        <section class="hero" id="heroPanel" aria-label="Control plane overview">
+            <div class="hero-copy">
+                <div class="hero-kicker">Control plane demo</div>
+                <h1 class="hero-title" id="heroTitle">Start the control plane story.</h1>
+                <div class="hero-summary" id="heroSummary">Open a session, create a node, or run the demo to watch leadership, leases, and recovery settle into a live narrative.</div>
+                <div class="hero-chips" id="heroChips">
+                    <span class="hero-chip"><strong>Connecting</strong> control plane</span>
+                    <span class="hero-chip"><strong>0</strong> ops visible</span>
+                    <span class="hero-chip"><strong>0</strong> live sessions</span>
+                </div>
+            </div>
+            <div class="hero-plan">
+                <div class="hero-plan-label">Launch sequence</div>
+                <div class="hero-steps" id="heroSteps">
+                    <div class="hero-step">
+                        <div class="hero-step-head">
+                            <span class="hero-step-index">1</span>
+                            <span class="hero-step-tag">ready</span>
+                        </div>
+                        <div class="hero-step-title">Open a session</div>
+                        <div class="hero-step-copy">Create a live lease holder so the control plane has something to own.</div>
+                    </div>
+                    <div class="hero-step">
+                        <div class="hero-step-head">
+                            <span class="hero-step-index">2</span>
+                            <span class="hero-step-tag">ready</span>
+                        </div>
+                        <div class="hero-step-title">Add a node</div>
+                        <div class="hero-step-copy">Bind a persistent or ephemeral node and watch the tree respond.</div>
+                    </div>
+                    <div class="hero-step">
+                        <div class="hero-step-head">
+                            <span class="hero-step-index">3</span>
+                            <span class="hero-step-tag">ready</span>
+                        </div>
+                        <div class="hero-step-title">Run the demo</div>
+                        <div class="hero-step-copy">Stage the election story, watches, and failover path in one click.</div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <div class="panels">
         <section class="panel">
             <div class="panel-header">
                 <span class="panel-title">Node Tree</span>
@@ -1137,12 +1398,12 @@
                         <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/>
                         </svg>
-                        <span>No nodes yet. Create one to watch leadership, leases, and watches settle in.</span>
+                        <span>No nodes yet. Start with + Session, then + Node, or run the demo to populate the tree.</span>
                     </div>
                 </div>
             </div>
         </section>
-        
+
         <section class="panel">
             <div class="panel-header">
                 <span class="panel-title">Committed Timeline</span>
@@ -1155,7 +1416,7 @@
                         <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M13 10V3L4 14h7v7l9-11h-7z"/>
                         </svg>
-                        <span>Committed operations will appear here as the cluster moves.</span>
+                        <span>Committed operations will appear here after the first write or demo run.</span>
                     </div>
                 </div>
             </div>
@@ -1171,10 +1432,11 @@
                     <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 12h6m-6 4h6M7 4h10a2 2 0 012 2v12a2 2 0 01-2 2H7a2 2 0 01-2-2V6a2 2 0 012-2z"/>
                     </svg>
-                    <span>Select a session, path, or operation to inspect leadership handoffs and failure stories.</span>
+                    <span>Select a session, path, or operation to inspect leadership handoffs, failure stories, and recoveries.</span>
                 </div>
             </div>
         </section>
+        </div>
     </main>
     
     <section class="sessions-panel">
@@ -1185,7 +1447,7 @@
         <div class="panel-content">
             <div class="sessions-grid" id="sessionsGrid">
                 <div class="empty-state" style="width: 100%;">
-                    <span>No active sessions</span>
+                    <span>No active sessions. Open one to anchor the demo.</span>
                 </div>
             </div>
         </div>
@@ -1293,6 +1555,7 @@
         let streamStates = { operations: false, sessions: false };
         let selectedInspector = { kind: null, key: null, data: null, loading: false, error: null };
         let bootstrapComplete = false;
+        let treeNodeCount = 0;
         const TIMELINE_LIMIT = 20;
         const TIMELINE_FETCH_WINDOW = 80;
         const HIDDEN_TIMELINE_TYPES = new Set(['SESSION_HEARTBEAT', 'SESSION_OPEN', 'SESSION_CLOSE']);
@@ -1323,6 +1586,7 @@
                     refreshClusterStatus()
                 ]);
                 bootstrapComplete = true;
+                renderHero();
                 updateConnectionStatus('connecting', 'Opening live streams...');
             } catch (e) {
                 const hint = window.location.protocol === 'file:'
@@ -1343,6 +1607,7 @@
             document.getElementById('statSessions').textContent = stats.sessions_alive;
             document.getElementById('statWatches').textContent = stats.watches;
             document.getElementById('statOps').textContent = stats.operations;
+            renderHero();
             return stats;
         }
 
@@ -1360,6 +1625,7 @@
             } else {
                 document.getElementById('statClusterLag').textContent = `${clusterStatus.max_replication_lag || 0} ops / q${quorumCommit}`;
             }
+            renderHero();
             return clusterStatus;
         }
 
@@ -1385,6 +1651,73 @@
                 : 'async replication';
             const leaderHealth = role === 'follower' && clusterStatus.leader_contact_stale ? 'leader stale' : 'leader ok';
             return `${role} · term ${term} · ${healthy}/${peers} peers healthy · max lag ${lag} ops · ${quorum} · ${quorumCommitText} · ${leaderHealth}`;
+        }
+
+        function renderHero() {
+            const titleEl = document.getElementById('heroTitle');
+            const summaryEl = document.getElementById('heroSummary');
+            const chipsEl = document.getElementById('heroChips');
+            const stepsEl = document.getElementById('heroSteps');
+            if (!titleEl || !summaryEl || !chipsEl || !stepsEl) {
+                return;
+            }
+
+            const connectionLabel = streamStates.operations || streamStates.sessions
+                ? 'Live'
+                : bootstrapComplete
+                    ? 'Syncing'
+                    : 'Connecting';
+            const role = clusterStatus?.role || 'standalone';
+            const quorumState = clusterStatus?.require_write_quorum
+                ? (clusterStatus.write_quorum_ready ? 'quorum ready' : 'quorum gated')
+                : 'quorum off';
+            const empty = !bootstrapComplete || (treeNodeCount === 0 && sessions.length === 0 && operations.length === 0);
+
+            titleEl.textContent = empty
+                ? 'Start the control plane story.'
+                : 'The control plane is live.';
+            summaryEl.textContent = empty
+                ? 'Open a session, create a node, or run the demo to watch leadership, leases, and recovery settle into a live narrative.'
+                : 'Inspect a session, path, or operation to follow leadership handoffs, quorum commits, and recovery stories without reading raw logs.';
+
+            chipsEl.innerHTML = [
+                `<span class="hero-chip"><strong>${escapeHtml(connectionLabel)}</strong> control plane</span>`,
+                `<span class="hero-chip"><strong>${escapeHtml(role)}</strong> role</span>`,
+                `<span class="hero-chip"><strong>${treeNodeCount}</strong> nodes · <strong>${operations.length}</strong> ops</span>`,
+                `<span class="hero-chip"><strong>${escapeHtml(quorumState)}</strong></span>`,
+            ].join('');
+
+            const stepSpecs = [
+                {
+                    index: '1',
+                    title: 'Open a session',
+                    copy: 'Create a live lease holder so the control plane has something to own.',
+                    done: sessions.length > 0,
+                },
+                {
+                    index: '2',
+                    title: 'Add a node',
+                    copy: 'Bind a persistent or ephemeral node and watch the tree respond.',
+                    done: treeNodeCount > 1,
+                },
+                {
+                    index: '3',
+                    title: 'Run the demo',
+                    copy: 'Stage the election story, watches, and failover path in one click.',
+                    done: operations.length > 0,
+                },
+            ];
+
+            stepsEl.innerHTML = stepSpecs.map(step => `
+                <div class="hero-step ${step.done ? 'done' : ''}">
+                    <div class="hero-step-head">
+                        <span class="hero-step-index">${step.index}</span>
+                        <span class="hero-step-tag">${step.done ? 'done' : 'ready'}</span>
+                    </div>
+                    <div class="hero-step-title">${escapeHtml(step.title)}</div>
+                    <div class="hero-step-copy">${escapeHtml(step.copy)}</div>
+                </div>
+            `).join('');
         }
         
         // Update connection status
@@ -1588,7 +1921,9 @@
             
             const html = renderNode(tree);
             container.innerHTML = html;
+            treeNodeCount = count;
             document.getElementById('nodeCount').textContent = `${count} nodes`;
+            renderHero();
         }
         
         function escapeHtml(value) {
@@ -2691,12 +3026,14 @@
             streamStates[kind] = connected;
             if (streamStates.operations || streamStates.sessions) {
                 updateConnectionStatus('connected', `Live streams active \u00b7 ${formatClusterSummary()}`);
+                renderHero();
                 return;
             }
             updateConnectionStatus(
                 'connecting',
                 bootstrapComplete ? 'Reconnecting live streams...' : 'Waiting for live streams...'
             );
+            renderHero();
         }
 
         function scheduleTreeRefresh() {
@@ -2871,6 +3208,7 @@
             }).join('');
             
             document.getElementById('eventCount').textContent = `${operations.length} ops`;
+            renderHero();
         }
         
         // Session management
@@ -2961,11 +3299,12 @@
             if (sessionList.length === 0) {
                 container.innerHTML = `
                     <div class="empty-state" style="width: 100%;">
-                        <span>No active sessions</span>
+                        <span>No active sessions. Open one to anchor the demo.</span>
                     </div>
                 `;
                 document.getElementById('sessionCount').textContent = '0 sessions';
                 select.innerHTML = '<option value="">No live session</option>';
+                renderHero();
                 return;
             }
             
@@ -3010,6 +3349,7 @@
                     `<option value="${s.session_id}">${s.session_id.slice(0, 8)}...</option>`
                 )
             ].join('');
+            renderHero();
         }
         
         // Create node
