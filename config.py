@@ -22,7 +22,7 @@ WATCH_EVENT_HISTORY_LIMIT = 1000  # bounded in-memory fired-watch history for po
 
 # Server configuration
 HOST = os.environ.get("COORD_HOST", "0.0.0.0")
-PORT = int(os.environ.get("COORD_PORT", "8000"))
+PORT = int(os.environ.get("COORD_PORT", os.environ.get("PORT", "8000")))
 
 # Logging configuration
 LOG_LEVEL = os.environ.get("COORD_LOG_LEVEL", "INFO")

@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: coordination-service
+    runtime: python
+    plan: starter
+    autoDeployTrigger: commit
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    healthCheckPath: /api/stats
+    envVars:
+      - key: COORD_HOST
+        value: 0.0.0.0
+      - key: COORD_PORT
+        value: "10000"
+      - key: COORD_DB_PATH
+        value: /var/data/database.db
+      - key: COORD_LOG_LEVEL
+        value: INFO
+    disk:
+      name: coordination-data
+      mountPath: /var/data
+      sizeGB: 1

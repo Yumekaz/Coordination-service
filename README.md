@@ -157,6 +157,17 @@ If the local environment already exists:
 
 The API listens on the host and port defined in `config.py`.
 
+## Deploy On Render
+
+This repo now includes a `render.yaml` blueprint for a single-node demo deployment on Render with:
+
+- a Python web service
+- `/api/stats` as the health check
+- a persistent disk mounted at `/var/data`
+- `COORD_DB_PATH=/var/data/database.db`
+
+Important: this deployment shape is intentionally single-node. The app uses SQLite plus WAL state, so the public Render deployment should be presented as a live product demo, not a horizontally scaled distributed cluster.
+
 ## Test
 
 ```bash
