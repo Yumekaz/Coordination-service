@@ -85,7 +85,7 @@ class ClusterManager:
         self._recent_apply_events: Deque[Dict[str, Any]] = deque(maxlen=20)
         self._current_term = 0
         self._voted_for: Optional[str] = None
-        self._last_leader_contact_at: Optional[float] = time.time() if self._role == "leader" else None
+        self._last_leader_contact_at: Optional[float] = time.time() if self._role in ("leader", "follower") else None
         self._leader_lease_until: Optional[float] = None
         self._config_version = 1
         self._previous_config_version: Optional[int] = None
@@ -1331,6 +1331,7 @@ class ClusterManager:
         candidate_config_version: int = 1,
     ) -> Dict[str, Any]:
         """Evaluate a vote request from a candidate."""
+        logger.info("[DEBUG] request_vote: node=%s, candidate=%s, term=%s, self._current_term=%s, role=%s", self._node_id, candidate_id, term, self._current_term, self._role)
         apply_mode = False
         with self._prepare_barrier:
             with self._lock:
@@ -2444,7 +2445,11 @@ class ClusterManager:
                     if should_auto_elect:
                         self._start_election_once(auto=True)
                 elif self._role == "candidate":
-                    self._start_election_once(auto=False)
+                    should_retry = False
+                    with self._lock:
+                        should_retry = self._leader_contact_stale_locked()
+                    if should_retry:
+                        self._start_election_once(auto=False)
                 elif self._role == "leader":
                     self._send_heartbeats_once()
                     self._poll_peers_once()
@@ -2640,6 +2645,7 @@ class ClusterManager:
         minimum_term: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Run one election round and become leader on majority votes."""
+        logger.info("[DEBUG] _start_election_once: node=%s, term=%s, minimum_term=%s, auto=%s, role=%s", self._node_id, self._current_term, minimum_term, auto, self._role)
         if self._role == "standalone":
             return {"status": "standalone", "term": self._current_term, "votes": 1}
         if self._role == "decommissioned":
@@ -2654,6 +2660,7 @@ class ClusterManager:
                 if not self._leader_contact_stale_locked():
                     return {"status": "follower", "term": self._current_term, "votes": 0}
             self._role = "candidate"
+            self._last_leader_contact_at = time.time()
             next_term = self._current_term + 1
             if minimum_term is not None:
                 next_term = max(next_term, int(minimum_term))

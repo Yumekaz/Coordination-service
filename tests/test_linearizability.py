@@ -90,8 +90,7 @@ class TestConcurrentWritesOrdered:
         lock = threading.Lock()
         
         def writer(value: int):
-            coordinator.set("/order_test", str(value).encode())
-            node = coordinator.get("/order_test")
+            node = coordinator.set("/order_test", str(value).encode())
             with lock:
                 write_order.append((value, node.version))
         
