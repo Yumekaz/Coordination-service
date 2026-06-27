@@ -3348,7 +3348,11 @@ class ClusterManager:
         payload: Optional[Dict[str, Any]],
     ) -> Dict[str, Any]:
         """Perform a small JSON HTTP request with optional replication auth."""
-        headers = {"Accept": "application/json"}
+        headers = {
+            "Accept": "application/json",
+            "X-FailForge-From": self._node_id,
+            "X-FailForge-MsgType": "replicate",
+        }
         data = None
         if self._replication_token:
             headers[REPLICATION_TOKEN_HEADER] = self._replication_token
