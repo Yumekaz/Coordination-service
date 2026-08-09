@@ -157,6 +157,15 @@ If the local environment already exists:
 
 The API listens on the host and port defined in `config.py`.
 
+By default the API binds to `127.0.0.1` and the visualizer is available at
+`http://127.0.0.1:8000/` (or the equivalent `localhost` URL). Set
+`COORD_HOST` explicitly when exposing it beyond the local machine. For a
+cluster, set the same non-empty `COORD_REPLICATION_TOKEN` on every node;
+clustered startup refuses to run without it. The explicit
+`COORD_ALLOW_INSECURE_REPLICATION=1` override is reserved for isolated local
+testing. Additional browser origins can be allowlisted with the comma-separated
+`COORD_CORS_ORIGINS` environment variable.
+
 ## Deploy On Render
 
 This repo now includes a `render.yaml` blueprint for a single-node demo deployment on Render with:

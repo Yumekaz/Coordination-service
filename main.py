@@ -26,7 +26,13 @@ from cluster import ClusterManager, REPLICATION_TOKEN_HEADER
 from coordinator import Coordinator
 from models import EventType, NodeType, Operation, OperationType
 from logger import get_logger
-from config import HOST, PORT, DEFAULT_SESSION_TIMEOUT, WATCH_WAIT_TIMEOUT
+from config import (
+    HOST,
+    PORT,
+    CORS_ALLOW_ORIGINS,
+    DEFAULT_SESSION_TIMEOUT,
+    WATCH_WAIT_TIMEOUT,
+)
 from errors import ConflictError, ForbiddenError
 
 logger = get_logger("api")
@@ -73,10 +79,13 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Enable CORS for the visualizer
+# The visualizer is same-origin when served from GET /; these explicit local
+# origins also support opening it through localhost or 127.0.0.1 during local
+# development. Override with COORD_CORS_ORIGINS when a different UI origin is
+# deliberately part of the deployment.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ALLOW_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -639,11 +648,20 @@ def _require_cluster_manager() -> ClusterManager:
 
 
 def _require_replication_auth(request: Request) -> None:
-    """Protect internal replication endpoints when a token is configured."""
+    """Require a shared token unless insecure replication was explicitly opted in."""
     manager = _require_cluster_manager()
     token = getattr(manager, "_replication_token", "")
     if not token:
-        return
+        if getattr(manager, "_allow_insecure_replication", False):
+            return
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Replication authentication is not configured; set "
+                "COORD_REPLICATION_TOKEN or explicitly opt into "
+                "COORD_ALLOW_INSECURE_REPLICATION for an isolated local test"
+            ),
+        )
     if request.headers.get(REPLICATION_TOKEN_HEADER) != token:
         raise HTTPException(status_code=403, detail="Invalid replication token")
 

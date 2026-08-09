@@ -45,6 +45,7 @@ class ClusterManager:
         leader_url: Optional[str] = None,
         peer_urls: Optional[List[str]] = None,
         replication_token: str = "",
+        allow_insecure_replication: bool = False,
         poll_interval_seconds: float = 1.0,
         batch_size: int = 128,
         require_write_quorum: bool = False,
@@ -61,6 +62,7 @@ class ClusterManager:
         self._leader_url = leader_url.rstrip("/") if leader_url else None
         self._peer_urls = [peer.rstrip("/") for peer in (peer_urls or []) if peer]
         self._replication_token = replication_token
+        self._allow_insecure_replication = allow_insecure_replication
         self._poll_interval_seconds = max(0.2, float(poll_interval_seconds))
         self._batch_size = max(1, int(batch_size))
         self._require_write_quorum = require_write_quorum
@@ -190,6 +192,9 @@ class ClusterManager:
         peers_raw = os.environ.get("COORD_PEER_URLS", "")
         peer_urls = [item.strip() for item in peers_raw.split(",") if item.strip()]
         token = os.environ.get("COORD_REPLICATION_TOKEN", "")
+        allow_insecure_replication = os.environ.get(
+            "COORD_ALLOW_INSECURE_REPLICATION", ""
+        ).lower() in {"1", "true", "yes", "on"}
         poll_interval = float(os.environ.get("COORD_REPLICATION_POLL_INTERVAL", "1.0"))
         batch_size = int(os.environ.get("COORD_REPLICATION_BATCH_SIZE", "128"))
         require_write_quorum = os.environ.get("COORD_REQUIRE_WRITE_QUORUM", "").lower() in {"1", "true", "yes", "on"}
@@ -198,6 +203,15 @@ class ClusterManager:
         heartbeat_interval = float(os.environ.get("COORD_HEARTBEAT_INTERVAL", "1.0"))
         election_timeout = float(os.environ.get("COORD_ELECTION_TIMEOUT", "3.0"))
         prepare_timeout = float(os.environ.get("COORD_PREPARE_TIMEOUT", "5.0"))
+        clustering_configured = role.lower().strip() != "standalone" or bool(
+            peer_urls or leader_url
+        )
+        if clustering_configured and not token and not allow_insecure_replication:
+            raise RuntimeError(
+                "COORD_REPLICATION_TOKEN is required for clustered mode; "
+                "set COORD_ALLOW_INSECURE_REPLICATION=1 only for an isolated "
+                "local test cluster"
+            )
         return cls(
             coordinator,
             node_id=node_id,
@@ -205,6 +219,7 @@ class ClusterManager:
             leader_url=leader_url,
             peer_urls=peer_urls,
             replication_token=token,
+            allow_insecure_replication=allow_insecure_replication,
             poll_interval_seconds=poll_interval,
             batch_size=batch_size,
             require_write_quorum=require_write_quorum,
