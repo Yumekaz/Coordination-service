@@ -2221,6 +2221,10 @@ class TestClusterEndpoints:
             peer_urls=["http://peer-b"],
             advertise_url="http://leader-a",
             require_write_quorum=True,
+            # Generous lease so background heartbeats cannot be starved past
+            # expiry by CPU contention while the test body runs.
+            heartbeat_interval_seconds=1.0,
+            election_timeout_seconds=60.0,
             request_json=router,
         )
         managers.update(
@@ -2321,6 +2325,10 @@ class TestClusterEndpoints:
             peer_urls=["http://peer-b"],
             advertise_url="http://leader-a",
             require_write_quorum=True,
+            # Generous lease so background heartbeats cannot be starved past
+            # expiry by CPU contention while the test body runs.
+            heartbeat_interval_seconds=1.0,
+            election_timeout_seconds=60.0,
             request_json=router,
         )
         managers.update(
@@ -2947,6 +2955,10 @@ class TestClusterEndpoints:
             peer_urls=["http://peer-b"],
             advertise_url="http://leader-a",
             require_write_quorum=True,
+            # Generous lease so background heartbeats cannot be starved past
+            # expiry by CPU contention while the test body runs.
+            heartbeat_interval_seconds=1.0,
+            election_timeout_seconds=60.0,
             request_json=router,
         )
         managers.update(
@@ -3063,6 +3075,10 @@ class TestClusterEndpoints:
             peer_urls=["http://peer-b"],
             advertise_url="http://leader-a",
             require_write_quorum=True,
+            # Generous lease so background heartbeats cannot be starved past
+            # expiry by CPU contention while the test body runs.
+            heartbeat_interval_seconds=1.0,
+            election_timeout_seconds=60.0,
             request_json=router,
         )
         managers.update(
@@ -3182,6 +3198,10 @@ class TestClusterEndpoints:
             peer_urls=["http://peer-b"],
             advertise_url="http://leader-a",
             require_write_quorum=True,
+            # Generous lease so background heartbeats cannot be starved past
+            # expiry by CPU contention while the test body runs.
+            heartbeat_interval_seconds=1.0,
+            election_timeout_seconds=60.0,
             request_json=router,
         )
         managers.update(
@@ -3338,6 +3358,10 @@ class TestClusterEndpoints:
             peer_urls=["http://peer-b"],
             advertise_url="http://leader-a",
             require_write_quorum=True,
+            # Generous lease so background heartbeats cannot be starved past
+            # expiry by CPU contention while the test body runs.
+            heartbeat_interval_seconds=1.0,
+            election_timeout_seconds=60.0,
             request_json=router,
         )
         managers.update(
@@ -3444,6 +3468,10 @@ class TestClusterEndpoints:
             peer_urls=["http://peer-b"],
             advertise_url="http://leader-a",
             require_write_quorum=True,
+            # Generous lease so background heartbeats cannot be starved past
+            # expiry by CPU contention while the test body runs.
+            heartbeat_interval_seconds=1.0,
+            election_timeout_seconds=60.0,
             request_json=router,
         )
         managers.update(
@@ -3595,6 +3623,10 @@ class TestClusterEndpoints:
             peer_urls=["http://peer-b"],
             advertise_url="http://leader-a",
             require_write_quorum=True,
+            # Generous lease so background heartbeats cannot be starved past
+            # expiry by CPU contention while the test body runs.
+            heartbeat_interval_seconds=1.0,
+            election_timeout_seconds=60.0,
             request_json=router,
         )
         managers.update(
