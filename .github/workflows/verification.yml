@@ -1,0 +1,42 @@
+name: Verification
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  coordination-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.12', '3.14']
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install -r requirements.txt
+      - name: Complete election, handoff, recovery and HTTP suite
+        run: |
+          mkdir -p verification
+          python -m pytest -q -p no:cacheprovider --junitxml=verification/results.xml
+      - name: Require full execution
+        run: |
+          python - <<'PY'
+          import xml.etree.ElementTree as ET
+          root=ET.parse('verification/results.xml').getroot()
+          cases=root.findall('.//testcase')
+          assert len(cases)>=320, f'expected full suite, got {len(cases)}'
+          assert not root.findall('.//skipped'), 'required coordination tests were skipped'
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coordination-python-${{ matrix.python }}
+          path: verification/results.xml
