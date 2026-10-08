@@ -2834,6 +2834,15 @@ class Coordinator:
                 "last_sequence": self._operation_log.current_sequence,
                 "persistence": self._persistence.get_stats(),
             }
+
+    def get_committed_sequence(self) -> int:
+        """Read the operation cursor without acquiring the write lock.
+
+        Cluster state holds its own lock and client writes call back into the
+        cluster while holding the coordinator lock. This cursor read must not
+        acquire those locks in the opposite order.
+        """
+        return self._operation_log.committed_sequence
     
     def verify_consistency(self) -> Tuple[bool, List[str]]:
         """Verify system consistency."""

@@ -722,7 +722,7 @@ async def forbidden_error_handler(request, exc: ForbiddenError) -> JSONResponse:
 # ========== Session Endpoints ==========
 
 @app.post("/api/session/open", response_model=OpenSessionResponse)
-async def open_session(request: OpenSessionRequest) -> OpenSessionResponse:
+def open_session(request: OpenSessionRequest) -> OpenSessionResponse:
     """Open a new client session."""
     try:
         session = coordinator.open_session(request.timeout_seconds)
@@ -733,7 +733,7 @@ async def open_session(request: OpenSessionRequest) -> OpenSessionResponse:
 
 
 @app.post("/api/session/heartbeat", response_model=HeartbeatResponse)
-async def heartbeat(request: HeartbeatRequest) -> HeartbeatResponse:
+def heartbeat(request: HeartbeatRequest) -> HeartbeatResponse:
     """Send a heartbeat for a session."""
     try:
         coordinator.heartbeat(request.session_id)
@@ -745,7 +745,7 @@ async def heartbeat(request: HeartbeatRequest) -> HeartbeatResponse:
 
 
 @app.post("/api/session/close")
-async def close_session(request: HeartbeatRequest) -> dict:
+def close_session(request: HeartbeatRequest) -> dict:
     """Close a session explicitly."""
     session = coordinator.close_session(request.session_id)
     if session is None:
@@ -754,7 +754,7 @@ async def close_session(request: HeartbeatRequest) -> dict:
 
 
 @app.get("/api/sessions", response_model=SessionsResponse)
-async def list_sessions(
+def list_sessions(
     alive_only: bool = Query(default=False, description="Only return alive sessions"),
 ) -> SessionsResponse:
     """List current session inventory for clients and the visualizer."""
@@ -766,7 +766,7 @@ async def list_sessions(
 
 
 @app.get("/api/session/detail", response_model=SessionDetailResponse)
-async def session_detail(
+def session_detail(
     session_id: str = Query(..., description="Session ID"),
     operation_limit: int = Query(default=20, ge=1, le=100),
 ) -> SessionDetailResponse:
@@ -795,7 +795,7 @@ async def session_detail(
 
 
 @app.get("/api/path/detail", response_model=PathDetailResponse)
-async def path_detail(
+def path_detail(
     path: str = Query(..., description="Exact node path"),
     operation_limit: int = Query(default=20, ge=1, le=100),
     watch_limit: int = Query(default=20, ge=1, le=100),
@@ -847,7 +847,7 @@ async def path_detail(
 # ========== Metadata Endpoints ==========
 
 @app.post("/api/node/create", response_model=CreateNodeResponse)
-async def create_node(request: CreateNodeRequest) -> CreateNodeResponse:
+def create_node(request: CreateNodeRequest) -> CreateNodeResponse:
     """Create a new node in the metadata tree."""
     try:
         node = coordinator.create(
@@ -864,7 +864,7 @@ async def create_node(request: CreateNodeRequest) -> CreateNodeResponse:
 
 
 @app.get("/api/node/get", response_model=GetNodeResponse)
-async def get_node(path: str = Query(..., description="Node path")) -> GetNodeResponse:
+def get_node(path: str = Query(..., description="Node path")) -> GetNodeResponse:
     """Get a node's data and metadata."""
     node = coordinator.get(path)
     if node is None:
@@ -881,7 +881,7 @@ async def get_node(path: str = Query(..., description="Node path")) -> GetNodeRe
 
 
 @app.post("/api/node/set", response_model=SetNodeResponse)
-async def set_node(request: SetNodeRequest) -> SetNodeResponse:
+def set_node(request: SetNodeRequest) -> SetNodeResponse:
     """Update a node's data."""
     try:
         node = coordinator.set(
@@ -895,7 +895,7 @@ async def set_node(request: SetNodeRequest) -> SetNodeResponse:
 
 
 @app.delete("/api/node/delete", response_model=DeleteNodeResponse)
-async def delete_node(path: str = Query(..., description="Node path")) -> DeleteNodeResponse:
+def delete_node(path: str = Query(..., description="Node path")) -> DeleteNodeResponse:
     """Delete a node and all its children."""
     try:
         deleted_paths = coordinator.delete(path)
@@ -907,14 +907,14 @@ async def delete_node(path: str = Query(..., description="Node path")) -> Delete
 
 
 @app.get("/api/node/exists", response_model=ExistsResponse)
-async def node_exists(path: str = Query(..., description="Node path")) -> ExistsResponse:
+def node_exists(path: str = Query(..., description="Node path")) -> ExistsResponse:
     """Check if a node exists."""
     exists = coordinator.exists(path)
     return ExistsResponse(exists=exists)
 
 
 @app.get("/api/node/list_children", response_model=ListChildrenResponse)
-async def list_children(path: str = Query(..., description="Parent path")) -> ListChildrenResponse:
+def list_children(path: str = Query(..., description="Parent path")) -> ListChildrenResponse:
     """List the direct children of a node."""
     try:
         children = coordinator.list_children(path)
@@ -926,7 +926,7 @@ async def list_children(path: str = Query(..., description="Parent path")) -> Li
 # ========== Watch Endpoints ==========
 
 @app.post("/api/watch/register", response_model=RegisterWatchResponse)
-async def register_watch(request: RegisterWatchRequest) -> RegisterWatchResponse:
+def register_watch(request: RegisterWatchRequest) -> RegisterWatchResponse:
     """Register a watch on a path."""
     try:
         watch = coordinator.register_watch(
@@ -940,7 +940,7 @@ async def register_watch(request: RegisterWatchRequest) -> RegisterWatchResponse
 
 
 @app.get("/api/watch/wait")
-async def wait_watch(
+def wait_watch(
     watch_id: str = Query(..., description="Watch ID"),
     timeout_seconds: float = Query(default=WATCH_WAIT_TIMEOUT, ge=1, le=300),
 ) -> dict:
@@ -962,7 +962,7 @@ async def wait_watch(
 
 
 @app.delete("/api/watch/unregister")
-async def unregister_watch(watch_id: str = Query(..., description="Watch ID")) -> dict:
+def unregister_watch(watch_id: str = Query(..., description="Watch ID")) -> dict:
     """Unregister a watch."""
     result = coordinator.unregister_watch(watch_id)
     if not result:
@@ -973,7 +973,7 @@ async def unregister_watch(watch_id: str = Query(..., description="Watch ID")) -
 # ========== Lease Endpoints ==========
 
 @app.post("/api/lease/acquire", response_model=LeaseResponse)
-async def acquire_lease(request: AcquireLeaseRequest) -> LeaseResponse:
+def acquire_lease(request: AcquireLeaseRequest) -> LeaseResponse:
     """Acquire an exclusive lease backed by an ephemeral node."""
     lease = coordinator.acquire_lease(
         path=request.path,
@@ -988,7 +988,7 @@ async def acquire_lease(request: AcquireLeaseRequest) -> LeaseResponse:
 
 
 @app.get("/api/lease/get", response_model=LeaseResponse)
-async def get_lease(path: str = Query(..., description="Lease path")) -> LeaseResponse:
+def get_lease(path: str = Query(..., description="Lease path")) -> LeaseResponse:
     """Get the current state of a lease."""
     lease = coordinator.get_lease(path)
     if lease is None:
@@ -997,7 +997,7 @@ async def get_lease(path: str = Query(..., description="Lease path")) -> LeaseRe
 
 
 @app.get("/api/lease/detail", response_model=LeaseDetailResponse)
-async def lease_detail(
+def lease_detail(
     path: str = Query(..., description="Lease path"),
     operation_limit: int = Query(default=20, ge=1, le=100),
 ) -> LeaseDetailResponse:
@@ -1018,14 +1018,14 @@ async def lease_detail(
 
 
 @app.post("/api/lease/release")
-async def release_lease(request: ReleaseLeaseRequest) -> dict:
+def release_lease(request: ReleaseLeaseRequest) -> dict:
     """Release a lease if the caller currently owns it."""
     coordinator.release_lease(request.path, request.session_id)
     return {"status": "released", "path": request.path}
 
 
 @app.post("/api/lease/renew", response_model=LeaseResponse)
-async def renew_lease(request: RenewLeaseRequest) -> LeaseResponse:
+def renew_lease(request: RenewLeaseRequest) -> LeaseResponse:
     """Renew a lease by resetting its independent TTL."""
     lease = coordinator.renew_lease(
         path=request.path,
@@ -1036,7 +1036,7 @@ async def renew_lease(request: RenewLeaseRequest) -> LeaseResponse:
 
 
 @app.get("/api/cluster/status", response_model=ClusterStatusResponse)
-async def cluster_status() -> ClusterStatusResponse:
+def cluster_status() -> ClusterStatusResponse:
     """Return current cluster role, lag, and peer health."""
     status = _require_cluster_manager().build_status()
     return ClusterStatusResponse(
@@ -1052,7 +1052,7 @@ async def cluster_status() -> ClusterStatusResponse:
 
 
 @app.post("/api/cluster/reconfigure")
-async def cluster_reconfigure(request: ClusterReconfigureRequest) -> dict:
+def cluster_reconfigure(request: ClusterReconfigureRequest) -> dict:
     """Stage and activate a conservative single-peer add/remove cluster reconfiguration."""
     return _require_cluster_manager().reconfigure_cluster(
         expected_version=request.expected_version,
@@ -1061,7 +1061,7 @@ async def cluster_reconfigure(request: ClusterReconfigureRequest) -> dict:
 
 
 @app.post("/api/cluster/transfer-leadership")
-async def cluster_transfer_leadership(request: ClusterTransferLeadershipRequest) -> dict:
+def cluster_transfer_leadership(request: ClusterTransferLeadershipRequest) -> dict:
     """Hand leadership to one healthy, fully caught-up follower."""
     return _require_cluster_manager().transfer_leadership(
         target_url=request.target_url,
@@ -1070,7 +1070,7 @@ async def cluster_transfer_leadership(request: ClusterTransferLeadershipRequest)
 
 
 @app.get("/internal/replication/operations")
-async def internal_replication_operations(
+def internal_replication_operations(
     request: Request,
     since_sequence: int = Query(default=0, ge=0),
     limit: int = Query(default=128, ge=1, le=1000),
@@ -1084,28 +1084,28 @@ async def internal_replication_operations(
 
 
 @app.get("/internal/replication/state")
-async def internal_replication_state(request: Request) -> dict:
+def internal_replication_state(request: Request) -> dict:
     """Expose local replication progress for leader peer monitoring."""
     _require_replication_auth(request)
     return _require_cluster_manager().get_internal_state()
 
 
 @app.get("/internal/replication/snapshot")
-async def internal_replication_snapshot(request: Request) -> dict:
+def internal_replication_snapshot(request: Request) -> dict:
     """Expose a committed full-state snapshot for follower bootstrap/rejoin."""
     _require_replication_auth(request)
     return _require_cluster_manager().export_snapshot()
 
 
 @app.get("/internal/replication/watches")
-async def internal_replication_watches(request: Request) -> dict:
+def internal_replication_watches(request: Request) -> dict:
     """Expose active watches so followers can mirror leader watch state."""
     _require_replication_auth(request)
     return _require_cluster_manager().export_active_watches()
 
 
 @app.post("/internal/replication/apply")
-async def internal_replication_apply(
+def internal_replication_apply(
     request: Request,
     payload: InternalReplicationApplyRequest,
 ) -> dict:
@@ -1124,7 +1124,7 @@ async def internal_replication_apply(
 
 
 @app.post("/internal/replication/append")
-async def internal_replication_append(
+def internal_replication_append(
     request: Request,
     payload: InternalReplicationAppendRequest,
 ) -> dict:
@@ -1142,7 +1142,7 @@ async def internal_replication_append(
 
 
 @app.post("/internal/replication/prepare")
-async def internal_replication_prepare(
+def internal_replication_prepare(
     request: Request,
     payload: InternalReplicationPrepareRequest,
 ) -> dict:
@@ -1159,7 +1159,7 @@ async def internal_replication_prepare(
 
 
 @app.post("/internal/replication/cancel-prepare")
-async def internal_replication_cancel_prepare(
+def internal_replication_cancel_prepare(
     request: Request,
     payload: InternalReplicationCancelPrepareRequest,
 ) -> dict:
@@ -1175,7 +1175,7 @@ async def internal_replication_cancel_prepare(
 
 
 @app.post("/internal/replication/commit")
-async def internal_replication_commit(
+def internal_replication_commit(
     request: Request,
     payload: InternalReplicationCommitRequest,
 ) -> dict:
@@ -1197,7 +1197,7 @@ async def internal_replication_commit(
 
 
 @app.post("/internal/replication/truncate")
-async def internal_replication_truncate(
+def internal_replication_truncate(
     request: Request,
     payload: InternalReplicationTruncateRequest,
 ) -> dict:
@@ -1212,7 +1212,7 @@ async def internal_replication_truncate(
 
 
 @app.post("/internal/cluster/heartbeat")
-async def internal_cluster_heartbeat(
+def internal_cluster_heartbeat(
     request: Request,
     payload: InternalHeartbeatRequest,
 ) -> dict:
@@ -1228,7 +1228,7 @@ async def internal_cluster_heartbeat(
 
 
 @app.post("/internal/cluster/request-vote")
-async def internal_cluster_request_vote(
+def internal_cluster_request_vote(
     request: Request,
     payload: InternalVoteRequest,
 ) -> dict:
@@ -1245,7 +1245,7 @@ async def internal_cluster_request_vote(
 
 
 @app.post("/internal/cluster/configure")
-async def internal_cluster_configure(
+def internal_cluster_configure(
     request: Request,
     payload: InternalClusterConfigureRequest,
 ) -> dict:
@@ -1263,7 +1263,7 @@ async def internal_cluster_configure(
 
 
 @app.post("/internal/cluster/transfer-leadership")
-async def internal_cluster_transfer_leadership(
+def internal_cluster_transfer_leadership(
     request: Request,
     payload: InternalLeadershipTransferRequest,
 ) -> dict:
@@ -1284,20 +1284,20 @@ async def internal_cluster_transfer_leadership(
 # ========== Health Endpoints ==========
 
 @app.get("/api/health", response_model=HealthResponse)
-async def health() -> HealthResponse:
+def health() -> HealthResponse:
     """Get the health status of the service."""
     health_data = coordinator.get_health()
     return HealthResponse(**health_data)
 
 
 @app.get("/api/stats")
-async def stats() -> dict:
+def stats() -> dict:
     """Get detailed statistics."""
     return coordinator.get_stats()
 
 
 @app.get("/api/verify")
-async def verify() -> dict:
+def verify() -> dict:
     """Verify system consistency."""
     is_consistent, issues = coordinator.verify_consistency()
     return {
@@ -1307,7 +1307,7 @@ async def verify() -> dict:
 
 
 @app.get("/api/operations", response_model=OperationsResponse)
-async def list_operations(
+def list_operations(
     since_sequence: int = Query(default=0, ge=0),
     limit: int = Query(default=100, ge=1, le=1000),
     operation_types: Optional[List[OperationType]] = Query(default=None),
@@ -1333,7 +1333,7 @@ async def list_operations(
 
 
 @app.get("/api/operations/tail", response_model=OperationsResponse)
-async def tail_operations(
+def tail_operations(
     since_sequence: int = Query(default=0, ge=0),
     timeout_seconds: float = Query(default=WATCH_WAIT_TIMEOUT, ge=0, le=300),
     limit: int = Query(default=100, ge=1, le=1000),
@@ -1363,7 +1363,7 @@ async def tail_operations(
 
 
 @app.get("/api/operations/{sequence_number}", response_model=OperationResponse)
-async def get_operation(sequence_number: int) -> OperationResponse:
+def get_operation(sequence_number: int) -> OperationResponse:
     """Fetch one committed operation by sequence number."""
     operation = coordinator.get_operation(sequence_number)
     if operation is None:
@@ -1372,7 +1372,7 @@ async def get_operation(sequence_number: int) -> OperationResponse:
 
 
 @app.get("/api/operations/{sequence_number}/incident", response_model=OperationIncidentResponse)
-async def get_operation_incident(
+def get_operation_incident(
     sequence_number: int,
     path_limit: int = Query(default=12, ge=1, le=100),
     watch_limit: int = Query(default=50, ge=1, le=200),
@@ -1499,13 +1499,13 @@ async def get_operation_incident(
 
 
 @app.get("/api/operation/detail", response_model=OperationIncidentResponse)
-async def get_operation_incident_legacy(
+def get_operation_incident_legacy(
     sequence_number: int = Query(..., ge=1),
     path_limit: int = Query(default=12, ge=1, le=100),
     watch_limit: int = Query(default=50, ge=1, le=200),
 ) -> OperationIncidentResponse:
     """Legacy alias for operation incident detail used by the visualizer."""
-    return await get_operation_incident(
+    return get_operation_incident(
         sequence_number=sequence_number,
         path_limit=path_limit,
         watch_limit=watch_limit,
@@ -1513,7 +1513,7 @@ async def get_operation_incident_legacy(
 
 
 @app.get("/api/recovery/last")
-async def last_recovery() -> dict:
+def last_recovery() -> dict:
     """Return the most recent startup recovery report."""
     return coordinator.get_last_recovery_stats()
 
@@ -1645,7 +1645,7 @@ async def stream_sessions(
 from fastapi.responses import FileResponse
 
 @app.get("/")
-async def visualizer():
+def visualizer():
     """Serve the visualizer HTML."""
     visualizer_path = os.path.join(os.path.dirname(__file__), "visualizer.html")
     return FileResponse(visualizer_path, media_type="text/html")

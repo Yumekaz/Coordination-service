@@ -36,6 +36,7 @@ class OperationLog:
         self._lock = threading.RLock()
         self._condition = threading.Condition(self._lock)
         self._sequence_number = 0
+        self._committed_sequence = 0
         self._operations: List[Operation] = []
         self._commit_callbacks: List[Callable[[Operation], None]] = []
         logger.info("OperationLog initialized")
@@ -56,6 +57,12 @@ class OperationLog:
         with self._lock:
             self._sequence_number += 1
             return self._sequence_number
+
+    @property
+    def committed_sequence(self) -> int:
+        """Last durable/applicable operation, excluding reserved writes."""
+        with self._lock:
+            return self._committed_sequence
     
     def append(
         self,
@@ -147,6 +154,7 @@ class OperationLog:
         an operation is now safe to observe as committed.
         """
         with self._condition:
+            self._committed_sequence = max(self._committed_sequence, operation.sequence_number)
             callbacks = list(self._commit_callbacks)
             self._condition.notify_all()
 
@@ -177,6 +185,7 @@ class OperationLog:
             self._operations.append(operation)
             if operation.sequence_number > self._sequence_number:
                 self._sequence_number = operation.sequence_number
+            self._committed_sequence = max(self._committed_sequence, operation.sequence_number)
             self._condition.notify_all()
             logger.debug(
                 "Appended external committed op: seq=%s type=%s path=%s",
@@ -227,6 +236,7 @@ class OperationLog:
         """Clear all operations (used for testing and recovery)."""
         with self._lock:
             self._operations.clear()
+            self._committed_sequence = 0
             logger.info("OperationLog cleared")
     
     def restore_sequence(self, sequence_number: int) -> None:
@@ -238,6 +248,7 @@ class OperationLog:
         """
         with self._lock:
             self._sequence_number = sequence_number
+            self._committed_sequence = sequence_number
             logger.info(f"Sequence number restored to {sequence_number}")
     
     def restore_operations(self, operations: List[Operation]) -> None:
@@ -248,6 +259,7 @@ class OperationLog:
         """
         with self._lock:
             self._operations = list(operations)
+            self._committed_sequence = max((op.sequence_number for op in operations), default=0)
             if operations:
                 self._sequence_number = max(op.sequence_number for op in operations)
             logger.info(f"Restored {len(operations)} operations, sequence at {self._sequence_number}")

@@ -2,11 +2,11 @@
 
 A coordination engine for hierarchical metadata, session-backed leases, one-shot watches, committed operation history, crash recovery, and leader/follower replication with a durable replicated log, quorum-commit flow, leadership handoff, and stronger failover fencing.
 
-`306 tests passing` | `Python + FastAPI + SQLite`
+`Python + FastAPI + SQLite` | 320 tests passed in the retained 2026-10-08 local acceptance run.
 
 ## Fast First Impression
 
-In under 30 seconds: this is not a toy key-value store. It is a coordination engine with a live control plane that shows committed history, causal incidents, session and lease state, follower lag, recovery reports, and cluster health in one place, so failure behavior is visible instead of hidden.
+The live control plane shows committed history, causal incidents, session and lease state, follower lag, recovery reports, and cluster health in one place.
 
 What makes it memorable is the combination of hard backend behavior and inspectability. You can see why a path disappeared, which session owned it, what the watch and recovery story was, and how the cluster responded.
 
