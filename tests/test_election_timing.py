@@ -1,6 +1,7 @@
 """Regression coverage for campaign startup and distinct membership votes."""
 import time
 import threading
+import pytest
 
 from cluster import ClusterManager
 
@@ -92,6 +93,46 @@ def test_old_peer_poll_cannot_replace_newer_commit_ack(coordinator):
                              peer_urls=["http://b"], request_json=delayed_poll)
     manager._poll_peers_once()
     assert manager._peer_states["http://b"]["last_applied"] == 7
+
+
+@pytest.mark.parametrize("response_fails", [False, True])
+def test_old_heartbeat_cannot_replace_newer_commit_ack(coordinator, response_fails):
+    manager = None
+
+    def delayed_heartbeat(url, method, payload):
+        # A commit or authoritative poll completes while this earlier
+        # heartbeat response is still in flight. Its stale result must not
+        # make an already-applied peer appear behind during reconfiguration.
+        manager._peer_states["http://b"] = {
+            "healthy": True, "last_applied": 7, "last_log_index": 7,
+            "last_ack_at": time.time() + 0.001,
+        }
+        if response_fails:
+            raise ConnectionError("old heartbeat failed after newer acknowledgement")
+        return {"accepted": True, "term": 0, "node_id": "b", "last_applied": 6,
+                "last_log_index": 6}
+
+    manager = ClusterManager(coordinator, node_id="a", role="leader",
+                             peer_urls=["http://b"], request_json=delayed_heartbeat)
+    manager._send_heartbeats_once()
+    assert manager._peer_states["http://b"]["last_applied"] == 7
+    assert manager._peer_states["http://b"]["last_log_index"] == 7
+    assert manager._peer_states["http://b"]["healthy"] is True
+
+
+def test_fresh_heartbeat_reports_lower_peer_state_instead_of_hiding_it(coordinator):
+    manager = ClusterManager(
+        coordinator, node_id="a", role="leader", peer_urls=["http://b"],
+        request_json=lambda *args: {"accepted": True, "term": 0, "node_id": "b",
+                                   "last_applied": 0, "last_log_index": 0},
+    )
+    manager._peer_states["http://b"] = {
+        "healthy": True, "last_applied": 7, "last_log_index": 7,
+        "last_ack_at": time.time() - 1,
+    }
+    manager._send_heartbeats_once()
+    assert manager._peer_states["http://b"]["last_applied"] == 0
+    assert manager._peer_states["http://b"]["last_log_index"] == 0
 
 
 def test_reserved_operation_does_not_advance_committed_cursor(coordinator):

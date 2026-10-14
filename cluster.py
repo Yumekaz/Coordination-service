@@ -2555,6 +2555,22 @@ class ClusterManager:
                     continue
                 self._peer_states[peer] = observed_state
 
+    def _record_heartbeat_observation(self, peer: str, observation: Dict[str, Any],
+                                      started_at: float, term: int, config_version: int) -> None:
+        """Do not let delayed heartbeat success/failure undo a newer ACK."""
+        with self._lock:
+            effective_config = (
+                int(self._pending_config_version)
+                if self._reconfig_in_progress and self._pending_config_version is not None
+                else self._config_version
+            )
+            if self._role != "leader" or self._current_term != term or effective_config != config_version:
+                return
+            newer_ack = self._peer_states.get(peer, {}).get("last_ack_at") or 0
+            if newer_ack > started_at:
+                return
+            self._peer_states[peer] = observation
+
     def _send_heartbeats_once(self) -> None:
         """Send heartbeats from the leader to all peers."""
         if self._role != "leader":
@@ -2576,6 +2592,7 @@ class ClusterManager:
                 else self._config_version
             )
         for peer in heartbeat_targets:
+            started_at = time.time()
             try:
                 payload = self._request_json(
                     f"{peer}/internal/cluster/heartbeat",
@@ -2599,7 +2616,7 @@ class ClusterManager:
                 last_log_term = int(payload.get("last_log_term", previous.get("last_log_term", 0) or 0))
                 if accepted:
                     accepted_votes += 1
-                self._peer_states[peer] = {
+                observation = {
                     "peer_url": peer,
                     "peer_id": payload.get("node_id"),
                     "role": "follower" if accepted else "unknown",
@@ -2614,8 +2631,11 @@ class ClusterManager:
                     "last_ack_at": time.time() if accepted else None,
                     "last_error": None if accepted else "heartbeat_rejected",
                 }
+                self._record_heartbeat_observation(
+                    peer, observation, started_at, heartbeat_term, heartbeat_config_version,
+                )
             except Exception as exc:
-                self._peer_states[peer] = {
+                observation = {
                     "peer_url": peer,
                     "peer_id": None,
                     "role": "unknown",
@@ -2626,6 +2646,9 @@ class ClusterManager:
                     "last_ack_at": None,
                     "last_error": str(exc),
                 }
+                self._record_heartbeat_observation(
+                    peer, observation, started_at, heartbeat_term, heartbeat_config_version,
+                )
         should_step_down = False
         with self._lock:
             if self._role != "leader" or self._current_term != heartbeat_term:
