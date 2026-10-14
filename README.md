@@ -1,237 +1,161 @@
 # Coordination Service
 
-A coordination engine for hierarchical metadata, session-backed leases, one-shot watches, committed operation history, crash recovery, and leader/follower replication with a durable replicated log, quorum-commit flow, leadership handoff, and stronger failover fencing.
+[![Verification](https://github.com/Yumekaz/Coordination-service/actions/workflows/verification.yml/badge.svg)](https://github.com/Yumekaz/Coordination-service/actions/workflows/verification.yml)
 
-`Python + FastAPI + SQLite` | 320 tests passed in the retained 2026-10-08 local acceptance run.
+**A coordination engine for hierarchical metadata, sessions, leases, watches and observable recovery.**
 
-## Fast First Impression
+The service combines a FastAPI interface with SQLite-backed persistence, committed operation history and optional leader/follower replication. Its live visualizer connects metadata changes to session ownership, watch firings, cleanup cascades and recovery reports.
 
-The live control plane shows committed history, causal incidents, session and lease state, follower lag, recovery reports, and cluster health in one place.
+## Capabilities
 
-What makes it memorable is the combination of hard backend behavior and inspectability. You can see why a path disappeared, which session owned it, what the watch and recovery story was, and how the cluster responded.
+| Area | Behavior |
+| --- | --- |
+| Metadata | Hierarchical nodes, child listing and version-checked updates |
+| Sessions | Heartbeats, expiry and ephemeral ownership cleanup |
+| Leases | Owner-checked acquire/renew/release, independent TTL and queued waiters |
+| Watches | One-shot registrations with event-type filtering |
+| History | Committed sequence history and operation incident inspection |
+| Recovery | WAL replay, session/ephemeral cleanup and startup reports |
+| Cluster mode | Durable replicated log, optional write quorum, leadership handoff and follower catch-up |
+| Visualizer | Live tree, timeline, inspector, session inventory and SSE updates |
 
-## Try These Demo Flows
+It is an independent coordination service, not a drop-in ZooKeeper replacement or a complete Raft implementation.
 
-- Open `/`, click `Run Demo`, then watch the committed timeline and inspector populate with real state.
-- Create a session with `+ Session`, create a node with `+ Node`, then click the session card or a timeline event to inspect the causal chain.
-- Open a path incident in the timeline and use the inspector to see blast radius, watch firings, and cleanup details.
-- Use the [`demos/README.md`](demos/README.md) guide for the best run order across crash recovery, locks, leader election, and configuration management.
+## Quick start: Linux/macOS
 
-## Operational Playbooks
+Use Python **3.12 or 3.14**, the versions covered by CI.
 
-- Leadership handoff: term-aware heartbeats, log-fresh vote checks, and majority fencing keep the active leader honest while followers stay read-only until they catch up.
-- Safe old-leader removal: reconfiguration is staged, committed, and fenced so a removed or stale leader stays out of the write path on restart.
-- Cluster chaos coverage: the test suite covers partitions, rejoin, leader crash timing, divergent tails, snapshot rebuilds, quorum rollback, and reconfiguration failure paths.
+```bash
+git clone https://github.com/Yumekaz/Coordination-service.git
+cd Coordination-service
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements.txt
+python main.py
+```
 
-## Current Product Surface
+Open **http://127.0.0.1:8000/** for the visualizer, or **http://127.0.0.1:8000/docs** for the API reference.
 
-### Metadata
-- `POST /api/node/create`
-- `GET /api/node/get`
-- `POST /api/node/set` with optional `expected_version`
-- `DELETE /api/node/delete`
-- `GET /api/node/exists`
-- `GET /api/node/list_children`
+## Quick start: Windows PowerShell
 
-### Sessions
-- `POST /api/session/open`
-- `POST /api/session/heartbeat`
-- `POST /api/session/close`
-- `GET /api/sessions`
-- `GET /api/stream/sessions`
+After cloning and entering the repository:
 
-### Watches
-- `POST /api/watch/register`
-- `GET /api/watch/wait`
-- `DELETE /api/watch/unregister`
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe main.py
+```
 
-### Leases
-- `POST /api/lease/acquire`
-- `GET /api/lease/get`
-- `POST /api/lease/renew`
-- `POST /api/lease/release`
+Both paths use the repository's default local database. Use a dedicated working directory/database for experiments that intentionally crash processes or manipulate persistence.
 
-### Operations And Recovery
-- `GET /api/operations`
-- `GET /api/operations/tail`
-- `GET /api/operations/{sequence_number}`
-- `GET /api/operations/{sequence_number}/incident`
-- `GET /api/operation/detail`
-- `GET /api/stream/operations`
-- `GET /api/recovery/last`
+## Try the product
 
-### Cluster
-- `GET /api/cluster/status`
-- `POST /api/cluster/transfer-leadership`
-- `GET /internal/replication/operations`
-- `GET /internal/replication/snapshot`
-- `GET /internal/replication/state`
-- `GET /internal/replication/watches`
-- `POST /internal/replication/append`
-- `POST /internal/replication/commit`
-- `POST /internal/replication/truncate`
-- `POST /internal/replication/prepare`
-- `POST /internal/replication/cancel-prepare`
-- `POST /internal/replication/apply`
-- `POST /internal/cluster/heartbeat`
-- `POST /internal/cluster/request-vote`
-- `POST /internal/cluster/transfer-leadership`
+- Click **Run Demo** to populate real committed state and its timeline.
+- Create a session with **+ Session**, then create a node with **+ Node**.
+- Inspect a session or operation to follow ownership and cleanup effects.
+- Open a path incident to see its causal chain, affected paths and watch history.
 
-### Visualizer
-- `GET /`
-- Live node tree
-- Committed operations timeline
-- Operation incident inspector with causal chain, blast radius, and affected paths
-- Startup recovery summary
-- Live session inventory sourced from the backend
-- SSE-driven updates for sessions and operations
+The [demo guide](demos/README.md) covers locks, watches, service discovery, election-style ownership and crash recovery. Demo scenarios demonstrate selected behavior; they are not universal distributed-consensus proofs.
 
 ## Architecture
 
-```text
-HTTP API
-  -> Coordinator
-      -> ClusterManager
-      -> MetadataTree
-      -> SessionManager
-      -> WatchManager
-      -> OperationLog
-      -> Persistence
-      -> RecoveryManager
+The Coordinator serializes local mutations. Persistence succeeds before planned in-memory changes become visible.
+
+```mermaid
+flowchart TD
+    API["HTTP API"] --> Coordinator["Coordinator: serialize and stage mutations"]
+    Coordinator --> Persistence[("SQLite persistence and custom WAL")]
+    Persistence --> State["Metadata, sessions, leases and watches"]
+    State --> History["Committed operation history"]
+    History --> SSE["SSE streams and incident inspector"]
+    SSE --> UI["Live visualizer"]
+    Persistence --> Recovery["Startup recovery and ephemeral cleanup"]
+    Recovery --> State
 ```
 
-The `Coordinator` is the serialization point. Writes are staged, persisted, then applied to in-memory state so persistence failure does not leak partial state into the live tree or session manager.
+Cluster replication is an additional path. In quorum-enabled mode, leader writes use durable replica acknowledgements before local application; commit advancement lets followers apply committed entries.
 
-`OperationLog` now represents committed history, not just provisional intent. The visualizer and history endpoints read from that committed stream, and the control plane now consumes SSE streams instead of polling every second. `RecoveryManager` replays WAL-backed operations on startup, expires old sessions, removes dead ephemerals, clears watches, restores committed history, and only truncates the WAL after successful recovery.
+```mermaid
+flowchart LR
+    Client["Write request"] --> Leader["Leader: stage operation"]
+    Leader -->|Durable append| F1[("Follower log")]
+    Leader -->|Durable append| F2[("Follower log")]
+    F1 --> Majority["Required majority acknowledgement"]
+    F2 --> Majority
+    Leader --> Majority
+    Majority --> Local["Persist local commit"]
+    Local -->|Advance commit| Followers["Leader and followers apply committed history"]
+    Followers --> Reads["Read-only follower state and lag reporting"]
+```
 
-Leases are implemented on top of ephemeral ownership. `lease_token` is derived from committed create order, so downstream consumers can use it as a fencing token.
+This second diagram describes the quorum-enabled cluster path, not the standalone default. Majority heartbeat leases and term/log-freshness checks provide fencing mechanisms, but do not constitute a formal consensus proof.
 
-## Key Behavior
+## Behavior and guarantees
 
-- `expected_version` on `/api/node/set` provides optimistic concurrency control.
-- Stale CAS writes return `409 Conflict`.
-- Lease acquire and release are owner-checked.
-- Lease TTL can be independent from session timeout and can be renewed by the owner.
-- Competing lease waiters are queued in FIFO order instead of racing on delete watches.
-- Watch registration supports `event_types`, so watchers do not fire on unrelated changes.
-- Metadata writes and session mutations roll back cleanly if persistence fails.
-- Session expiry cleanup is rollback-safe.
-- Follower replicas catch up from the leader's committed operation history and can accept pushed replication batches from the leader.
-- Followers detect divergent local history and can rebuild atomically from a leader snapshot instead of staying silently wrong.
-- Snapshot-based follower rebuild preserves persisted watch-fire history for operation incidents after rejoin.
-- Leaders can durably append a write batch to a majority before local apply when write quorum is enabled.
-- Followers keep a durable replicated log and apply entries only after commit advancement.
-- Leaders can roll back uncommitted replicated-log tails when local persistence fails after quorum append.
-- Leaders can optionally reject writes when a quorum of peers is not healthy.
-- Leaders also reject new writes when prior committed operations have not reached a majority yet.
-- Leaders use a majority heartbeat lease and step down when that lease expires.
-- Followers track leader term/contact health and can trigger election attempts when the leader goes stale.
-- Vote requests compare candidate log freshness instead of only comparing last applied sequence.
-- Follower replicas are read-only and report replication lag through `/api/cluster/status`.
-- Follower replicas sync active watches from the leader and preserve watch-fire history and path/session postmortem detail after snapshot rebuild and append/commit replay.
-- `/api/operations` returns committed operations in sequence order.
-- `/api/operations/tail` blocks until a matching committed operation arrives or times out.
-- `/api/stream/operations` streams committed operations as SSE.
-- `/api/stream/sessions` streams live session inventory as SSE.
-- Timeline events can be inspected as first-class incidents with affected-path summaries, watch firings, and cleanup cascades.
-- `/api/recovery/last` exposes the last startup recovery report for the current process.
+- Version-checked updates reject stale CAS writes with `409 Conflict`.
+- Leases are checked against their owner; their tokens derive from committed create order and can be used by downstream consumers for fencing.
+- Watches fire once per registration in the implemented watch state machine; this is not an exactly-once network-delivery guarantee.
+- Failed local persistence does not intentionally expose staged tree/session changes.
+- Recovery replays durable operations, expires old sessions, removes dead ephemerals and records a startup report.
+- Followers remain read-only and catch up from committed history; divergent local histories can be rebuilt from leader snapshots.
+- Quorum-enabled leaders durably append to a majority and distinguish committed history from provisional reservations.
+- Leader heartbeat leases, term-aware messages and log-freshness votes guard the tested handoff/failover paths.
 
-## Setup
+Cluster safety still has explicit boundaries: no complete log-matching/overwrite protocol, no formal joint-consensus membership changes and no claim of production split-brain-proof consensus.
+
+## API map
+
+| Surface | Representative endpoints |
+| --- | --- |
+| Metadata | /api/node/create, /api/node/get, /api/node/set, /api/node/delete, /api/node/list_children |
+| Sessions | /api/session/open, /api/session/heartbeat, /api/session/close, /api/sessions |
+| Watches | /api/watch/register, /api/watch/wait, /api/watch/unregister |
+| Leases | /api/lease/acquire, /api/lease/get, /api/lease/renew, /api/lease/release |
+| History | /api/operations, /api/operations/tail, /api/operations/{sequence_number}/incident |
+| Recovery | /api/recovery/last |
+| Cluster | /api/cluster/status, /api/cluster/transfer-leadership |
+| Streams | /api/stream/operations, /api/stream/sessions |
+
+See the running application's `/docs` page for request schemas and HTTP methods. Internal replication endpoints are a separate, token-protected interface.
+
+## Configuration and security
+
+The default bind address is **127.0.0.1:8000**. Relevant environment variables include:
+
+| Variable | Purpose |
+| --- | --- |
+| COORD_HOST / COORD_PORT | Explicit bind address and port |
+| COORD_DB_PATH | Local SQLite database location |
+| COORD_REPLICATION_TOKEN | Shared, non-empty token required for configured clustering |
+| COORD_CORS_ORIGINS | Additional explicitly allowed browser origins |
+| COORD_LOG_LEVEL | Logging level |
+
+Replication-token protection is not public-client authentication. Keep the admin/API local or provide a separately authenticated, TLS-protected access layer before public exposure. Insecure replication opt-ins are reserved for isolated tests, not normal deployment.
+
+[render.yaml](render.yaml) describes a **single-node demo** with a persistent disk. It is not a horizontally scaled cluster deployment or proof that a public instance has suitable access controls.
+
+## Verification
+
+From an activated Linux/macOS virtual environment:
 
 ```bash
-python -m venv .venv
-.venv\Scripts\pip.exe install -r requirements.txt
+python -m pytest -q
 ```
 
-If the local environment already exists:
+Windows PowerShell:
 
-```bash
-.venv\Scripts\python.exe -m pip install -r requirements.txt
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q
 ```
 
-## Run
+The October 8 retained acceptance run passed **320 tests**. The required [Verification workflow](.github/workflows/verification.yml) runs Python 3.12/3.14, requires the complete suite and rejects prerequisite skips.
 
-```bash
-.venv\Scripts\python.exe main.py
-```
+Coverage includes metadata/session atomicity, WAL recovery, leases, watches, HTTP/SSE behavior, quorum rollback, leadership handoff/removal, stale-leader rejection, follower restart replay and divergent-history rebuilding. [FailForge](https://github.com/Yumekaz/FAILFORGE) adds covered baseline and seeded fault campaigns; its pinned target revisions are recorded separately.
 
-The API listens on the host and port defined in `config.py`.
+See [Cairn's validation record](https://github.com/Yumekaz/Cairn/blob/main/docs/VALIDATION_2026-10.md) for retained cross-project results and scope limits.
 
-By default the API binds to `127.0.0.1` and the visualizer is available at
-`http://127.0.0.1:8000/` (or the equivalent `localhost` URL). Set
-`COORD_HOST` explicitly when exposing it beyond the local machine. For a
-cluster, set the same non-empty `COORD_REPLICATION_TOKEN` on every node;
-clustered startup refuses to run without it. The explicit
-`COORD_ALLOW_INSECURE_REPLICATION=1` override is reserved for isolated local
-testing. Additional browser origins can be allowlisted with the comma-separated
-`COORD_CORS_ORIGINS` environment variable.
+## Source map
 
-## Deploy On Render
+[Coordinator](coordinator.py) · [Metadata tree](metadata_tree.py) · [Sessions](session_manager.py) · [Watches](watch_manager.py) · [Operation history](operation_log.py) · [Persistence](persistence.py) · [Recovery](recovery.py) · [Tests](tests)
 
-This repo now includes a `render.yaml` blueprint for a single-node demo deployment on Render with:
-
-- a Python web service
-- `/api/stats` as the health check
-- a persistent disk mounted at `/var/data`
-- `COORD_DB_PATH=/var/data/database.db`
-
-Important: this deployment shape is intentionally single-node. The app uses SQLite plus WAL state, so the public Render deployment should be presented as a live product demo, not a horizontally scaled distributed cluster.
-
-## Test
-
-```bash
-.venv\Scripts\python.exe -m pytest -q
-```
-
-Latest verified local run: `306 passed in 584.87s (0:09:44)`.
-
-## Demos
-
-The `demos/` folder covers the core scenarios:
-
-- session timeout and ephemeral cleanup
-- concurrent linearizable clients
-- exactly-once watch firing
-- crash recovery
-- distributed lock behavior
-- service discovery
-- leader election
-- configuration management
-
-## Testing And Quality
-
-- Recovery coverage includes WAL-only replay cases for `SET`, recursive delete, and ephemeral create behavior.
-- Atomicity coverage includes metadata writes, session lifecycle failures, and rollback behavior.
-- API coverage includes CAS, lease behavior, watch filtering, operation timeline, incident reporting, recovery reporting, session inventory, replica snapshot rebuilds, and SSE stream snapshots.
-- Integration coverage includes concurrent behavior and recovery scenarios.
-- Cluster coverage includes durable append/commit/truncate flow, quorum rollback on local failure, leadership handoff, safe old-leader removal fencing, majority-partition failover, stale-leader rejection after failover, follower restart replay from the replicated log, replicated watch parity, log-freshness vote checks, leader-lease step-down, and follower divergence snapshot rebuilds.
-
-## Honest Limits
-
-- This is stronger than simple leader/follower replication now: it has a durable replicated log and quorum-commit flow when write quorum is enabled.
-- It is still not full Raft or ZooKeeper-class distributed consensus. There is no general log-matching/overwrite protocol, no formal joint consensus membership changes, and no claim of split-brain-proof production consensus.
-- Leader election and failover are materially harder now because votes consider log freshness and leaders fence themselves with a heartbeat lease, but this is still not a complete consensus proof.
-- Recovery is stronger than before, but it is still SQLite plus a custom WAL underneath.
-- This is not a drop-in ZooKeeper replacement.
-
-## Roadmap
-
-If we keep pushing this as a product, the next high-value steps are:
-
-1. Streaming watch delivery over SSE or WebSocket.
-2. More crash-injection tooling around persistence and recovery boundaries.
-3. Timeline filtering and exportable postmortem snapshots.
-4. More end-to-end examples that show why this is a coordination engine, not a generic key-value store.
-5. Deeper chaos testing and broader follower parity across every observability surface if this graduates further as a distributed system.
-
-## Project Layout
-
-- `coordinator.py` - orchestration and commit contract
-- `metadata_tree.py` - in-memory namespace and delete planning
-- `session_manager.py` - session lifecycle and expiry
-- `watch_manager.py` - watch registration and firing
-- `operation_log.py` - committed sequence history
-- `persistence.py` - SQLite durability and WAL handling
-- `recovery.py` - crash recovery and restart repair
-- `main.py` - FastAPI surface and visualizer entry point
-- `tests/` - unit, API, integration, atomicity, and recovery coverage
+Related projects: [Cairn](https://github.com/Yumekaz/Cairn) uses Mini-Docker/DuraFlow for deployments; Coordination and MiniDB are connected verification targets, not Cairn's production metadata dependencies.
