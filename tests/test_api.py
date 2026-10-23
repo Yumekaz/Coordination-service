@@ -1190,7 +1190,7 @@ class TestClusterEndpoints:
 
         try:
             with manager._lock:
-                manager._leader_lease_until = time.time() - 1
+                manager._leader_lease_deadline_monotonic = time.monotonic() - 1
 
             manager._send_heartbeats_once()
 
@@ -1795,7 +1795,7 @@ class TestClusterEndpoints:
 
         try:
             with leader_cluster._lock:
-                leader_cluster._leader_lease_until = time.time() - 1
+                leader_cluster._leader_lease_deadline_monotonic = time.monotonic() - 1
 
             with pytest.raises(ConflictError) as exc_info:
                 leader.open_session(30)
@@ -1865,7 +1865,7 @@ class TestClusterEndpoints:
                     ["http://peer-b", "http://peer-c", "http://peer-d"],
                     manager._peer_states,
                 )
-                manager._leader_lease_until = time.time() - 1
+                manager._leader_lease_deadline_monotonic = time.monotonic() - 1
                 manager._persist_cluster_state_locked()
 
             manager._send_heartbeats_once()
@@ -2881,14 +2881,14 @@ class TestClusterEndpoints:
                 }
             )
 
-            leader_cluster._leader_lease_until = time.time() - 0.1
+            leader_cluster._leader_lease_deadline_monotonic = time.monotonic() - 0.1
             leader_cluster._send_heartbeats_once()
             stale_status = leader_cluster.build_status()
             assert stale_status["role"] == "candidate"
             leader_cluster.stop()
 
-            follower_b_cluster._last_leader_contact_at = time.time() - 1.0
-            follower_c_cluster._last_leader_contact_at = time.time() - 1.0
+            follower_b_cluster._last_leader_contact_monotonic = time.monotonic() - 1.0
+            follower_c_cluster._last_leader_contact_monotonic = time.monotonic() - 1.0
             election = follower_b_cluster.trigger_election()
             assert election["status"] == "leader"
 

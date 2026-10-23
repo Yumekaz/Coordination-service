@@ -5,6 +5,9 @@ This is not consensus. It is honest multi-node groundwork:
 - leader exposes committed operations
 - follower catches up from leader history
 - cluster status reports role, lag, and peer reachability
+
+Local deadlines, durations, and ACK ordering use monotonic time. Civil-time
+timestamps are observability only; monotonic values never leave this process.
 """
 
 from __future__ import annotations
@@ -93,8 +96,13 @@ class ClusterManager:
         self._current_term = 0
         self._voted_for: Optional[str] = None
         self._last_leader_contact_at: Optional[float] = time.time() if self._role in ("leader", "follower") else None
-        self._election_clock_started_at = time.time()
+        # Runtime clock values are process-local and never persisted or sent.
+        self._last_leader_contact_monotonic: Optional[float] = (
+            time.monotonic() if self._role in ("leader", "follower") else None
+        )
+        self._election_clock_started_monotonic = time.monotonic()
         self._leader_lease_until: Optional[float] = None
+        self._leader_lease_deadline_monotonic: Optional[float] = None
         self._config_version = 1
         self._previous_config_version: Optional[int] = None
         self._previous_peer_urls: List[str] = []
@@ -108,7 +116,7 @@ class ClusterManager:
         self._prepared_count: int = 0
         self._prepared_term: Optional[int] = None
         self._prepared_leader_id: Optional[str] = None
-        self._prepared_expires_at: Optional[float] = None
+        self._prepared_deadline_monotonic: Optional[float] = None
         self._peer_states: Dict[str, Dict[str, Any]] = {
             peer: {
                 "peer_url": peer,
@@ -123,6 +131,7 @@ class ClusterManager:
                 "match_term": 0,
                 "replication_lag": None,
                 "last_ack_at": None,
+                "_last_ack_monotonic": None,
                 "last_error": None,
             }
             for peer in self._peer_urls
@@ -164,8 +173,8 @@ class ClusterManager:
             self._role = "decommissioned"
             self._leader_id = None
             self._leader_url = None
-            self._leader_lease_until = None
-            self._last_leader_contact_at = None
+            self._clear_leader_lease_locked()
+            self._clear_leader_contact_locked()
             self._voted_for = None
 
         should_bootstrap_leader = self._role == "leader" and not (
@@ -176,15 +185,15 @@ class ClusterManager:
             self._role = "follower"
             self._leader_id = None
             self._leader_url = None
-            self._leader_lease_until = None
-            self._last_leader_contact_at = None
+            self._clear_leader_lease_locked()
+            self._clear_leader_contact_locked()
 
         if should_bootstrap_leader:
             self._current_term = max(1, self._current_term + 1)
             self._voted_for = self._node_id
             self._leader_id = self._node_id
             self._leader_url = self._advertise_url or self._leader_url
-            self._leader_lease_until = time.time() + self._election_timeout_seconds
+            self._renew_leader_lease_locked()
 
         self._apply_replica_mode()
         with self._lock:
@@ -250,9 +259,9 @@ class ClusterManager:
             # Coordinator initialization can take longer than an election
             # timeout. Start the election clock when the cluster loop starts,
             # so every newly launched node does not immediately self-vote.
-            self._election_clock_started_at = time.time()
+            self._election_clock_started_monotonic = time.monotonic()
             if self._role in {"follower", "candidate"} and not self._leader_url:
-                self._last_leader_contact_at = self._election_clock_started_at
+                self._record_leader_contact_locked()
             self._sync_commit_callback_locked()
             self._thread = threading.Thread(
                 target=self._loop,
@@ -359,7 +368,7 @@ class ClusterManager:
             WatchFireRecord.from_dict(item)
             for item in (watch_fires_payload or [])
         ]
-        started_at = time.time()
+        started_at = time.monotonic()
         with self._lock:
             self._clear_expired_prepare_locked()
             membership_reason = self._replication_membership_rejection_reason_locked(config_version)
@@ -434,7 +443,7 @@ class ClusterManager:
                 )
             self._last_sync_at = applied_at
             self._last_error = None
-            self._last_leader_contact_at = applied_at
+            self._record_leader_contact_locked()
             self._persist_cluster_state_locked()
             if applied and operations:
                 self._recent_apply_events.appendleft(
@@ -443,7 +452,7 @@ class ClusterManager:
                         "peer_id": source_node_id or self._leader_url or "leader",
                         "status": "applied",
                         "applied_at": applied_at,
-                        "latency_ms": int((applied_at - started_at) * 1000),
+                        "latency_ms": int((time.monotonic() - started_at) * 1000),
                         "applied_count": applied,
                     }
                 )
@@ -581,7 +590,7 @@ class ClusterManager:
                     self._current_term = term
                     self._voted_for = leader_id
                     self._clear_prepare_reservation_locked()
-                    self._leader_lease_until = None
+                    self._clear_leader_lease_locked()
                     if self._role != "standalone":
                         self._role = "follower"
                         apply_mode = True
@@ -635,7 +644,7 @@ class ClusterManager:
                 self._coordinator.append_replication_entries(term, ordered)
                 self._leader_id = leader_id
                 self._leader_url = leader_url.rstrip("/") if leader_url else self._leader_url
-                self._last_leader_contact_at = time.time()
+                self._record_leader_contact_locked()
                 self._persist_cluster_state_locked()
 
                 last_log_index, last_log_term = self._coordinator.get_last_replication_position()
@@ -702,7 +711,7 @@ class ClusterManager:
                     self._current_term = term
                     self._voted_for = leader_id
                     self._clear_prepare_reservation_locked()
-                    self._leader_lease_until = None
+                    self._clear_leader_lease_locked()
                     if self._role != "standalone":
                         self._role = "follower"
                         apply_mode = True
@@ -712,7 +721,7 @@ class ClusterManager:
                 self._leader_id = leader_id
                 self._leader_url = leader_url.rstrip("/") if leader_url else self._leader_url
                 self._leader_commit_index = max(self._leader_commit_index, int(commit_index))
-                self._last_leader_contact_at = time.time()
+                self._record_leader_contact_locked()
                 self._persist_cluster_state_locked()
 
         target_commit = int(commit_index)
@@ -822,7 +831,7 @@ class ClusterManager:
             )
             self._last_sync_at = applied_at
             self._last_error = None
-            self._last_leader_contact_at = applied_at
+            self._record_leader_contact_locked()
             self._persist_cluster_state_locked()
             if applied_count:
                 self._recent_apply_events.appendleft(
@@ -895,7 +904,7 @@ class ClusterManager:
 
                 removed = self._coordinator.truncate_replication_entries_after(int(truncate_after))
                 self._leader_id = leader_id
-                self._last_leader_contact_at = time.time()
+                self._record_leader_contact_locked()
                 self._persist_cluster_state_locked()
                 return {
                     "accepted": True,
@@ -992,12 +1001,12 @@ class ClusterManager:
 
             self._leader_id = leader_id
             self._leader_url = leader_url.rstrip("/") if leader_url else self._leader_url
-            self._last_leader_contact_at = time.time()
+            self._record_leader_contact_locked()
             self._prepared_sequence = start_sequence
             self._prepared_count = count
             self._prepared_term = term
             self._prepared_leader_id = leader_id
-            self._prepared_expires_at = time.time() + self._prepare_timeout_seconds
+            self._prepared_deadline_monotonic = time.monotonic() + self._prepare_timeout_seconds
             self._persist_cluster_state_locked()
 
             response = {
@@ -1158,7 +1167,7 @@ class ClusterManager:
             self._coordinator.append_replication_entries(current_term, ordered)
 
             for peer in target_peers:
-                started_at = time.time()
+                started_at = time.monotonic()
                 try:
                     payload = self._request_json(
                         f"{peer}/internal/replication/append",
@@ -1198,6 +1207,7 @@ class ClusterManager:
                         "match_term": peer_last_log_term if reserved else 0,
                         "replication_lag": max(0, self._coordinator.get_committed_sequence() - last_applied),
                         "last_ack_at": time.time(),
+                        "_last_ack_monotonic": time.monotonic(),
                         "last_error": None if reserved else payload.get("reason", "append_rejected"),
                     }
                     if reserved:
@@ -1208,7 +1218,7 @@ class ClusterManager:
                             "peer_id": payload.get("node_id") or peer,
                             "status": "appended" if reserved else "append_rejected",
                             "applied_at": time.time(),
-                            "latency_ms": int((time.time() - started_at) * 1000),
+                            "latency_ms": int((time.monotonic() - started_at) * 1000),
                             "applied_count": 0,
                         }
                     )
@@ -1326,14 +1336,14 @@ class ClusterManager:
 
                 self._leader_id = leader_id
                 self._leader_url = leader_url.rstrip("/") if leader_url else self._leader_url
-                self._leader_lease_until = None
+                self._clear_leader_lease_locked()
                 self._leader_commit_index = max(self._leader_commit_index, commit_index)
-                self._last_leader_contact_at = time.time()
+                self._record_leader_contact_locked()
                 self._clear_prepare_reservation_locked()
                 if self._role != "standalone":
                     self._role = "follower"
                     apply_mode = True
-                    self._last_leader_contact_at = time.time()
+                    self._record_leader_contact_locked()
                 self._persist_cluster_state_locked()
 
                 response = {
@@ -1347,10 +1357,10 @@ class ClusterManager:
         if apply_mode:
             self._apply_replica_mode()
             with self._lock:
-                self._last_leader_contact_at = time.time()
+                self._record_leader_contact_locked()
         self._sync_active_watches_from_leader()
         with self._lock:
-            self._last_leader_contact_at = time.time()
+            self._record_leader_contact_locked()
         return response
 
     def request_vote(
@@ -1405,7 +1415,7 @@ class ClusterManager:
                     self._voted_for = None
                     self._leader_id = None
                     self._leader_url = None
-                    self._leader_lease_until = None
+                    self._clear_leader_lease_locked()
                     self._clear_prepare_reservation_locked()
                     if self._role != "standalone":
                         self._role = "follower"
@@ -1426,7 +1436,7 @@ class ClusterManager:
                 )
                 if vote_granted:
                     self._voted_for = candidate_id
-                    self._last_leader_contact_at = time.time()
+                    self._record_leader_contact_locked()
                 self._persist_cluster_state_locked()
 
                 response = {
@@ -1629,7 +1639,7 @@ class ClusterManager:
                     }
                 self._leader_id = leader_id
                 self._leader_url = leader_url.rstrip("/") if leader_url else self._leader_url
-                self._last_leader_contact_at = time.time()
+                self._record_leader_contact_locked()
 
         election = self._start_election_once(
             auto=False,
@@ -1644,8 +1654,8 @@ class ClusterManager:
                 "reason": "transfer_election_failed",
             }
 
-        deadline = time.time() + max(0.5, float(timeout_seconds))
-        while time.time() < deadline:
+        deadline = time.monotonic() + max(0.5, float(timeout_seconds))
+        while time.monotonic() < deadline:
             status = self.build_status()
             if status["role"] == "leader":
                 return {
@@ -1958,7 +1968,7 @@ class ClusterManager:
                 if term > self._current_term:
                     self._current_term = term
                     self._voted_for = leader_id
-                    self._leader_lease_until = None
+                    self._clear_leader_lease_locked()
                     self._clear_prepare_reservation_locked()
                     if self._role not in {"standalone", "decommissioned"}:
                         self._role = "follower"
@@ -1977,7 +1987,7 @@ class ClusterManager:
 
                 self._leader_id = leader_id
                 self._leader_url = leader_url.rstrip("/") if leader_url else self._leader_url
-                self._last_leader_contact_at = time.time()
+                self._record_leader_contact_locked()
 
                 if phase_value == "stage":
                     self._decommissioned = False
@@ -2043,8 +2053,8 @@ class ClusterManager:
                     self._voted_for = None
                     self._leader_id = None
                     self._leader_url = None
-                    self._leader_lease_until = None
-                    self._last_leader_contact_at = None
+                    self._clear_leader_lease_locked()
+                    self._clear_leader_contact_locked()
                     self._role = "decommissioned"
                     apply_mode = True
                     self._persist_cluster_state_locked()
@@ -2162,7 +2172,7 @@ class ClusterManager:
                 if next_term > self._current_term:
                     self._current_term = next_term
                     self._voted_for = leader_id
-                    self._leader_lease_until = None
+                    self._clear_leader_lease_locked()
                     self._clear_prepare_reservation_locked()
 
                 self._previous_config_version = int(payload["previous_config_version"])
@@ -2178,7 +2188,7 @@ class ClusterManager:
                     self._peer_states = self._rebuild_peer_states(self._peer_urls, self._peer_states)
                     self._leader_id = leader_id
                     self._leader_url = leader_url.rstrip("/") if leader_url else self._leader_url
-                    self._last_leader_contact_at = time.time()
+                    self._record_leader_contact_locked()
                     if self._role != "leader" or leader_id != self._node_id:
                         self._role = "follower" if self._peer_urls else "standalone"
                         apply_mode = self._role == "follower"
@@ -2189,8 +2199,8 @@ class ClusterManager:
                     self._voted_for = None
                     self._leader_id = None
                     self._leader_url = None
-                    self._leader_lease_until = None
-                    self._last_leader_contact_at = None
+                    self._clear_leader_lease_locked()
+                    self._clear_leader_contact_locked()
                     self._role = "decommissioned"
                     apply_mode = True
 
@@ -2224,8 +2234,8 @@ class ClusterManager:
                 self._role = "leader"
                 self._leader_id = self._node_id
                 self._leader_url = self._advertise_url
-                self._leader_lease_until = None
-                self._last_leader_contact_at = time.time()
+                self._clear_leader_lease_locked()
+                self._record_leader_contact_locked()
                 self._persist_cluster_state_locked()
 
     def build_status(self) -> Dict[str, Any]:
@@ -2236,7 +2246,11 @@ class ClusterManager:
         with self._lock:
             visible_peer_urls = self._reconfig_target_peer_urls_locked()
             peers = [
-                dict(self._peer_states.get(peer, {"peer_url": peer}))
+                {
+                    key: value
+                    for key, value in self._peer_states.get(peer, {"peer_url": peer}).items()
+                    if key != "_last_ack_monotonic"
+                }
                 for peer in visible_peer_urls
             ]
             healthy_peers = sum(1 for peer in peers if peer.get("healthy"))
@@ -2307,7 +2321,7 @@ class ClusterManager:
         current_sequence = self._coordinator.get_committed_sequence()
         request_since = max(0, current_sequence - 1) if current_sequence > 0 else 0
         request_limit = self._batch_size + (1 if current_sequence > 0 else 0)
-        started_at = time.time()
+        started_at = time.monotonic()
         payload = self._request_json(
             f"{self._leader_url}/internal/replication/operations"
             f"?{parse.urlencode({'since_sequence': request_since, 'limit': request_limit})}",
@@ -2396,7 +2410,7 @@ class ClusterManager:
             self._leader_commit_index = leader_commit_index or self._leader_commit_index
             self._last_sync_at = applied_at
             self._last_error = None
-            self._last_leader_contact_at = applied_at
+            self._record_leader_contact_locked()
             self._persist_cluster_state_locked()
             if applied and operations_to_apply:
                 last_sequence = operations_to_apply[-1].sequence_number
@@ -2406,7 +2420,7 @@ class ClusterManager:
                         "peer_id": self._leader_id or self._leader_url,
                         "status": "applied",
                         "applied_at": applied_at,
-                        "latency_ms": int((applied_at - started_at) * 1000),
+                        "latency_ms": int((time.monotonic() - started_at) * 1000),
                         "applied_count": applied,
                     }
                 )
@@ -2417,7 +2431,7 @@ class ClusterManager:
         if self._role != "follower" or not self._leader_url:
             return 0
 
-        started_at = time.time()
+        started_at = time.monotonic()
         payload = self._request_json(
             f"{self._leader_url}/internal/replication/snapshot",
             "GET",
@@ -2455,7 +2469,7 @@ class ClusterManager:
             self._leader_commit_index = leader_commit_index
             self._last_sync_at = applied_at
             self._last_error = None
-            self._last_leader_contact_at = applied_at
+            self._record_leader_contact_locked()
             self._persist_cluster_state_locked()
             self._recent_apply_events.appendleft(
                 {
@@ -2463,7 +2477,7 @@ class ClusterManager:
                     "peer_id": self._leader_id or self._leader_url,
                     "status": "snapshotted",
                     "applied_at": applied_at,
-                    "latency_ms": int((applied_at - started_at) * 1000),
+                    "latency_ms": int((time.monotonic() - started_at) * 1000),
                     "applied_count": total_applied,
                     "reason": reason,
                 }
@@ -2507,7 +2521,7 @@ class ClusterManager:
         with self._lock:
             poll_targets = self._reconfig_target_peer_urls_locked()
         for peer in poll_targets:
-            started_at = time.time()
+            started_at = time.monotonic()
             try:
                 payload = self._request_json(f"{peer}/internal/replication/state", "GET", None)
                 previous = self._peer_states.get(peer, {})
@@ -2527,6 +2541,7 @@ class ClusterManager:
                     "match_term": last_log_term,
                     "replication_lag": max(0, current_sequence - last_applied),
                     "last_ack_at": time.time(),
+                    "_last_ack_monotonic": time.monotonic(),
                     "last_error": payload.get("last_error"),
                 }
             except Exception as exc:
@@ -2549,9 +2564,10 @@ class ClusterManager:
             with self._lock:
                 # A poll may have captured the follower before an in-flight
                 # write committed. Never overwrite its newer apply/heartbeat
-                # acknowledgement with that older observation.
-                newer_ack = self._peer_states.get(peer, {}).get("last_ack_at") or 0
-                if newer_ack > started_at:
+                # acknowledgement with that older observation. Civil time may
+                # jump between request and ACK, so it cannot order them.
+                newer_ack = self._peer_states.get(peer, {}).get("_last_ack_monotonic")
+                if newer_ack is not None and newer_ack > started_at:
                     continue
                 self._peer_states[peer] = observed_state
 
@@ -2566,8 +2582,8 @@ class ClusterManager:
             )
             if self._role != "leader" or self._current_term != term or effective_config != config_version:
                 return
-            newer_ack = self._peer_states.get(peer, {}).get("last_ack_at") or 0
-            if newer_ack > started_at:
+            newer_ack = self._peer_states.get(peer, {}).get("_last_ack_monotonic")
+            if newer_ack is not None and newer_ack > started_at:
                 return
             self._peer_states[peer] = observation
 
@@ -2592,7 +2608,7 @@ class ClusterManager:
                 else self._config_version
             )
         for peer in heartbeat_targets:
-            started_at = time.time()
+            started_at = time.monotonic()
             try:
                 payload = self._request_json(
                     f"{peer}/internal/cluster/heartbeat",
@@ -2629,6 +2645,7 @@ class ClusterManager:
                     "match_term": last_log_term if accepted else int(previous.get("match_term", 0) or 0),
                     "replication_lag": max(0, current_sequence - last_applied),
                     "last_ack_at": time.time() if accepted else None,
+                    "_last_ack_monotonic": time.monotonic() if accepted else None,
                     "last_error": None if accepted else "heartbeat_rejected",
                 }
                 self._record_heartbeat_observation(
@@ -2660,7 +2677,7 @@ class ClusterManager:
                 for peer_urls in quorum_sets
             )
             if has_joint_majority:
-                self._leader_lease_until = time.time() + self._election_timeout_seconds
+                self._renew_leader_lease_locked()
             elif self._leader_lease_expired_locked():
                 should_step_down = True
         if should_step_down:
@@ -2744,7 +2761,7 @@ class ClusterManager:
                 if not self._leader_contact_stale_locked():
                     return {"status": "follower", "term": self._current_term, "votes": 0}
             self._role = "candidate"
-            self._last_leader_contact_at = time.time()
+            self._record_leader_contact_locked()
             next_term = self._current_term + 1
             if minimum_term is not None:
                 next_term = max(next_term, int(minimum_term))
@@ -2753,7 +2770,7 @@ class ClusterManager:
             self._voted_for = self._node_id
             self._leader_id = None
             self._leader_url = None
-            self._leader_lease_until = None
+            self._clear_leader_lease_locked()
             self._last_error = None
             self._clear_prepare_reservation_locked()
             self._persist_cluster_state_locked()
@@ -2790,8 +2807,8 @@ class ClusterManager:
                     self._role = "leader"
                     self._leader_id = self._node_id
                     self._leader_url = self._advertise_url
-                    self._leader_lease_until = time.time() + self._election_timeout_seconds
-                    self._last_leader_contact_at = time.time()
+                    self._renew_leader_lease_locked()
+                    self._record_leader_contact_locked()
                     self._clear_prepare_reservation_locked()
                     self._sync_commit_callback_locked()
                     self._persist_cluster_state_locked()
@@ -2817,7 +2834,7 @@ class ClusterManager:
             commit_index=operation.sequence_number,
         )
         for peer in self._peer_urls:
-            started_at = time.time()
+            started_at = time.monotonic()
             try:
                 payload = self._request_json(
                     f"{peer}/internal/replication/apply",
@@ -2844,6 +2861,7 @@ class ClusterManager:
                     "last_applied": last_applied,
                     "replication_lag": max(0, self._coordinator.get_committed_sequence() - last_applied),
                     "last_ack_at": applied_at,
+                    "_last_ack_monotonic": time.monotonic(),
                     "last_error": None,
                 }
                 self._recent_apply_events.appendleft(
@@ -2852,7 +2870,7 @@ class ClusterManager:
                         "peer_id": payload.get("node_id") or peer,
                         "status": "acked",
                         "applied_at": applied_at,
-                        "latency_ms": int((applied_at - started_at) * 1000),
+                        "latency_ms": int((time.monotonic() - started_at) * 1000),
                         "applied_count": int(payload.get("applied_count", 1)),
                     }
                 )
@@ -2907,13 +2925,31 @@ class ClusterManager:
             self._coordinator.remove_commit_callback(self._on_leader_commit)
             self._commit_callback_registered = False
 
+    def _record_leader_contact_locked(self) -> None:
+        """Keep civil-time observability separate from the election clock."""
+        self._last_leader_contact_at = time.time()
+        self._last_leader_contact_monotonic = time.monotonic()
+
+    def _clear_leader_contact_locked(self) -> None:
+        self._last_leader_contact_at = None
+        self._last_leader_contact_monotonic = None
+
+    def _renew_leader_lease_locked(self) -> None:
+        """A wall deadline is diagnostic only; only elapsed time fences writes."""
+        self._leader_lease_deadline_monotonic = time.monotonic() + self._election_timeout_seconds
+        self._leader_lease_until = time.time() + self._election_timeout_seconds
+
+    def _clear_leader_lease_locked(self) -> None:
+        self._leader_lease_until = None
+        self._leader_lease_deadline_monotonic = None
+
     def _leader_contact_stale_locked(self) -> bool:
         """Return whether the follower has lost contact with its leader."""
         if self._role == "leader" or self._role == "standalone":
             return False
-        if self._last_leader_contact_at is None:
+        if self._last_leader_contact_monotonic is None:
             return True
-        return (time.time() - self._last_leader_contact_at) > self._election_timeout_seconds
+        return (time.monotonic() - self._last_leader_contact_monotonic) > self._election_timeout_seconds
 
     def _automatic_election_due_locked(self) -> bool:
         """Stagger each node/term's retries so split votes can make progress.
@@ -2927,18 +2963,18 @@ class ClusterManager:
         digest = hashlib.sha256(f"{self._node_id}:{self._current_term}".encode()).digest()
         fraction = int.from_bytes(digest[:8], "big") / float(1 << 64)
         timeout = self._election_timeout_seconds * (1.0 + fraction)
-        contact = self._last_leader_contact_at
+        contact = self._last_leader_contact_monotonic
         if contact is None:
-            contact = self._election_clock_started_at
-        return time.time() - contact > timeout
+            contact = self._election_clock_started_monotonic
+        return time.monotonic() - contact > timeout
 
     def _leader_lease_expired_locked(self) -> bool:
         """Return whether the current leader has lost its majority heartbeat lease."""
         if self._role != "leader" or not self._peer_urls:
             return False
-        if self._leader_lease_until is None:
+        if self._leader_lease_deadline_monotonic is None:
             return True
-        return time.time() >= self._leader_lease_until
+        return time.monotonic() >= self._leader_lease_deadline_monotonic
 
     def _step_down_to_candidate(self, reason: str) -> None:
         """Drop leadership when quorum freshness is lost so writes stop immediately."""
@@ -2949,7 +2985,7 @@ class ClusterManager:
                 self._role = "candidate"
                 self._leader_id = None
                 self._leader_url = None
-                self._leader_lease_until = None
+                self._clear_leader_lease_locked()
                 self._last_error = reason
                 self._clear_prepare_reservation_locked()
                 self._persist_cluster_state_locked()
@@ -2957,9 +2993,9 @@ class ClusterManager:
 
     def _clear_expired_prepare_locked(self) -> None:
         """Drop stale follower-side prepare reservations."""
-        if self._prepared_expires_at is None:
+        if self._prepared_deadline_monotonic is None:
             return
-        if time.time() >= self._prepared_expires_at:
+        if time.monotonic() >= self._prepared_deadline_monotonic:
             self._clear_prepare_reservation_locked()
 
     def _clear_prepare_reservation_locked(self) -> None:
@@ -2968,7 +3004,7 @@ class ClusterManager:
         self._prepared_count = 0
         self._prepared_term = None
         self._prepared_leader_id = None
-        self._prepared_expires_at = None
+        self._prepared_deadline_monotonic = None
 
     def _validate_prepare_reservation_locked(
         self,
@@ -3029,7 +3065,7 @@ class ClusterManager:
 
         self._prepared_sequence = next_sequence
         self._prepared_count = remaining
-        self._prepared_expires_at = time.time() + self._prepare_timeout_seconds
+        self._prepared_deadline_monotonic = time.monotonic() + self._prepare_timeout_seconds
 
     def _cancel_prepare_reservations(
         self,
@@ -3084,7 +3120,7 @@ class ClusterManager:
             commit_index=commit_index,
         )
         for peer in peers:
-            started_at = time.time()
+            started_at = time.monotonic()
             try:
                 payload = self._request_json(
                     f"{peer}/internal/replication/commit",
@@ -3124,6 +3160,7 @@ class ClusterManager:
                     "match_term": int(payload.get("last_log_term", commit_term)),
                     "replication_lag": max(0, commit_index - last_applied),
                     "last_ack_at": time.time(),
+                    "_last_ack_monotonic": time.monotonic(),
                     "last_error": None if payload.get("accepted", True) else payload.get("reason", "commit_rejected"),
                 }
                 self._recent_apply_events.appendleft(
@@ -3132,7 +3169,7 @@ class ClusterManager:
                         "peer_id": payload.get("node_id") or peer,
                         "status": "committed" if payload.get("accepted", True) else "commit_rejected",
                         "applied_at": time.time(),
-                        "latency_ms": int((time.time() - started_at) * 1000),
+                        "latency_ms": int((time.monotonic() - started_at) * 1000),
                         "applied_count": int(payload.get("applied_count", 0)),
                     }
                 )
@@ -3315,7 +3352,7 @@ class ClusterManager:
         return quorum_index
 
     def _persist_cluster_state_locked(self) -> None:
-        """Persist durable election metadata for this node."""
+        """Persist authority metadata, never process-local clock values."""
         current_applied = self._coordinator.get_committed_sequence()
         commit_index = current_applied if self._role == "leader" else max(self._leader_commit_index, current_applied)
         self._coordinator.save_cluster_state(
@@ -3351,10 +3388,10 @@ class ClusterManager:
                 self._role = "follower"
                 self._leader_id = leader_id
                 self._leader_url = leader_url.rstrip("/") if isinstance(leader_url, str) and leader_url else self._leader_url
-                self._leader_lease_until = None
-                self._last_leader_contact_at = time.time()
+                self._clear_leader_lease_locked()
+                self._record_leader_contact_locked()
                 self._clear_prepare_reservation_locked()
-                self._last_leader_contact_at = time.time()
+                self._record_leader_contact_locked()
                 self._persist_cluster_state_locked()
         self._apply_replica_mode()
 
@@ -3397,6 +3434,7 @@ class ClusterManager:
             state.setdefault("match_term", 0)
             state.setdefault("replication_lag", None)
             state.setdefault("last_ack_at", None)
+            state.setdefault("_last_ack_monotonic", None)
             state.setdefault("last_error", None)
             rebuilt[peer] = state
         return rebuilt
@@ -3425,8 +3463,8 @@ class ClusterManager:
         expected_log_term: int,
     ) -> None:
         """Wait briefly for one staged peer to catch up before activation."""
-        deadline = time.time() + self._reconfig_timeout_seconds
-        while time.time() < deadline:
+        deadline = time.monotonic() + self._reconfig_timeout_seconds
+        while time.monotonic() < deadline:
             payload = self._request_json(f"{peer_url}/internal/replication/state", "GET", None)
             if (
                 int(payload.get("last_applied", 0)) >= int(expected_applied)

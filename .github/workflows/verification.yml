@@ -25,14 +25,15 @@ jobs:
       - name: Complete election, handoff, recovery and HTTP suite
         run: |
           mkdir -p verification
-          python -m pytest -q -p no:cacheprovider --junitxml=verification/results.xml
+          python -m pytest -q -p no:cacheprovider -W error::pytest.PytestUnhandledThreadExceptionWarning --junitxml=verification/results.xml
       - name: Require full execution
         run: |
           python - <<'PY'
           import xml.etree.ElementTree as ET
           root=ET.parse('verification/results.xml').getroot()
           cases=root.findall('.//testcase')
-          assert len(cases)>=323, f'expected full suite, got {len(cases)}'
+          assert len(cases)>=367, f'expected full suite, got {len(cases)}'
+          assert len([c for c in cases if 'test_cluster_clock_jumps' in c.attrib.get('classname','')]) == 44, 'clock-jump regressions missing'
           expected={'test_old_heartbeat_cannot_replace_newer_commit_ack[False]',
                     'test_old_heartbeat_cannot_replace_newer_commit_ack[True]',
                     'test_fresh_heartbeat_reports_lower_peer_state_instead_of_hiding_it'}

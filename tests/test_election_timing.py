@@ -38,11 +38,11 @@ def test_automatic_retry_deadlines_differ_after_a_split_vote(coordinator, monkey
                                  heartbeat_interval_seconds=0.2)
         manager._role = "candidate"
         manager._current_term = 1
-        manager._last_leader_contact_at = 100.0
+        manager._last_leader_contact_monotonic = 100.0
         due_at = None
         for hundredths in range(101, 201):
             now = 100.0 + hundredths / 100.0
-            monkeypatch.setattr(time, "time", lambda now=now: now)
+            monkeypatch.setattr(time, "monotonic", lambda now=now: now)
             if manager._automatic_election_due_locked():
                 due_at = now
                 break
@@ -86,6 +86,7 @@ def test_old_peer_poll_cannot_replace_newer_commit_ack(coordinator):
         # Reproduce the response from a read that started before a commit.
         manager._peer_states["http://b"] = {
             "healthy": True, "last_applied": 7, "last_ack_at": time.time() + 0.001,
+            "_last_ack_monotonic": time.monotonic() + 0.001,
         }
         return {"node_id": "b", "last_applied": 6}
 
@@ -106,6 +107,7 @@ def test_old_heartbeat_cannot_replace_newer_commit_ack(coordinator, response_fai
         manager._peer_states["http://b"] = {
             "healthy": True, "last_applied": 7, "last_log_index": 7,
             "last_ack_at": time.time() + 0.001,
+            "_last_ack_monotonic": time.monotonic() + 0.001,
         }
         if response_fails:
             raise ConnectionError("old heartbeat failed after newer acknowledgement")
@@ -129,6 +131,7 @@ def test_fresh_heartbeat_reports_lower_peer_state_instead_of_hiding_it(coordinat
     manager._peer_states["http://b"] = {
         "healthy": True, "last_applied": 7, "last_log_index": 7,
         "last_ack_at": time.time() - 1,
+        "_last_ack_monotonic": time.monotonic() - 1,
     }
     manager._send_heartbeats_once()
     assert manager._peer_states["http://b"]["last_applied"] == 0

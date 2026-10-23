@@ -101,6 +101,10 @@ This second diagram describes the quorum-enabled cluster path, not the standalon
 - Quorum-enabled leaders durably append to a majority and distinguish committed history from provisional reservations.
 - Leader heartbeat leases, term-aware messages and log-freshness votes guard the tested handoff/failover paths.
 
+Cluster-local lease expiry, election/contact age, prepare-reservation expiry, handoff confirmation and peer-alignment waits use monotonic elapsed time. Peer ACK ordering and replication latency also use this clock, so NTP/manual wall-clock jumps cannot reorder ACKs or change these local deadlines. Monotonic values are neither persisted nor sent to peers; restarts retain durable term/vote/membership fences but do not restore an old process's lease or prepare reservation.
+
+Status fields such as `last_leader_contact_at`, `leader_lease_until`, `last_ack_at`, `last_sync_at` and `applied_at` remain wall-clock diagnostics. In particular, `leader_lease_until` records the civil-time estimate at renewal; after a clock adjustment, use `leader_lease_expired`/`write_quorum_ready`, not a client-side subtraction from that timestamp. This hardening does not change session/client-lease TTL semantics, compensate for clock-rate drift or guarantee expiry across host suspend; waits can also exceed their budget by an in-flight RPC or scheduling delay. See the [clock-jump validation record](validation-runs/hardening-20261023/README.md).
+
 Cluster safety still has explicit boundaries: no complete log-matching/overwrite protocol, no formal joint-consensus membership changes and no claim of production split-brain-proof consensus.
 
 ## API map
