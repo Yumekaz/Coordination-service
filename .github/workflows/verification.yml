@@ -32,10 +32,11 @@ jobs:
           import xml.etree.ElementTree as ET
           root=ET.parse('verification/results.xml').getroot()
           cases=root.findall('.//testcase')
-          assert len(cases)>=367, f'expected full suite, got {len(cases)}'
+          assert len(cases)>=368, f'expected full suite, got {len(cases)}'
           assert len([c for c in cases if 'test_cluster_clock_jumps' in c.attrib.get('classname','')]) == 44, 'clock-jump regressions missing'
           expected={'test_old_heartbeat_cannot_replace_newer_commit_ack[False]',
                     'test_old_heartbeat_cannot_replace_newer_commit_ack[True]',
+                    'test_reacquire_is_not_renewal_and_expired_owner_cannot_release_successor',
                     'test_fresh_heartbeat_reports_lower_peer_state_instead_of_hiding_it'}
           executed={case.attrib.get('name') for case in cases}
           assert expected <= executed, f'heartbeat regressions missing: {expected-executed}'
